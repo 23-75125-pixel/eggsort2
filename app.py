@@ -100,8 +100,12 @@ app.config["AUTO_START_SORTING_ON_LOGIN"] = os.environ.get(
 SORTING_RUNTIME_INSTANCE = secrets.token_hex(8)
 
 
-# SQLite database configuration
-app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///database.db"
+# Database configuration. Keep SQLite for local development; Render can use a
+# persistent disk with DATABASE_URL=sqlite:////var/data/database.db.
+app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
+    "DATABASE_URL",
+    "sqlite:///database.db",
+).strip()
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 
@@ -114,6 +118,12 @@ oauth.register(
     client_secret=app.config["GOOGLE_CLIENT_SECRET"],
     client_kwargs={"scope": "openid email profile"},
 )
+
+
+@app.get("/health")
+def health_check() -> Any:
+    """Lightweight deployment health check; does not access camera hardware."""
+    return jsonify(status="ok")
 
 
 INITIAL_ADMIN_EMAIL = app.config["ADMIN_EMAIL"]
