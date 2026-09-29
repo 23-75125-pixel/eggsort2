@@ -100,12 +100,22 @@ app.config["AUTO_START_SORTING_ON_LOGIN"] = os.environ.get(
 SORTING_RUNTIME_INSTANCE = secrets.token_hex(8)
 
 
-# Database configuration. Keep SQLite for local development; Render can use a
-# persistent disk with DATABASE_URL=sqlite:////var/data/database.db.
-app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
-    "DATABASE_URL",
-    "sqlite:///database.db",
-).strip()
+# Database configuration. DATABASE_URL remains supported for Render and local
+# SQLite deployments. SUPABASE_DB_URL is the documented Supabase setting and
+# must take effect when DATABASE_URL is blank or absent.
+database_url = (
+    os.environ.get("DATABASE_URL", "").strip()
+    or os.environ.get("SUPABASE_DB_URL", "").strip()
+    or "sqlite:///database.db"
+)
+# SQLAlchemy uses the postgresql dialect spelling. Some Supabase connection
+# dialogs still provide postgres://, and Psycopg does not accept Prisma's
+# pgbouncer query option.
+if database_url.startswith("postgres://"):
+    database_url = "postgresql://" + database_url[len("postgres://"):]
+database_url = re.sub(r"([?&])pgbouncer=true(?:&|$)", r"\1", database_url)
+database_url = database_url.rstrip("?&")
+app.config["SQLALCHEMY_DATABASE_URI"] = database_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 
@@ -474,27 +484,27 @@ with app.app_context():
         for column in inspect(db.engine).get_columns("user")
     }
     migration_statements = {
-        "email": "ALTER TABLE user ADD COLUMN email VARCHAR(254)",
-        "google_sub": "ALTER TABLE user ADD COLUMN google_sub VARCHAR(255)",
-        "display_name": "ALTER TABLE user ADD COLUMN display_name VARCHAR(120)",
-        "avatar_url": "ALTER TABLE user ADD COLUMN avatar_url VARCHAR(1024)",
+        "email": "ALTER TABLE \"user\" ADD COLUMN email VARCHAR(254)",
+        "google_sub": "ALTER TABLE \"user\" ADD COLUMN google_sub VARCHAR(255)",
+        "display_name": "ALTER TABLE \"user\" ADD COLUMN display_name VARCHAR(120)",
+        "avatar_url": "ALTER TABLE \"user\" ADD COLUMN avatar_url VARCHAR(1024)",
         "role": (
-            "ALTER TABLE user ADD COLUMN role VARCHAR(20) "
+            "ALTER TABLE \"user\" ADD COLUMN role VARCHAR(20) "
             "NOT NULL DEFAULT 'staff'"
         ),
         "is_active": (
-            "ALTER TABLE user ADD COLUMN is_active BOOLEAN "
+            "ALTER TABLE \"user\" ADD COLUMN is_active BOOLEAN "
             "NOT NULL DEFAULT 1"
         ),
         "password_set": (
-            "ALTER TABLE user ADD COLUMN password_set BOOLEAN "
+            "ALTER TABLE \"user\" ADD COLUMN password_set BOOLEAN "
             "NOT NULL DEFAULT 0"
         ),
         "invite_token_hash": (
-            "ALTER TABLE user ADD COLUMN invite_token_hash VARCHAR(64)"
+            "ALTER TABLE \"user\" ADD COLUMN invite_token_hash VARCHAR(64)"
         ),
         "invite_expires_at": (
-            "ALTER TABLE user ADD COLUMN invite_expires_at DATETIME"
+            "ALTER TABLE \"user\" ADD COLUMN invite_expires_at DATETIME"
         ),
     }
     for column_name, statement in migration_statements.items():
@@ -503,13 +513,13 @@ with app.app_context():
     db.session.execute(
         text(
             "CREATE UNIQUE INDEX IF NOT EXISTS ix_user_email "
-            "ON user (email)"
+            "ON \"user\" (email)"
         )
     )
     db.session.execute(
         text(
             "CREATE UNIQUE INDEX IF NOT EXISTS ix_user_google_sub "
-            "ON user (google_sub)"
+            "ON \"user\" (google_sub)"
         )
     )
     db.session.commit()
@@ -527,7 +537,10 @@ with app.app_context():
         ).first()
     if initial_admin is None and User.query.count() == 1:
         initial_admin = User.query.first()
-    if initial_admin is None:
+    # The migration copies the local user IDs verbatim. Do not insert a new
+    # bootstrap admin first, otherwise it can occupy ID 1 and cause the
+    # source administrator to be skipped by the idempotent import.
+    if initial_admin is None and os.environ.get("DATABASE_MIGRATION_MODE") != "1":
         initial_admin = User(
             username=INITIAL_ADMIN_EMAIL,
             password=generate_password_hash(secrets.token_urlsafe(32)),
@@ -537,7 +550,7 @@ with app.app_context():
             is_active=True,
         )
         db.session.add(initial_admin)
-    else:
+    elif initial_admin is not None:
         initial_admin.email = INITIAL_ADMIN_EMAIL
         if INITIAL_ADMIN_GOOGLE_SUB:
             initial_admin.google_sub = INITIAL_ADMIN_GOOGLE_SUB
@@ -1662,8 +1675,8 @@ def create_sale() -> Any:
         return jsonify(error="Select a valid egg size."), 400
     if quantity <= 0 or total_amount < 0:
         return jsonify(error="Quantity must be positive and amount cannot be negative."), 400
-    if payment_method not in {"Cash", "GCash", "Bank Transfer"}:
-        return jsonify(error="Select a valid payment method."), 400
+    if payment_method != "Cash":
+        return jsonify(error="Cash is the only accepted payment method."), 400
     available = sellable_stock_counts().get(size, 0)
     if quantity > available:
         return jsonify(

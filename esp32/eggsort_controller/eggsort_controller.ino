@@ -1,133 +1,203 @@
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
-#include <Preferences.h>
 #include "HX711.h"
 
-// EggSort+ ESP32 controller
-//
-// The ESP32 owns the load cell and every servo. The PC owns the camera,
-// quality model, database, and dashboard. One egg follows this handshake:
-//   ESP32 -> Egg Detected
-//   PC    -> MEASURE:GOOD | UNDEFINED
-//   ESP32 -> FINAL WEIGHT / SIZE, then automatically releases and routes
-//   ESP32 -> SERVO SORTED / Egg Left
-// Camera defects bypass this handshake: REJECT:CRACK | ROTTEN immediately
-// opens channel 0 for 10 seconds, without starting a weight measurement.
+// =====================================================
+// PCA9685
+// =====================================================
 
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
-HX711 scale;
-Preferences scaleSettings;
 
-// ESP32 wiring.
-static const uint8_t SDA_PIN = 21;
-static const uint8_t SCL_PIN = 22;
-static const uint8_t HX711_DOUT_PIN = 19;
-static const uint8_t HX711_CLK_PIN = 18;
+#define SDA_PIN 21
+#define SCL_PIN 22
 
-// PCA9685 channels from the proven mechanical sketch.
-static const uint8_t CRACK_SERVO = 0; // Shared reject gate for CRACK and ROTTEN.
-static const uint8_t LOADCELL_SERVO = 1;
-static const uint8_t SMALL_SERVO = 5;
-static const uint8_t MEDIUM_SERVO = 2;
-static const uint8_t LARGE_SERVO = 4;
-static const uint8_t EXTRA_LARGE_SERVO = 3;
-
-// Proven load-cell gate settings.
-static const int LOADCELL_CLOSED = 305;
-static const int LOADCELL_OPEN = 180;
-static const int LOADCELL_OPEN_SPEED = 15;
-static const unsigned long LOADCELL_OPEN_TIME = 3000;
-
-// Proven sorting-gate settings (degrees).
-static const int SERVO_MIN = 150;
-static const int SERVO_MAX = 600;
-// Reference crack gate angles, shared by camera CRACK and ROTTEN results.
-// Swap OPEN/CLOSED if the physical linkage is reversed.
-static const int CRACK_CLOSED = 0;
-static const int CRACK_OPEN = 80;
-static const unsigned long CRACK_GATE_OPEN_TIME = 10000; // 10 seconds
-static const int SMALL_CLOSED = 70;
-static const int SMALL_OPEN = 0;
-static const int MEDIUM_CLOSED = 0;
-static const int MEDIUM_OPEN = 70;
-static const int LARGE_CLOSED = 80;
-static const int LARGE_OPEN = 0;
-static const int EXTRA_LARGE_CLOSED = 0;
-static const int EXTRA_LARGE_OPEN = 80;
-static const int SIZE_CLOSE_SPEED = 25;
-static const unsigned long SIZE_GATE_OPEN_TIME = 1500;
-static const unsigned long SM_TRAVEL_TIME = 2000;
-static const unsigned long LARGE_TRAVEL_TIME = 8700;
-static const unsigned long EXTRA_LARGE_TRAVEL_TIME = 8500;
-
-
-static const float DEFAULT_CALIBRATION_FACTOR = 622.0f;
-float calibrationFactor = DEFAULT_CALIBRATION_FACTOR;
-static const int EGG_PRESENT_THRESHOLD_GRAMS = 30;
-static const int EGG_CLEAR_THRESHOLD_GRAMS = 10;
-// Release the Good/Undefined egg after two consecutive rounded readings
-// agree exactly. A changed reading starts a new consecutive pair.
-static const int STABLE_TOLERANCE_GRAMS = 0;
-static const uint8_t STABLE_SAMPLE_COUNT = 2;
-static const uint8_t WEIGHT_SAMPLES_PER_READING = 5;
-static const int INVALID_WEIGHT = -10000;
-static const unsigned long SAMPLE_INTERVAL_MS = 500;
-static const unsigned long STATUS_INTERVAL_MS = 15000;
-static const unsigned long IDLE_WEIGHT_INTERVAL_MS = 3000;
-
-bool eggDetected = false;
-bool measurementAuthorized = false;
-bool measurementReady = false;
-bool sorting = false;
 bool pcaReady = false;
-bool hx711Ready = false;
+
+// =====================================================
+// SERVO CHANNELS
+// =====================================================
+
+// Crack / Rotten reject gate
+#define CRACK_SERVO 0
+
+// Load-cell gate
+#define LOADCELL_SERVO 1
+
+// Size servos
+#define SMALL_SERVO 5     // Servo 4
+#define MEDIUM_SERVO 2    // Servo 3
+#define LARGE_SERVO 4     // Servo 6
+#define XL_SERVO 3        // Servo 5
+
+// =====================================================
+// CRACK / ROTTEN REJECT SERVO
+// =====================================================
+
+// Swap OPEN/CLOSED kung baliktad ang linkage
+#define CRACK_CLOSED 0
+#define CRACK_OPEN 80
+
+// How long the reject gate stays open (10 seconds)
+#define CRACK_GATE_OPEN_TIME 10000
+
 bool rejectGateOpen = false;
 unsigned long rejectOpenedAt = 0;
-static const uint8_t MAX_PENDING_COMMANDS = 8;
-String pendingCommands[MAX_PENDING_COMMANDS];
-uint8_t pendingCommandCount = 0;
 
-String lockedQuality = "";
-String measuredSize = "";
-int readingNumber = 0;
-int finalWeight = 0;
-int emptyReadingCount = 0;
-int occupiedReadingCount = 0;
-int stableWeights[STABLE_SAMPLE_COUNT] = {0};
-uint8_t stableWeightCount = 0;
-unsigned long lastReadingAt = 0;
-unsigned long lastStatusAt = 0;
+// =====================================================
+// LOAD-CELL SERVO
+// =====================================================
 
-int angleToPulse(int angle) {
-  angle = constrain(angle, 0, 180);
-  return map(angle, 0, 180, SERVO_MIN, SERVO_MAX);
-}
+#define LOADCELL_CLOSED 305
+#define LOADCELL_OPEN 180
 
-void setServoAngle(uint8_t channel, int angle) {
-  pwm.setPWM(channel, 0, angleToPulse(angle));
-}
+// Higher = slower opening
+#define LOADCELL_OPEN_SPEED 15
+
+// How long load-cell gate stays open
+#define LOADCELL_OPEN_TIME 3000
+
+// =====================================================
+// SIZE SERVO RANGE
+// =====================================================
+
+#define SERVO_MIN 150
+#define SERVO_MAX 600
+
+// =====================================================
+// SMALL - SERVO 4 / CHANNEL 5
+// =====================================================
+
+#define SMALL_CLOSED 70
+#define SMALL_OPEN 0
+
+// =====================================================
+// MEDIUM - SERVO 3 / CHANNEL 2 (REVERSED)
+// =====================================================
+
+#define MEDIUM_CLOSED 0
+#define MEDIUM_OPEN 70
+
+// =====================================================
+// LARGE - SERVO 6 / CHANNEL 4
+// =====================================================
+
+#define LARGE_CLOSED 80
+#define LARGE_OPEN 0
+
+// =====================================================
+// XL - SERVO 5 / CHANNEL 3 (REVERSED)
+// =====================================================
+
+#define XL_CLOSED 0
+#define XL_OPEN 80
+
+// =====================================================
+// SIZE SERVO SETTINGS
+// =====================================================
+
+// Higher = slower closing
+#define SIZE_CLOSE_SPEED 20
+
+// How long size gate stays open
+#define SIZE_GATE_OPEN_TIME 1500
+
+// =====================================================
+// TRAVEL TIMES
+// =====================================================
+
+// Small and Medium
+#define SM_TRAVEL_TIME 2000
+
+// Large
+#define LARGE_TRAVEL_TIME 8700
+
+// Extra Large
+#define XL_TRAVEL_TIME 8500
+
+// =====================================================
+// HX711
+// =====================================================
+
+#define DOUT 19
+#define CLK 18
+
+HX711 scale;
+
+float calibration_factor = 622.0;
+
+#define EGG_THRESHOLD 30
+
+// =====================================================
+// VARIABLES
+// =====================================================
+
+int lastWeight = -1;
+int sameCount = 0;
+
+bool processingEgg = false;
+bool zeroPrinted = false;
+bool eggDetected = false;
+bool measurementAuthorized = false;
+
+// =====================================================
+// FUNCTION PROTOTYPE
+// (kailangan kasi tinatawag ito ng waitWithRejectService)
+// =====================================================
 
 void handleSerialCommands(bool urgentOnly);
 
+// =====================================================
+// SET SERVO ANGLE
+// =====================================================
+
+void setServoAngle(uint8_t channel, int angle) {
+
+  angle = constrain(angle, 0, 180);
+
+  int pulse = map(angle, 0, 180, SERVO_MIN, SERVO_MAX);
+
+  pwm.setPWM(channel, 0, pulse);
+}
+
+// =====================================================
+// CRACK / ROTTEN REJECT SERVO FUNCTIONS
+// =====================================================
+
+// Isasara ang reject gate kapag lumipas na ang 10 seconds
 void updateRejectServo() {
-  if (rejectGateOpen && millis() - rejectOpenedAt >= CRACK_GATE_OPEN_TIME) {
+
+  if (rejectGateOpen &&
+      millis() - rejectOpenedAt >= CRACK_GATE_OPEN_TIME) {
+
     setServoAngle(CRACK_SERVO, CRACK_CLOSED);
     rejectGateOpen = false;
+
     Serial.println("REJECT SERVO: CLOSED");
   }
 }
 
+// Bubuksan ang reject gate at sisimulan ang 10 second timer
 void startRejectServo() {
+
   setServoAngle(CRACK_SERVO, CRACK_OPEN);
+
   rejectOpenedAt = millis();
   rejectGateOpen = true;
+
   Serial.println("REJECT SERVO: OPEN; HOLD 10000 MS");
 }
 
-// Keep the upstream camera gate responsive during downstream servo travel
-// and HX711 conversions. Other commands cannot re-enter an active operation.
+// =====================================================
+// WAIT (kapalit ng delay)
+// Habang naghihintay, chine-check pa rin ang serial
+// at ang reject timer, para gumana ang REJECT kahit
+// nagso-sort ang ibang servo.
+// =====================================================
+
 void waitWithRejectService(unsigned long duration) {
+
   unsigned long startedAt = millis();
+
   do {
     handleSerialCommands(true);
     updateRejectServo();
@@ -135,333 +205,30 @@ void waitWithRejectService(unsigned long duration) {
   } while (millis() - startedAt < duration);
 }
 
-void moveServoSlow(uint8_t channel, int fromAngle, int toAngle, int delayMs) {
-  int step = (toAngle >= fromAngle) ? 1 : -1;
-  for (int angle = fromAngle; angle != toAngle; angle += step) {
-    setServoAngle(channel, angle);
-    waitWithRejectService(delayMs);
-  }
-  setServoAngle(channel, toAngle);
-}
+// Test: buksan ang gate at hintayin hanggang magsara
+void activateCrackServo() {
 
-void moveLoadCellServoSlow(int fromPulse, int toPulse, int delayMs) {
-  int step = (toPulse >= fromPulse) ? 1 : -1;
-  for (int pulse = fromPulse; pulse != toPulse; pulse += step) {
-    pwm.setPWM(LOADCELL_SERVO, 0, pulse);
-    waitWithRejectService(delayMs);
-  }
-  pwm.setPWM(LOADCELL_SERVO, 0, toPulse);
-}
+  startRejectServo();
 
-int readWeight() {
-  // HX711 DOUT goes high between conversions. A one-shot is_ready() check can
-  // therefore report a healthy 10 SPS module as unavailable. Wait through the
-  // conversion window before deciding that the sensor is disconnected.
-  float totalUnits = 0.0f;
-  for (uint8_t sample = 0; sample < WEIGHT_SAMPLES_PER_READING; sample++) {
-    unsigned long startedAt = millis();
-    while (!scale.is_ready()) {
-      if (millis() - startedAt >= 1000) {
-        hx711Ready = false;
-        return INVALID_WEIGHT;
-      }
-      waitWithRejectService(1);
-    }
-    // One conversion is ready; average a small batch for faster response.
-    totalUnits += scale.get_units(1);
+  while (rejectGateOpen) {
     waitWithRejectService(1);
   }
-
-  hx711Ready = true;
-  // A reversed A+/A- load-cell connection changes only the sign. Using the
-  // magnitude lets the calibrated scale work with either polarity.
-  float units = fabs(totalUnits / WEIGHT_SAMPLES_PER_READING);
-  if (isnan(units) || isinf(units)) return INVALID_WEIGHT;
-  if (units < 1.5f) units = 0.0f;
-  return (int)round(units);
 }
 
-void addStableWeight(int weight) {
-  if (stableWeightCount < STABLE_SAMPLE_COUNT) {
-    stableWeights[stableWeightCount++] = weight;
-    return;
-  }
-  for (uint8_t index = 1; index < STABLE_SAMPLE_COUNT; index++) {
-    stableWeights[index - 1] = stableWeights[index];
-  }
-  stableWeights[STABLE_SAMPLE_COUNT - 1] = weight;
-}
-
-bool stableWeightAvailable() {
-  if (stableWeightCount < STABLE_SAMPLE_COUNT) return false;
-  int minimum = stableWeights[0];
-  int maximum = stableWeights[0];
-  for (uint8_t index = 1; index < STABLE_SAMPLE_COUNT; index++) {
-    minimum = min(minimum, stableWeights[index]);
-    maximum = max(maximum, stableWeights[index]);
-  }
-  return maximum - minimum <= STABLE_TOLERANCE_GRAMS;
-}
-
-int averagedStableWeight() {
-  long total = 0;
-  for (uint8_t index = 0; index < STABLE_SAMPLE_COUNT; index++) {
-    total += stableWeights[index];
-  }
-  return (int)round((float)total / STABLE_SAMPLE_COUNT);
-}
-
-String classifySize(int weight) {
-  if (weight < 45) return "SMALL";
-  if (weight <= 54) return "MEDIUM";
-  if (weight <= 62) return "LARGE";
-  if (weight <= 69) return "EXTRA_LARGE";
-  return "JUMBO";
-}
-
-bool validQuality(const String &quality) {
-  return quality == "GOOD" || quality == "UNDEFINED";
-}
-
-bool validSize(const String &size) {
-  return size == "PEEWEE" || size == "SMALL" || size == "MEDIUM" ||
-         size == "LARGE" || size == "EXTRA_LARGE" || size == "JUMBO";
-}
-
-void closeAllServos() {
-  if (!pcaReady) return;
-  pwm.setPWM(LOADCELL_SERVO, 0, LOADCELL_CLOSED);
-  setServoAngle(CRACK_SERVO, CRACK_CLOSED);
-  rejectGateOpen = false;
-  setServoAngle(SMALL_SERVO, SMALL_CLOSED);
-  setServoAngle(MEDIUM_SERVO, MEDIUM_CLOSED);
-  setServoAngle(LARGE_SERVO, LARGE_CLOSED);
-  setServoAngle(EXTRA_LARGE_SERVO, EXTRA_LARGE_CLOSED);
-}
-
-void resetEggState() {
-  eggDetected = false;
-  measurementAuthorized = false;
-  measurementReady = false;
-  sorting = false;
-  lockedQuality = "";
-  measuredSize = "";
-  readingNumber = 0;
-  finalWeight = 0;
-  emptyReadingCount = 0;
-  occupiedReadingCount = 0;
-  stableWeightCount = 0;
-  for (uint8_t index = 0; index < STABLE_SAMPLE_COUNT; index++) {
-    stableWeights[index] = 0;
-  }
-  lastReadingAt = 0;
-  lastStatusAt = millis();
-}
-
-void printHardwareStatus() {
-  int weight = readWeight();
-  Serial.print("HX711 READY : ");
-  Serial.println(hx711Ready ? "YES" : "NO");
-  Serial.print("PCA9685 READY : ");
-  Serial.println(pcaReady ? "YES" : "NO");
-  Serial.print("SCALE FACTOR : ");
-  Serial.println(calibrationFactor, 3);
-  if (weight == INVALID_WEIGHT) {
-    Serial.println("LIVE WEIGHT : UNAVAILABLE");
-  } else {
-    Serial.print("LIVE WEIGHT : ");
-    Serial.print(weight);
-    Serial.println(" g");
-  }
-  Serial.print("CONTROLLER STATE : ");
-  if (sorting) Serial.println("SORTING");
-  else if (measurementReady) Serial.println("WAITING FOR SORT");
-  else if (measurementAuthorized) Serial.println("MEASURING");
-  else if (eggDetected) Serial.println("WAITING FOR CAMERA");
-  else Serial.println("IDLE");
-}
-
-void activateCrackServo() {
-  startRejectServo();
-  while (rejectGateOpen) waitWithRejectService(1);
-}
-
-void activateRouteServo(const String &size) {
-  // Peewee and Small share the first physical chute. Jumbo continues
-  // straight because this four-gate mechanism has no separate Jumbo gate.
-  if (size == "PEEWEE" || size == "SMALL") {
-    setServoAngle(SMALL_SERVO, SMALL_OPEN);
-    waitWithRejectService(SIZE_GATE_OPEN_TIME);
-    moveServoSlow(SMALL_SERVO, SMALL_OPEN, SMALL_CLOSED, SIZE_CLOSE_SPEED);
-  } else if (size == "MEDIUM") {
-    setServoAngle(MEDIUM_SERVO, MEDIUM_OPEN);
-    waitWithRejectService(SIZE_GATE_OPEN_TIME);
-    moveServoSlow(MEDIUM_SERVO, MEDIUM_OPEN, MEDIUM_CLOSED, SIZE_CLOSE_SPEED);
-  } else if (size == "LARGE") {
-    setServoAngle(LARGE_SERVO, LARGE_OPEN);
-    waitWithRejectService(SIZE_GATE_OPEN_TIME);
-    moveServoSlow(LARGE_SERVO, LARGE_OPEN, LARGE_CLOSED, SIZE_CLOSE_SPEED);
-  } else if (size == "EXTRA_LARGE") {
-    setServoAngle(EXTRA_LARGE_SERVO, EXTRA_LARGE_OPEN);
-    waitWithRejectService(SIZE_GATE_OPEN_TIME);
-    moveServoSlow(EXTRA_LARGE_SERVO, EXTRA_LARGE_OPEN,
-                  EXTRA_LARGE_CLOSED, SIZE_CLOSE_SPEED);
-  }
-}
-
-void waitForEggToLeave() {
-  int clearSamples = 0;
-  unsigned long startedAt = millis();
-
-  while (clearSamples < 3 && millis() - startedAt < 15000) {
-    int weight = readWeight();
-    if (weight != INVALID_WEIGHT && weight <= EGG_CLEAR_THRESHOLD_GRAMS) {
-      clearSamples++;
-    } else {
-      clearSamples = 0;
-    }
-    waitWithRejectService(250);
-  }
-
-  Serial.println("Egg Left");
-  resetEggState();
-}
-
-void performSort(const String &requestedSize) {
-  if (!pcaReady) {
-    Serial.println("SORT REJECTED: PCA9685 NOT FOUND");
-    return;
-  }
-  sorting = true;
-
-  String routeSize = measuredSize;
-  if (requestedSize != measuredSize) {
-    Serial.print("SORT SIZE MISMATCH; USING MEASURED SIZE: ");
-    Serial.println(measuredSize);
-  }
-
-  Serial.print("SORTING : ");
-  Serial.println(routeSize);
-
-  // Release the egg from the load cell with the working slow-open motion.
-  moveLoadCellServoSlow(LOADCELL_CLOSED, LOADCELL_OPEN,
-                        LOADCELL_OPEN_SPEED);
-  Serial.println("LOAD CELL GATE: OPEN");
-
-  // Match the reference sketch: travel time begins when the load-cell gate
-  // reaches its fully open position. Its three-second hold counts as travel.
-  unsigned long travelStartedAt = millis();
-  waitWithRejectService(LOADCELL_OPEN_TIME);
-  pwm.setPWM(LOADCELL_SERVO, 0, LOADCELL_CLOSED);
-  Serial.println("LOAD CELL GATE: CLOSED");
-
-  unsigned long selectedTravelTime = 0;
-  if (routeSize == "PEEWEE" || routeSize == "SMALL" ||
-      routeSize == "MEDIUM") {
-    selectedTravelTime = SM_TRAVEL_TIME;
-  } else if (routeSize == "LARGE") {
-    selectedTravelTime = LARGE_TRAVEL_TIME;
-  } else if (routeSize == "EXTRA_LARGE") {
-    selectedTravelTime = EXTRA_LARGE_TRAVEL_TIME;
-  }
-
-  while (millis() - travelStartedAt < selectedTravelTime) {
-    waitWithRejectService(10);
-  }
-
-  activateRouteServo(routeSize);
-
-  // Keep the measured size in the completion message for PC record handling.
-  Serial.print("SERVO SORTED : ");
-  Serial.println(routeSize);
-  waitForEggToLeave();
-}
-
-void finishMeasurementAndRelease() {
-  finalWeight = averagedStableWeight();
-  measuredSize = classifySize(finalWeight);
-  measurementAuthorized = false;
-  measurementReady = true;
-  lastStatusAt = millis();
-
-  // Send the completed measurement before moving the gate, so the PC can
-  // retain the correct record while the egg travels to its size chute.
-  Serial.print("FINAL WEIGHT : ");
-  Serial.print(finalWeight);
-  Serial.println(" g");
-  Serial.print("SIZE : ");
-  Serial.println(measuredSize);
-  Serial.println("WEIGHT COMPLETE; OPENING LOAD CELL GATE");
-
-  // The load-cell servo must only open after a stable final weight exists.
-  performSort(measuredSize);
-}
-
-void testAllServos() {
-  if (eggDetected || sorting || rejectGateOpen) {
-    Serial.println("SERVO TEST REJECTED: REMOVE EGG FIRST");
-    return;
-  }
-  if (!pcaReady) {
-    Serial.println("SERVO TEST REJECTED: PCA9685 NOT FOUND");
-    return;
-  }
-
-  Serial.println("SERVO TEST STARTED");
-  closeAllServos();
-  waitWithRejectService(500);
-
-  moveLoadCellServoSlow(LOADCELL_CLOSED, LOADCELL_OPEN,
-                        LOADCELL_OPEN_SPEED);
-  Serial.println("LOAD CELL GATE: OPEN");
-  waitWithRejectService(LOADCELL_OPEN_TIME);
-  pwm.setPWM(LOADCELL_SERVO, 0, LOADCELL_CLOSED);
-  Serial.println("LOAD CELL GATE: CLOSED");
-  waitWithRejectService(500);
-
-  activateCrackServo();
-  activateRouteServo("SMALL");
-  activateRouteServo("MEDIUM");
-  activateRouteServo("LARGE");
-  activateRouteServo("EXTRA_LARGE");
-  // A camera reject may have arrived during this test. Let its timer finish.
-  while (rejectGateOpen) waitWithRejectService(1);
-  closeAllServos();
-  Serial.println("SERVO TEST COMPLETE");
-}
-
-void advanceLoadCellGate() {
-  if (eggDetected || sorting) {
-    Serial.println("ADVANCE REJECTED: EGG CYCLE ACTIVE");
-    return;
-  }
-  if (!pcaReady) {
-    Serial.println("ADVANCE REJECTED: PCA9685 NOT FOUND");
-    return;
-  }
-
-  Serial.println("ADVANCE STARTED");
-  moveLoadCellServoSlow(LOADCELL_CLOSED, LOADCELL_OPEN,
-                        LOADCELL_OPEN_SPEED);
-  Serial.println("LOAD CELL GATE: OPEN");
-  waitWithRejectService(LOADCELL_OPEN_TIME);
-  pwm.setPWM(LOADCELL_SERVO, 0, LOADCELL_CLOSED);
-  Serial.println("LOAD CELL GATE: CLOSED");
-  Serial.println("ADVANCE COMPLETE");
-}
+// =====================================================
+// SERIAL COMMANDS
+// urgentOnly = true  -> REJECT lang ang tinatanggap
+//                       (habang nagso-sort)
+// urgentOnly = false -> lahat ng commands
+//
+// REJECT:CRACK | REJECT:ROTTEN | MEASURE:GOOD | MEASURE:UNDEFINED | STATUS
+// =====================================================
 
 void handleSerialCommands(bool urgentOnly) {
-  while ((!urgentOnly && pendingCommandCount > 0) || Serial.available() > 0) {
-    String command;
-    if (!urgentOnly && pendingCommandCount > 0) {
-      command = pendingCommands[0];
-      for (uint8_t index = 1; index < pendingCommandCount; index++) {
-        pendingCommands[index - 1] = pendingCommands[index];
-      }
-      pendingCommandCount--;
-    } else {
-      command = Serial.readStringUntil('\n');
-    }
+
+  while (Serial.available() > 0) {
+
+    String command = Serial.readStringUntil('\n');
     command.trim();
     command.toUpperCase();
 
@@ -469,152 +236,78 @@ void handleSerialCommands(bool urgentOnly) {
       continue;
     }
 
-    if (command == "PING") {
-      Serial.println("PONG");
-      continue;
-    }
-
+    // ---------- REJECT:CRACK / REJECT:ROTTEN ----------
     if (command.startsWith("REJECT:")) {
+
       String quality = command.substring(7);
       quality.trim();
+
       if (quality != "CRACK" && quality != "ROTTEN") {
+
         Serial.println("REJECT FAILED: INVALID QUALITY");
+
       } else if (!pcaReady) {
+
         Serial.println("REJECT FAILED: PCA9685 NOT FOUND");
+
       } else {
+
         Serial.print("CAMERA REJECT : ");
         Serial.println(quality);
+
         startRejectServo();
       }
+
       continue;
     }
 
+    // Habang busy, REJECT lang ang pwede
     if (urgentOnly) {
-      if (pendingCommandCount < MAX_PENDING_COMMANDS) {
-        pendingCommands[pendingCommandCount++] = command;
+      Serial.println("COMMAND IGNORED: BUSY");
+      continue;
+    }
+
+    // Flask only authorizes a non-defective egg to leave the load cell after
+    // its camera result is matched to this physical egg.
+    if (command.startsWith("MEASURE:")) {
+      String quality = command.substring(8);
+      quality.trim();
+      if (!eggDetected || processingEgg) {
+        Serial.println("MEASURE FAILED: NO EGG WAITING");
+      } else if (quality != "GOOD" && quality != "UNDEFINED") {
+        Serial.println("MEASURE FAILED: INVALID QUALITY");
       } else {
-        Serial.println("COMMAND REJECTED: COMMAND QUEUE FULL");
+        measurementAuthorized = true;
+        Serial.print("CAMERA QUALITY: ");
+        Serial.println(quality);
       }
       continue;
     }
 
     if (command == "STATUS") {
-      printHardwareStatus();
+      Serial.print("PCA9685 READY: ");
+      Serial.println(pcaReady ? "YES" : "NO");
+      Serial.println("HX711 READY: YES");
+      Serial.print("LOAD CELL GATE: ");
+      Serial.println("CLOSED");
+      Serial.print("CONTROLLER STATE: ");
+      Serial.println(processingEgg ? "SORTING" : (eggDetected ? "WAITING FOR CAMERA" : "READY"));
       continue;
     }
 
-    if (command == "SERVO_TEST") {
-      testAllServos();
-      continue;
-    }
+    // ---------- CRACK_TEST ----------
+    if (command == "CRACK_TEST") {
 
-    if (command == "TARE") {
-      if (eggDetected || sorting) {
-        Serial.println("TARE REJECTED: REMOVE EGG FIRST");
-      } else if (!scale.wait_ready_timeout(1000)) {
-        Serial.println("TARE REJECTED: HX711 NOT READY");
+      if (processingEgg) {
+        Serial.println("CRACK TEST REJECTED: EGG CYCLE ACTIVE");
+      } else if (!pcaReady) {
+        Serial.println("CRACK TEST REJECTED: PCA9685 NOT FOUND");
       } else {
-        scale.tare(25);
-        resetEggState();
-        Serial.println("TARE COMPLETE");
-        printHardwareStatus();
+        Serial.println("CRACK TEST STARTED");
+        activateCrackServo();
+        Serial.println("CRACK TEST COMPLETE");
       }
-      continue;
-    }
 
-    if (command.startsWith("CALIBRATE:")) {
-      String massText = command.substring(10);
-      massText.trim();
-      float referenceGrams = massText.toFloat();
-      if (measurementAuthorized || measurementReady || sorting) {
-        Serial.println("CALIBRATION REJECTED: EGG CYCLE ACTIVE");
-      } else if (referenceGrams <= 0.0f || referenceGrams > 1000.0f ||
-                 isnan(referenceGrams) || isinf(referenceGrams)) {
-        Serial.println("CALIBRATION REJECTED: USE A KNOWN MASS IN GRAMS");
-      } else if (!scale.wait_ready_timeout(1000)) {
-        Serial.println("CALIBRATION REJECTED: HX711 NOT READY");
-      } else {
-        // Tare with an empty platform first. get_value() subtracts that
-        // stored offset but does not apply the old scale factor.
-        float newFactor = (float)scale.get_value(10) / referenceGrams;
-        if (isnan(newFactor) || isinf(newFactor) || fabs(newFactor) < 1.0f) {
-          Serial.println("CALIBRATION REJECTED: CHECK TARE AND REFERENCE MASS");
-        } else {
-          calibrationFactor = newFactor;
-          scale.set_scale(calibrationFactor);
-          scaleSettings.putFloat("scale_factor", calibrationFactor);
-          resetEggState();
-          Serial.println("CALIBRATION COMPLETE");
-          printHardwareStatus();
-        }
-      }
-      continue;
-    }
-
-    if (command == "ADVANCE") {
-      advanceLoadCellGate();
-      continue;
-    }
-
-    if (command.startsWith("MEASURE:")) {
-      String quality = command.substring(8);
-      quality.trim();
-
-      if (!eggDetected) {
-        Serial.println("MEASURE REJECTED: NO EGG");
-      } else if (measurementReady || sorting) {
-        Serial.println("MEASURE REJECTED: CYCLE ALREADY MEASURED");
-      } else if (!validQuality(quality)) {
-        Serial.println("MEASURE REJECTED: INVALID QUALITY");
-      } else {
-        lockedQuality = quality;
-        measurementAuthorized = true;
-        stableWeightCount = 0;
-        readingNumber = 0;
-        lastReadingAt = 0;
-        Serial.print("CAMERA QUALITY : ");
-        Serial.println(lockedQuality);
-        Serial.println("MEASUREMENT STARTED");
-      }
-      continue;
-    }
-
-    // Permit a simple camera "GOOD" / "UNDEFINED" result as an alias for
-    // MEASURE:<QUALITY>. The Flask bridge sends MEASURE:GOOD, but accepting
-    // this form prevents a compatible camera sender from leaving a good egg
-    // held on the scale without starting the load-cell cycle.
-    if (command == "GOOD" || command == "UNDEFINED") {
-      if (!eggDetected) {
-        Serial.println("MEASURE REJECTED: NO EGG");
-      } else if (measurementReady || sorting) {
-        Serial.println("MEASURE REJECTED: CYCLE ALREADY MEASURED");
-      } else {
-        lockedQuality = command;
-        measurementAuthorized = true;
-        stableWeightCount = 0;
-        readingNumber = 0;
-        lastReadingAt = 0;
-        Serial.print("CAMERA QUALITY : ");
-        Serial.println(lockedQuality);
-        Serial.println("MEASUREMENT STARTED");
-      }
-      continue;
-    }
-
-    if (command.startsWith("SORT:")) {
-      String requestedSize = command.substring(5);
-      requestedSize.trim();
-      requestedSize.replace(" ", "_");
-
-      if (!measurementReady) {
-        Serial.println("SORT REJECTED: WEIGHT NOT READY");
-      } else if (sorting) {
-        Serial.println("SORT REJECTED: SORT ALREADY ACTIVE");
-      } else if (!validSize(requestedSize)) {
-        Serial.println("SORT REJECTED: INVALID SIZE");
-      } else {
-        performSort(requestedSize);
-      }
       continue;
     }
 
@@ -623,159 +316,496 @@ void handleSerialCommands(bool urgentOnly) {
   }
 }
 
+// =====================================================
+// SLOW SIZE SERVO MOVEMENT
+// =====================================================
+
+void moveServoSlow(
+  uint8_t channel,
+  int startAngle,
+  int targetAngle,
+  int stepDelay
+) {
+
+  if (startAngle < targetAngle) {
+
+    for (int angle = startAngle; angle <= targetAngle; angle++) {
+      setServoAngle(channel, angle);
+      waitWithRejectService(stepDelay);
+    }
+
+  } else {
+
+    for (int angle = startAngle; angle >= targetAngle; angle--) {
+      setServoAngle(channel, angle);
+      waitWithRejectService(stepDelay);
+    }
+  }
+}
+
+// =====================================================
+// SLOW LOAD-CELL SERVO OPEN
+// =====================================================
+
+void moveLoadCellServoSlow(
+  int startPulse,
+  int targetPulse,
+  int stepDelay
+) {
+
+  if (startPulse > targetPulse) {
+
+    for (int pulse = startPulse; pulse >= targetPulse; pulse--) {
+      pwm.setPWM(LOADCELL_SERVO, 0, pulse);
+      waitWithRejectService(stepDelay);
+    }
+
+  } else {
+
+    for (int pulse = startPulse; pulse <= targetPulse; pulse++) {
+      pwm.setPWM(LOADCELL_SERVO, 0, pulse);
+      waitWithRejectService(stepDelay);
+    }
+  }
+}
+
+// =====================================================
+// READ WEIGHT
+// =====================================================
+
+int readWeight() {
+
+  float weight = scale.get_units(10);
+
+  if (weight > -10 && weight < 10) {
+    weight = 0;
+  }
+
+  return round(weight);
+}
+
+// =====================================================
+// ACTIVATE SIZE SERVO
+// =====================================================
+
+void activateSizeServo(
+  uint8_t channel,
+  int openAngle,
+  int closedAngle,
+  const char* sizeName
+) {
+
+  Serial.println();
+
+  Serial.print(sizeName);
+  Serial.println(" EGG ARRIVING");
+
+  // OPEN FAST
+  Serial.print("OPENING ");
+  Serial.print(sizeName);
+  Serial.println(" SERVO");
+
+  setServoAngle(channel, openAngle);
+
+  waitWithRejectService(SIZE_GATE_OPEN_TIME);
+
+  // CLOSE SLOWLY
+  Serial.print("SLOWLY CLOSING ");
+  Serial.print(sizeName);
+  Serial.println(" SERVO");
+
+  moveServoSlow(channel, openAngle, closedAngle, SIZE_CLOSE_SPEED);
+
+  Serial.print(sizeName);
+  Serial.println(" SERVO: CLOSED");
+}
+
+// =====================================================
+// CLOSE ALL SERVOS
+// =====================================================
+
+void closeAllServos() {
+
+  pwm.setPWM(LOADCELL_SERVO, 0, LOADCELL_CLOSED);
+
+  setServoAngle(CRACK_SERVO, CRACK_CLOSED);
+  rejectGateOpen = false;
+
+  setServoAngle(SMALL_SERVO, SMALL_CLOSED);
+  setServoAngle(MEDIUM_SERVO, MEDIUM_CLOSED);
+  setServoAngle(LARGE_SERVO, LARGE_CLOSED);
+  setServoAngle(XL_SERVO, XL_CLOSED);
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
 void setup() {
+
   Serial.begin(115200);
-  Serial.setTimeout(100);
+  Serial.setTimeout(100);   // para hindi mag-antay ng matagal sa serial
 
   Wire.begin(SDA_PIN, SCL_PIN);
+
+  // Check muna kung nakikita ang PCA9685
   Wire.beginTransmission(0x40);
-  pcaReady = Wire.endTransmission() == 0;
+  pcaReady = (Wire.endTransmission() == 0);
+
   if (pcaReady) {
+
     pwm.begin();
     pwm.setPWMFreq(50);
+
     delay(500);
+
+    // DEFAULT = ALL CLOSED (kasama na ang crack servo)
     closeAllServos();
   }
 
-  scale.begin(HX711_DOUT_PIN, HX711_CLK_PIN);
-  scaleSettings.begin("eggsort", false);
-  calibrationFactor = scaleSettings.getFloat("scale_factor", DEFAULT_CALIBRATION_FACTOR);
-  if (isnan(calibrationFactor) || isinf(calibrationFactor) ||
-      fabs(calibrationFactor) < 1.0f) {
-    calibrationFactor = DEFAULT_CALIBRATION_FACTOR;
-  }
-  scale.set_scale(calibrationFactor);
-  unsigned long hxStartedAt = millis();
-  while (!scale.is_ready() && millis() - hxStartedAt < 3000) {
-    delay(25);
-  }
-  hx711Ready = scale.is_ready();
-  if (hx711Ready) {
-    scale.tare(25);
-  }
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("EGGSOR+ SORTING TEST");
+  Serial.println("================================");
 
-  resetEggState();
-  Serial.println("Egg Sorting Ready");
-  printHardwareStatus();
+  Serial.print("PCA9685 READY: ");
+  Serial.println(pcaReady ? "YES" : "NO");
+
+  Serial.println("REJECT SERVO: CLOSED");
+  Serial.println("LOAD CELL GATE: CLOSED");
+  Serial.println("SMALL SERVO: CLOSED");
+  Serial.println("MEDIUM SERVO: CLOSED");
+  Serial.println("LARGE SERVO: CLOSED");
+  Serial.println("XL SERVO: CLOSED");
+
+  // ===================================================
+  // HX711
+  // ===================================================
+
+  scale.begin(DOUT, CLK);
+
+  scale.set_scale(calibration_factor);
+
+  Serial.println();
+  Serial.println("REMOVE ALL WEIGHT");
+
+  delay(2500);
+
+  scale.tare(25);
+
+  Serial.println("TARE COMPLETE");
+
+  Serial.println();
+  Serial.println("--------------------------------");
+  Serial.println("READY FOR EGG");
+  Serial.println("Commands: REJECT:CRACK | REJECT:ROTTEN | CRACK_TEST");
+  Serial.println("--------------------------------");
 }
 
+// =====================================================
+// LOOP
+// =====================================================
+
 void loop() {
+
+  // Laging i-check ang serial at reject timer
   handleSerialCommands(false);
   updateRejectServo();
 
-  if (sorting) {
+  int currentWeight = readWeight();
+
+  // ===================================================
+  // NO EGG
+  // ===================================================
+
+  if (currentWeight < EGG_THRESHOLD) {
+
+    sameCount = 0;
+    lastWeight = -1;
+
+    if (!zeroPrinted) {
+      Serial.println("WEIGHT: 0 g");
+      zeroPrinted = true;
+    }
+
+    if (eggDetected) {
+      Serial.println("EGG LEFT");
+      eggDetected = false;
+      measurementAuthorized = false;
+    }
+
+    waitWithRejectService(600);
+
     return;
   }
 
-  unsigned long now = millis();
+  // ===================================================
+  // EGG DETECTED
+  // ===================================================
+
+  zeroPrinted = false;
 
   if (!eggDetected) {
-    if (now - lastReadingAt < 350) {
-      return;
-    }
-    lastReadingAt = now;
-
-    int weight = readWeight();
-    if (weight != INVALID_WEIGHT &&
-        weight >= EGG_PRESENT_THRESHOLD_GRAMS) {
-      occupiedReadingCount++;
-    } else {
-      occupiedReadingCount = 0;
-    }
-
-    if (weight != INVALID_WEIGHT &&
-        now - lastStatusAt >= IDLE_WEIGHT_INTERVAL_MS) {
-      lastStatusAt = now;
-      Serial.print("LIVE WEIGHT : ");
-      Serial.print(weight);
-      Serial.println(" g");
-    }
-
-    if (occupiedReadingCount >= 2) {
-      eggDetected = true;
-      stableWeightCount = 0;
-      readingNumber = 0;
-      emptyReadingCount = 0;
-      occupiedReadingCount = 0;
-      lastStatusAt = now;
-      Serial.println("Egg Detected");
-      Serial.print("LIVE WEIGHT : ");
-      Serial.print(weight);
-      Serial.println(" g");
-      Serial.println("WAITING FOR CAMERA QUALITY");
-    }
-    return;
+    eggDetected = true;
+    measurementAuthorized = false;
+    Serial.println("EGG DETECTED");
   }
 
-  if (!measurementAuthorized && !measurementReady) {
-    if (now - lastReadingAt >= 500) {
-      lastReadingAt = now;
-      int weight = readWeight();
-      if (weight != INVALID_WEIGHT) {
-        Serial.print("LIVE WEIGHT : ");
-        Serial.print(weight);
-        Serial.println(" g");
-      }
-      if (weight != INVALID_WEIGHT && weight <= EGG_CLEAR_THRESHOLD_GRAMS) {
-        emptyReadingCount++;
-        if (emptyReadingCount >= 3) {
-          Serial.println("Egg Left");
-          resetEggState();
-          return;
-        }
-      } else {
-        emptyReadingCount = 0;
-      }
-    }
+  Serial.print("WEIGHT: ");
+  Serial.print(currentWeight);
+  Serial.println(" g");
 
-    if (now - lastStatusAt >= STATUS_INTERVAL_MS) {
-      lastStatusAt = now;
-      Serial.println("WAITING FOR CAMERA QUALITY");
-    }
-    return;
+  // ===================================================
+  // EXACT SAME READING CHECK
+  // ===================================================
+
+  if (currentWeight == lastWeight) {
+
+    sameCount++;
+
+  } else {
+
+    lastWeight = currentWeight;
+    sameCount = 1;
   }
 
-  if (measurementAuthorized && !measurementReady) {
-    if (now - lastReadingAt < SAMPLE_INTERVAL_MS) {
-      return;
-    }
-    lastReadingAt = now;
+  Serial.print("SAME READING COUNT: ");
+  Serial.println(sameCount);
 
-    int weight = readWeight();
-    if (weight == INVALID_WEIGHT) {
-      Serial.println("LOAD CELL NOT READY");
-      return;
-    }
+  // ===================================================
+  // THREE IDENTICAL READINGS
+  // ===================================================
 
-    if (weight <= EGG_CLEAR_THRESHOLD_GRAMS) {
-      emptyReadingCount++;
-      if (emptyReadingCount >= 3) {
-        Serial.println("Egg Left");
-        resetEggState();
-      }
-      return;
-    }
-    emptyReadingCount = 0;
+  if (sameCount >= 3 && !processingEgg && measurementAuthorized) {
 
-    readingNumber++;
-    Serial.print("Reading ");
-    Serial.print(readingNumber);
-    Serial.print(": ");
-    Serial.print(weight);
+    processingEgg = true;
+
+    int finalWeight = currentWeight;
+    int eggSize = 0;
+
+    Serial.println();
+    Serial.println("================================");
+
+    Serial.print("FINAL WEIGHT: ");
+    Serial.print(finalWeight);
     Serial.println(" g");
 
-    addStableWeight(weight);
+    // =================================================
+    // CLASSIFICATION
+    // =================================================
 
-    if (stableWeightAvailable()) {
-      finishMeasurementAndRelease();
+    if (finalWeight < 45) {
+
+      eggSize = 1;
+      Serial.println("SIZE: SMALL");
+
+    } else if (finalWeight <= 54) {
+
+      eggSize = 2;
+      Serial.println("SIZE: MEDIUM");
+
+    } else if (finalWeight <= 62) {
+
+      eggSize = 3;
+      Serial.println("SIZE: LARGE");
+
+    } else if (finalWeight <= 69) {
+
+      eggSize = 4;
+      Serial.println("SIZE: EXTRA LARGE");
+
+    } else {
+
+      eggSize = 5;
+      Serial.println("SIZE: JUMBO");
     }
-    return;
+
+    Serial.println("================================");
+
+    // =================================================
+    // SLOW OPEN LOAD-CELL GATE
+    // =================================================
+
+    Serial.println();
+    Serial.println("SLOW OPEN LOAD CELL GATE");
+
+    moveLoadCellServoSlow(
+      LOADCELL_CLOSED,
+      LOADCELL_OPEN,
+      LOADCELL_OPEN_SPEED
+    );
+
+    Serial.println("LOAD CELL GATE: OPEN");
+
+    // =================================================
+    // START TRAVEL TIMER HERE
+    // =================================================
+
+    unsigned long travelStart = millis();
+
+    Serial.println("EGG RELEASED");
+    Serial.println("TRAVEL TIMER STARTED");
+
+    // =================================================
+    // KEEP LOAD-CELL GATE OPEN
+    // =================================================
+
+    waitWithRejectService(LOADCELL_OPEN_TIME);
+
+    // =================================================
+    // FAST CLOSE LOAD-CELL GATE
+    // =================================================
+
+    Serial.println();
+    Serial.println("CLOSE LOAD CELL GATE");
+
+    pwm.setPWM(LOADCELL_SERVO, 0, LOADCELL_CLOSED);
+
+    Serial.println("LOAD CELL GATE: CLOSED");
+
+    // =================================================
+    // SELECT TRAVEL TIME
+    // =================================================
+
+    unsigned long selectedTravelTime = 0;
+
+    if (eggSize == 1 || eggSize == 2) {
+
+      // SMALL / MEDIUM
+      selectedTravelTime = SM_TRAVEL_TIME;
+
+      Serial.println();
+      Serial.println("S/M TRAVEL TIME: 2.0 SECONDS");
+
+    } else if (eggSize == 3) {
+
+      // LARGE
+      selectedTravelTime = LARGE_TRAVEL_TIME;
+
+      Serial.println();
+      Serial.println("LARGE TRAVEL TIME: 8.7 SECONDS");
+
+    } else if (eggSize == 4) {
+
+      // EXTRA LARGE
+      selectedTravelTime = XL_TRAVEL_TIME;
+
+      Serial.println();
+      Serial.println("XL TRAVEL TIME: 8.5 SECONDS");
+    }
+
+    // =================================================
+    // WAIT UNTIL TRAVEL TIME IS REACHED
+    // =================================================
+
+    if (selectedTravelTime > 0) {
+
+      Serial.println("EGG TRAVELLING...");
+
+      while (millis() - travelStart < selectedTravelTime) {
+        waitWithRejectService(10);
+      }
+
+      Serial.println("TRAVEL TIME REACHED");
+    }
+
+    // =================================================
+    // SMALL
+    // =================================================
+
+    if (eggSize == 1) {
+
+      activateSizeServo(SMALL_SERVO, SMALL_OPEN, SMALL_CLOSED, "SMALL");
+    }
+
+    // =================================================
+    // MEDIUM
+    // =================================================
+
+    else if (eggSize == 2) {
+
+      activateSizeServo(MEDIUM_SERVO, MEDIUM_OPEN, MEDIUM_CLOSED, "MEDIUM");
+    }
+
+    // =================================================
+    // LARGE
+    // =================================================
+
+    else if (eggSize == 3) {
+
+      activateSizeServo(LARGE_SERVO, LARGE_OPEN, LARGE_CLOSED, "LARGE");
+    }
+
+    // =================================================
+    // EXTRA LARGE
+    // =================================================
+
+    else if (eggSize == 4) {
+
+      activateSizeServo(XL_SERVO, XL_OPEN, XL_CLOSED, "EXTRA LARGE");
+    }
+
+    // =================================================
+    // JUMBO
+    // =================================================
+
+    else if (eggSize == 5) {
+
+      Serial.println();
+      Serial.println("JUMBO EGG");
+      Serial.println("NO SIZE SERVO ACTION");
+      Serial.println("JUMBO GOES STRAIGHT");
+    }
+
+    const char* completedSize = eggSize == 1 ? "SMALL" :
+      eggSize == 2 ? "MEDIUM" : eggSize == 3 ? "LARGE" :
+      eggSize == 4 ? "EXTRA LARGE" : "JUMBO";
+    Serial.print("SERVO SORTED: ");
+    Serial.println(completedSize);
+
+    // =================================================
+    // CHECK LOAD CELL
+    // =================================================
+
+    Serial.println();
+    Serial.println("CHECKING LOAD CELL...");
+
+    int remainingWeight = readWeight();
+
+    while (remainingWeight >= EGG_THRESHOLD) {
+
+      Serial.print("EGG STILL DETECTED: ");
+      Serial.print(remainingWeight);
+      Serial.println(" g");
+
+      Serial.println("WAITING FOR EGG TO LEAVE...");
+
+      waitWithRejectService(500);
+
+      remainingWeight = readWeight();
+    }
+
+    // =================================================
+    // RESET
+    // =================================================
+
+    Serial.println();
+    Serial.println("NO EGG DETECTED");
+    Serial.println("LOAD CELL IS CLEAR");
+
+    sameCount = 0;
+    lastWeight = -1;
+    processingEgg = false;
+
+    zeroPrinted = false;
+
+    Serial.println();
+    Serial.println("--------------------------------");
+    Serial.println("READY FOR NEXT EGG");
+    Serial.println("--------------------------------");
+
+    waitWithRejectService(600);
   }
 
-  if (measurementReady && !sorting &&
-      now - lastStatusAt >= STATUS_INTERVAL_MS) {
-    lastStatusAt = now;
-    Serial.println("AUTO SORT RETRY");
-    performSort(measuredSize);
-  }
+  waitWithRejectService(600);
 }

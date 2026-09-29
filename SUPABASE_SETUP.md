@@ -32,10 +32,17 @@
    ```
 
 7. Start the application normally. It creates any missing tables in Supabase
-   automatically.
+automatically.
 
    ```powershell
    .\.venv\Scripts\python.exe app.py
+   ```
+
+8. Confirm the application is actually connected to Supabase and inspect the
+   persisted record counts (it does not print credentials):
+
+   ```powershell
+   .\.venv\Scripts\python.exe verify_supabase.py
    ```
 
 Do not use the Supabase anon key or service-role key for this Flask database
