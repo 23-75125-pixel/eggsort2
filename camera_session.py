@@ -64,7 +64,12 @@ class CameraDetectionSession:
         self._passage_misses = 0
         self._passage_defect: str | None = None
         self._passage_reject_sent = False
+        self._active_capture: dict[str, Any] | None = None
+        self._last_capture: dict[str, Any] | None = None
+        self._egg_count = 0
+        self._quality_counts = {label: 0 for label in EGG_QUALITY_LABELS}
         self._reject_handler: Callable[[str], Any] | None = None
+        self._capture_handler: Callable[[dict[str, Any]], Any] | None = None
         self._reject_error: str | None = None
 
         self._error: str | None = None
@@ -84,10 +89,10 @@ class CameraDetectionSession:
         self.camera_fps = int(os.environ.get("CAMERA_FPS", "30"))
         self.jpeg_quality = int(os.environ.get("CAMERA_JPEG_QUALITY", "72"))
         self.inspection_left = float(
-            os.environ.get("CAMERA_INSPECTION_LEFT", "0.35")
+            os.environ.get("CAMERA_INSPECTION_LEFT", "0.25")
         )
         self.inspection_right = float(
-            os.environ.get("CAMERA_INSPECTION_RIGHT", "0.65")
+            os.environ.get("CAMERA_INSPECTION_RIGHT", "0.75")
         )
         self.inspection_top = float(
             os.environ.get("CAMERA_INSPECTION_TOP", "0.20")
@@ -99,7 +104,7 @@ class CameraDetectionSession:
             1, int(os.environ.get("CAMERA_PASSAGE_EXIT_SAMPLES", "2"))
         )
         self.capture_min_samples = max(
-            1, int(os.environ.get("CAMERA_QUALITY_SAMPLES", "3"))
+            1, int(os.environ.get("CAMERA_QUALITY_SAMPLES", "1"))
         )
         self.capture_max_age = max(
             1.0, float(os.environ.get("CAMERA_CAPTURE_MAX_AGE_SECONDS", "60"))
@@ -147,6 +152,10 @@ class CameraDetectionSession:
             self._passage_misses = 0
             self._passage_defect = None
             self._passage_reject_sent = False
+            self._active_capture = None
+            self._last_capture = None
+            self._egg_count = 0
+            self._quality_counts = {label: 0 for label in EGG_QUALITY_LABELS}
             self._reject_error = None
             self._error = None
             self._stream_fps = 0.0
@@ -225,7 +234,15 @@ class CameraDetectionSession:
                 "inference_ms": round(self._inference_ms),
                 "model": dict(self._model_info) if self._model_info else None,
                 "quality_queue": len(self._captured_qualities),
-                "inspection_active": bool(self._passage_samples),
+                "inspection_active": self._active_capture is not None,
+                "egg_count": self._egg_count,
+                "quality_counts": dict(self._quality_counts),
+                "active_capture": (
+                    dict(self._active_capture) if self._active_capture else None
+                ),
+                "last_capture": (
+                    dict(self._last_capture) if self._last_capture else None
+                ),
                 "reject_error": self._reject_error,
             }
 
@@ -364,64 +381,80 @@ class CameraDetectionSession:
         with self._lock:
             self._reject_handler = handler
 
+    def set_capture_handler(
+        self, handler: Callable[[dict[str, Any]], Any]
+    ) -> None:
+        with self._lock:
+            self._capture_handler = handler
+
     def _process_auto_capture(self, label: str, confidence: float) -> None:
         """Send a defect immediately, outside the camera lock; retry while visible."""
         with self._quality_ready:
-            self._update_auto_capture(label, confidence)
+            completed = self._update_auto_capture(label, confidence)
             defect = self._passage_defect
             handler = self._reject_handler
+            capture_handler = self._capture_handler
             should_send = defect is not None and not self._passage_reject_sent
             self._quality_ready.notify_all()
-        if not should_send:
-            return
-        try:
-            if handler is None:
-                raise RuntimeError("Camera reject command handler is not connected.")
-            handler(defect)
-        except RuntimeError as exc:
-            with self._lock:
-                self._reject_error = f"Channel 0 reject command failed: {exc}"
-        else:
-            with self._lock:
-                self._passage_reject_sent = True
-                self._reject_error = None
+        if should_send:
+            try:
+                if handler is None:
+                    raise RuntimeError("Camera reject command handler is not connected.")
+                handler(defect)
+            except RuntimeError as exc:
+                with self._lock:
+                    self._reject_error = f"Channel 0 reject command failed: {exc}"
+            else:
+                with self._lock:
+                    self._passage_reject_sent = True
+                    self._reject_error = None
+        if completed is not None and capture_handler is not None:
+            capture_handler(completed)
 
-    def _update_auto_capture(self, label: str, confidence: float) -> None:
-        """Latch defects on first detection; queue only eggs eligible for weighing."""
+    def _update_auto_capture(
+        self, label: str, confidence: float
+    ) -> dict[str, Any] | None:
+        """Capture one egg per zone passage; queue Good/Undefined on exit."""
         if label in EGG_QUALITY_LABELS:
+            if self._active_capture is None:
+                self._active_capture = {
+                    "capture_id": self._egg_count + 1,
+                    "label": label,
+                    "confidence": round(confidence, 4),
+                    "entered_at": monotonic(),
+                }
             self._passage_samples.append((label, confidence))
             self._passage_misses = 0
             if label in {"crack", "rotten"} and self._passage_defect is None:
                 self._passage_defect = label
-            return
+                self._active_capture["label"] = label
+                self._active_capture["confidence"] = round(confidence, 4)
+            return None
 
-        if not self._passage_samples:
-            return
+        if self._active_capture is None:
+            return None
         self._passage_misses += 1
         if self._passage_misses < self.passage_exit_samples:
-            return
+            return None
 
-        samples = self._passage_samples
+        sample_count = len(self._passage_samples)
+        capture = dict(self._active_capture)
         self._passage_samples = []
         self._passage_misses = 0
-        rejected = self._passage_defect is not None
+        self._active_capture = None
         self._passage_defect = None
         self._passage_reject_sent = False
-        # Rejects leave the conveyor before the scale. Queuing them would
-        # incorrectly assign their quality to the next egg on the load cell.
-        if rejected:
-            return
-        if len(samples) < self.capture_min_samples:
-            return
+        if sample_count < self.capture_min_samples:
+            return None
 
-        summary = self._summarize_quality(samples)
-        selected_label = str(summary["label"])
-        peak_confidence = float(summary["confidence"])
-        self._captured_qualities.append({
-            "label": selected_label,
-            "confidence": round(peak_confidence, 4),
-            "captured_at": monotonic(),
-        })
+        capture["captured_at"] = monotonic()
+        self._egg_count += 1
+        self._quality_counts[capture["label"]] += 1
+        self._last_capture = dict(capture)
+        # Rejected eggs are counted, but never assigned to a load-cell egg.
+        if capture["label"] in {"good", "undefined"}:
+            self._captured_qualities.append(dict(capture))
+        return capture
 
     def wait_for_frame(
         self, previous_sequence: int, timeout: float = 2.0

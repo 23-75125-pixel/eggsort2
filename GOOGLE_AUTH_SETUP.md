@@ -46,9 +46,13 @@ hours. Staff choose their own password and then use the same login form.
 
 - Admin: Google verification on first use, then either Google or password
   sign-in, with access to all pages and User Management.
-- Staff: invite-only username/password sign-in and all operational pages, but
-  no User Management page or user APIs.
-- Staff cannot self-register, and staff Google sign-in is rejected.
+- Staff: invite-only accounts open the emailed link, verify the exact invited
+  Google email, and create a password. This stores the Google profile name and
+  photo for the staff account. Afterwards they can sign in using either the
+  verified Google account or their staff password, but have no User Management
+  page or user APIs.
+- Staff cannot self-register. A different Google account cannot accept an
+  invitation or replace the invited person's profile.
 - Invitation links are single-use and expire after 24 hours.
 
 For a deployed site, use HTTPS and add the deployed callback URL to the same

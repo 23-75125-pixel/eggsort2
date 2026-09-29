@@ -9,15 +9,16 @@
       ],
       "includePath": [
         "${workspaceFolder}/esp32/**",
-        "C:/Users/Lira Angela Ata/AppData/Local/Arduino15/packages/esp32/hardware/esp32/3.3.11/cores/esp32",
-        "C:/Users/Lira Angela Ata/AppData/Local/Arduino15/packages/esp32/hardware/esp32/3.3.11/variants/esp32",
-        "C:/Users/Lira Angela Ata/AppData/Local/Arduino15/packages/esp32/hardware/esp32/3.3.11/libraries/Wire/src",
-        "C:/Users/Lira Angela Ata/AppData/Local/Arduino15/packages/esp32/tools/esp32-libs/3.3.11/include/**",
-        "C:/Users/Lira Angela Ata/AppData/Local/Arduino15/packages/esp32/tools/esp32-libs/3.3.11/qio_qspi/include",
+        "C:/Users/Lira Angela Ata/AppData/Local/Arduino15/packages/esp32/hardware/esp32/3.3.12/cores/esp32",
+        "C:/Users/Lira Angela Ata/AppData/Local/Arduino15/packages/esp32/hardware/esp32/3.3.12/variants/esp32",
+        "C:/Users/Lira Angela Ata/AppData/Local/Arduino15/packages/esp32/hardware/esp32/3.3.12/libraries/Wire/src",
+        "C:/Users/Lira Angela Ata/AppData/Local/Arduino15/packages/esp32/hardware/esp32/3.3.12/libraries/Preferences/src",
+        "C:/Users/Lira Angela Ata/AppData/Local/Arduino15/packages/esp32/tools/esp32-libs/3.3.12/include/**",
+        "C:/Users/Lira Angela Ata/AppData/Local/Arduino15/packages/esp32/tools/esp32-libs/3.3.12/qio_qspi/include",
         "C:/Users/Lira Angela Ata/Documents/Arduino/libraries/**"
       ],
       "forcedInclude": [
-        "C:/Users/Lira Angela Ata/AppData/Local/Arduino15/packages/esp32/hardware/esp32/3.3.11/cores/esp32/Arduino.h"
+        "C:/Users/Lira Angela Ata/AppData/Local/Arduino15/packages/esp32/hardware/esp32/3.3.12/cores/esp32/Arduino.h"
       ],
       "defines": [
         "ARDUINO=10819",
@@ -32,10 +33,11 @@
       "browse": {
         "path": [
           "${workspaceFolder}/esp32",
-          "C:/Users/Lira Angela Ata/AppData/Local/Arduino15/packages/esp32/hardware/esp32/3.3.11/cores/esp32",
-          "C:/Users/Lira Angela Ata/AppData/Local/Arduino15/packages/esp32/hardware/esp32/3.3.11/variants/esp32",
-          "C:/Users/Lira Angela Ata/AppData/Local/Arduino15/packages/esp32/hardware/esp32/3.3.11/libraries/Wire/src",
-          "C:/Users/Lira Angela Ata/AppData/Local/Arduino15/packages/esp32/tools/esp32-libs/3.3.11/include",
+          "C:/Users/Lira Angela Ata/AppData/Local/Arduino15/packages/esp32/hardware/esp32/3.3.12/cores/esp32",
+          "C:/Users/Lira Angela Ata/AppData/Local/Arduino15/packages/esp32/hardware/esp32/3.3.12/variants/esp32",
+          "C:/Users/Lira Angela Ata/AppData/Local/Arduino15/packages/esp32/hardware/esp32/3.3.12/libraries/Wire/src",
+          "C:/Users/Lira Angela Ata/AppData/Local/Arduino15/packages/esp32/hardware/esp32/3.3.12/libraries/Preferences/src",
+          "C:/Users/Lira Angela Ata/AppData/Local/Arduino15/packages/esp32/tools/esp32-libs/3.3.12/include",
           "C:/Users/Lira Angela Ata/Documents/Arduino/libraries"
         ],
         "limitSymbolsToIncludedHeaders": true

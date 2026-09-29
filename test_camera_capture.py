@@ -80,6 +80,43 @@ class CameraAutoCaptureTests(unittest.TestCase):
 
         self.assertFalse(session._captured_qualities)
 
+    def test_good_capture_waits_for_zone_exit_before_weighing(self) -> None:
+        session = CameraDetectionSession()
+        session._running = True
+        session._update_auto_capture("good", 0.88)
+        self.assertEqual(session.capture_min_samples, 1)
+        self.assertIsNone(session.wait_for_captured_quality(timeout=0.0))
+        session._update_auto_capture("no egg", 0.0)
+        self.assertIsNone(session.wait_for_captured_quality(timeout=0.0))
+        session._update_auto_capture("no egg", 0.0)
+        capture = session.wait_for_captured_quality(timeout=0.0)
+        self.assertEqual(capture["capture_id"], 1)
+        self.assertEqual(capture["label"], "good")
+        self.assertEqual(session.status()["egg_count"], 1)
+        self.assertIsNone(session.wait_for_captured_quality(timeout=0.0))
+
+    def test_defect_latch_blocks_scale_measurement(self) -> None:
+        for defect in ("crack", "rotten"):
+            with self.subTest(defect=defect):
+                session = self.make_session()
+                session._running = True
+                for label in (defect, "good", "good", "good", "no egg", "no egg"):
+                    session._update_auto_capture(label, 0.9)
+                self.assertIsNone(session.wait_for_captured_quality(timeout=0.0))
+                self.assertEqual(session.status()["egg_count"], 1)
+                self.assertEqual(session.status()["last_capture"]["label"], defect)
+
+    def test_completed_camera_capture_survives_scale_inspection_reset(self) -> None:
+        session = self.make_session()
+        for label in ("good", "good", "good", "no egg", "no egg"):
+            session._update_auto_capture(label, 0.86)
+
+        session.begin_egg_inspection()
+        capture = session.wait_for_captured_quality(timeout=0.0)
+        self.assertEqual(capture["capture_id"], 1)
+        self.assertEqual(capture["label"], "good")
+        self.assertEqual(capture["confidence"], 0.86)
+
     def test_separate_eggs_are_queued_in_conveyor_order(self) -> None:
         session = self.make_session()
         for label in ("good", "good", "good", "no egg", "no egg"):
@@ -93,6 +130,28 @@ class CameraAutoCaptureTests(unittest.TestCase):
             [result["label"] for result in session._captured_qualities],
             ["good", "undefined"],
         )
+        self.assertEqual(
+            [result["capture_id"] for result in session._captured_qualities],
+            [1, 3],
+        )
+        self.assertEqual(session.status()["egg_count"], 3)
+
+    def test_one_shot_count_and_capture_event_on_exit(self) -> None:
+        session = CameraDetectionSession()
+        handler = Mock()
+        session.set_capture_handler(handler)
+        for label in ("no egg", "good", "good", "good", "no egg"):
+            session._process_auto_capture(label, 0.8)
+        handler.assert_not_called()
+        self.assertEqual(session.status()["egg_count"], 0)
+        session._process_auto_capture("no egg", 0.0)
+        handler.assert_called_once()
+        self.assertEqual(handler.call_args.args[0]["capture_id"], 1)
+        self.assertEqual(handler.call_args.args[0]["label"], "good")
+        for _ in range(5):
+            session._process_auto_capture("no egg", 0.0)
+        handler.assert_called_once()
+        self.assertEqual(session.status()["quality_counts"]["good"], 1)
 
     def test_each_defect_sends_immediately_once_per_passage(self) -> None:
         for defect in ("crack", "rotten"):

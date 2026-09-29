@@ -130,21 +130,23 @@ From the project folder:
    `no egg` in that order.
 2. Open **Sorting Sessions** and confirm that **ESP32 link** shows
    `Connected on COM... @ 115200`.
-3. As each egg rolls through the marked center zone, Flask automatically
-   collects its detections without stopping the rollers. The first accepted
+3. Each egg is captured once when its detection center enters the marked
+   center zone. After two consecutive no-egg observations, that passage exits
+   the zone and increments the session egg count once. The first accepted
    Crack or Rotten detection immediately sends `REJECT:CRACK` or
    `REJECT:ROTTEN`. Channel 0 opens at the camera, before the load cell, holds
    for 10 seconds, and closes. Repeated frames of the same egg do not restart
    the timer. A separate rejected egg starts a new 10-second hold.
-4. Rejected eggs are excluded from the weighing queue, even if later frames
-   say Good. They receive no weight or size and do not create a weighed Egg
-   Record. Good and Undefined passages need at least three accepted frames;
-   their quality is queued after leaving the zone. `no egg` is never recorded.
+4. Rejected eggs are counted at zone exit but excluded from the weighing queue,
+   even if later frames say Good. They receive no weight or size and do not
+   create a weighed Egg Record. Good and Undefined passages are queued once,
+   after leaving the zone. `no egg` is never counted as an egg.
 5. When an accepted egg reaches the load cell, its gate stays closed and the ESP32
-   sends `Egg Detected`. Flask matches it to the oldest queued camera result
-   and sends `MEASURE:<QUALITY>`.
-6. The ESP32 takes three consecutive stable readings and calculates their
-   average as the final weight and size. The third stable reading automatically
+   sends `Egg Detected`. Flask matches it to the oldest queued zone exit capture
+   and sends `MEASURE:<QUALITY>` with that capture number retained in diagnostics.
+6. The ESP32 takes two consecutive identical rounded gram readings and calculates their
+   average as the final weight and size. Each reading averages five HX711
+   conversions for quicker response. The second matching reading automatically
    triggers sorting; no separate route command is required.
 7. The ESP32 opens servo channel 1 (the load-cell gate), waits for the egg's
    travel time, then moves exactly one correct size gate: channel 5 for Small,
@@ -192,14 +194,17 @@ The timer and reject commands are serviced during normal weighing and size
 gate travel. Camera send failures appear on the sorting page and retry while
 the same egg is visible; rejected eggs are never queued for weighing.
 
-The imported ESP32 program used an HX711 calibration factor of `605.0`. Verify
-it with a known calibration weight before sorting eggs. If readings are
-negative, reverse the load-cell signal pair or use a calibration factor with
-the opposite sign.
+The firmware starts with an HX711 calibration factor of `622.0` until you
+calibrate it for your own load cell. With the scale empty, send `TARE` in
+Serial Monitor and wait for `TARE COMPLETE`. Place a known mass on the scale,
+then send `CALIBRATE:<grams>` (for example, `CALIBRATE:100` for a 100 g mass).
+Wait for `CALIBRATION COMPLETE` and check `LIVE WEIGHT`. The new scale factor
+is saved on the ESP32 and reused after a restart. Remove the mass before
+sorting. Stop Flask while using Serial Monitor so the COM port is available.
 
 All mechanism-specific values are near the top of the firmware:
 
-- `calibrationFactor`
+- `DEFAULT_CALIBRATION_FACTOR` (used only until the first calibration)
 - `LOADCELL_CLOSED` and `LOADCELL_OPEN`
 - `LOADCELL_OPEN_SPEED`, `LOADCELL_CLOSE_SPEED`, and
   `LOADCELL_CLOSE_SETTLE_TIME`
@@ -207,7 +212,7 @@ All mechanism-specific values are near the top of the firmware:
 - `SIZE_GATE_OPEN_TIME`, `SIZE_GATE_CLOSE_DELAY`,
   `LARGE_SIZE_GATE_CLOSE_DELAY`, `SIZE_CLOSE_SPEED`,
   `LARGE_SIZE_OPEN_SPEED`, and `LARGE_SIZE_CLOSE_SPEED`
-- `SM_TRAVEL_TIME_MS` and `LX_TRAVEL_TIME_MS`
+- `SM_TRAVEL_TIME`, `LARGE_TRAVEL_TIME`, and `EXTRA_LARGE_TRAVEL_TIME`
 
 Disconnect servo power before changing linkages. Tune one gate at a time with
 small angle changes so a servo is not driven against a mechanical stop.

@@ -51,6 +51,39 @@ class Esp32BridgeDiagnosticsTests(unittest.TestCase):
         self.assertEqual(connection.write.call_args_list, [call(b"STATUS\n")] * 2)
         connection.close.assert_called_once()
 
+    def test_egg_detected_discards_idle_zero_and_accepts_new_live_weight(self) -> None:
+        bridge = Esp32Bridge()
+        connection = Mock()
+        readings = [
+            b"LIVE WEIGHT : 0 g\n",
+            b"Egg Detected\n",
+            b"LIVE WEIGHT : 64 g\n",
+        ]
+
+        def read_line():
+            line = readings.pop(0)
+            if not readings:
+                bridge._stop_event.set()
+            return line
+
+        connection.readline.side_effect = read_line
+        serial_module = Mock()
+        serial_module.Serial.return_value = connection
+        with patch.dict("sys.modules", {"serial": serial_module}), \
+                patch.object(bridge, "_find_port", return_value="COM_TEST"):
+            bridge._read_loop()
+
+        diagnostics = bridge.status()["diagnostics"]
+        self.assertFalse(diagnostics["awaiting_egg"])
+        self.assertEqual(diagnostics["live_weight_grams"], 64)
+        self.assertEqual(connection.write.call_args_list, [call(b"STATUS\n")])
+
+    def test_egg_detected_clears_stale_idle_weight(self) -> None:
+        bridge = Esp32Bridge()
+        bridge._publish({"type": "load_cell_status", "weight_grams": 0})
+        bridge._publish({"type": "egg_detected", "message": "Egg Detected"})
+        self.assertIsNone(bridge.status()["diagnostics"]["live_weight_grams"])
+
     def test_disconnected_and_missing_board_have_distinct_errors(self) -> None:
         bridge = Esp32Bridge()
         with self.assertRaisesRegex(RuntimeError, "disconnected"):
@@ -116,6 +149,38 @@ class Esp32BridgeDiagnosticsTests(unittest.TestCase):
         self.assertEqual(events[0]["type"], "measurement_quality")
         self.assertEqual(events[0]["quality"], "Good")
 
+    def test_load_cell_gate_messages_are_parsed_and_retained(self) -> None:
+        events = Esp32ProtocolParser().parse("LOAD CELL GATE: OPEN")
+        self.assertEqual(events[0]["type"], "load_cell_gate")
+        self.assertEqual(events[0]["state"], "OPEN")
+
+        bridge = Esp32Bridge()
+        bridge._publish(events[0])
+        bridge._publish({"type": "egg_left", "message": "Egg Left"})
+        diagnostics = bridge.status()["diagnostics"]
+        self.assertEqual(diagnostics["load_cell_gate_state"], "OPEN")
+        self.assertIn("opened", diagnostics["last_gate_event"])
+
+    def test_routed_egg_retains_quality_after_leaving_scale(self) -> None:
+        bridge = Esp32Bridge()
+        bridge._publish({"type": "egg_detected", "message": "Egg Detected"})
+        bridge._publish({
+            "type": "measurement_quality",
+            "quality": "Good",
+            "message": "CAMERA QUALITY : GOOD",
+        })
+        bridge._publish({
+            "type": "sort_complete",
+            "size": "Medium",
+            "message": "SERVO SORTED : MEDIUM",
+        })
+        bridge._publish({"type": "egg_left", "message": "Egg Left"})
+
+        diagnostics = bridge.status()["diagnostics"]
+        self.assertIsNone(diagnostics["measurement_quality"])
+        self.assertIn("Good", diagnostics["last_gate_event"])
+        self.assertIn("Medium size route complete", diagnostics["last_gate_event"])
+
     def test_measurement_command_exposes_quality_without_firmware_echo(self) -> None:
         bridge = Esp32Bridge()
         bridge._publish({
@@ -166,6 +231,24 @@ class Esp32BridgeDiagnosticsTests(unittest.TestCase):
         self.assertTrue(diagnostics["awaiting_egg"])
         self.assertIsNone(diagnostics["final_weight_grams"])
         self.assertIsNone(diagnostics["measurement_quality"])
+
+    def test_capture_number_quality_and_weight_remain_in_latest_event(self) -> None:
+        bridge = Esp32Bridge()
+        bridge._connected = True
+        bridge._serial = Mock()
+        bridge.publish_camera_capture({"capture_id": 7, "label": "good"})
+        self.assertIn("Egg #7", bridge.status()["diagnostics"]["latest_sensor_event"])
+        bridge._publish({"type": "egg_detected", "message": "Egg Detected"})
+        bridge.measure_egg("Good", capture_id=7)
+        bridge._publish({"type": "final_weight", "weight_grams": 64})
+        bridge._publish({"type": "load_cell_gate", "state": "OPEN"})
+        bridge._publish({"type": "sort_complete", "size": "Large"})
+        bridge._publish({"type": "egg_left", "message": "Egg Left"})
+        latest = bridge.status()["diagnostics"]["latest_sensor_event"]
+        self.assertIn("Egg #7", latest)
+        self.assertIn("Good", latest)
+        self.assertIn("64 g", latest)
+        self.assertIn("Large", latest)
 
 
 if __name__ == "__main__":

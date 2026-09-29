@@ -184,15 +184,34 @@ def annotate_image(frame: Any, result: dict[str, Any]) -> Any:
     inspection_zone = result.get("inspection_zone")
     if inspection_zone and len(inspection_zone) == 4:
         left, top, right, bottom = (int(value) for value in inspection_zone)
-        cv2.rectangle(annotated, (left, top), (right, bottom), (255, 255, 0), 2)
+        zone_color = (255, 255, 0)
+        cv2.rectangle(annotated, (left, top), (right, bottom), zone_color, 3)
+        zone_label = "AUTO CAPTURE ZONE"
+        zone_scale = 1.0
+        zone_thickness = 2
+        (zone_text_width, zone_text_height), zone_baseline = cv2.getTextSize(
+            zone_label, cv2.FONT_HERSHEY_SIMPLEX, zone_scale, zone_thickness
+        )
+        zone_label_left = left + 6
+        zone_label_top = top + 6
+        cv2.rectangle(
+            annotated,
+            (zone_label_left, zone_label_top),
+            (
+                zone_label_left + zone_text_width + 16,
+                zone_label_top + zone_text_height + zone_baseline + 14,
+            ),
+            (20, 45, 45),
+            -1,
+        )
         cv2.putText(
             annotated,
-            "AUTO CAPTURE ZONE",
-            (left + 6, max(22, top - 8)),
+            zone_label,
+            (zone_label_left + 8, zone_label_top + zone_text_height + 6),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (255, 255, 0),
-            2,
+            zone_scale,
+            zone_color,
+            zone_thickness,
             cv2.LINE_AA,
         )
     for detection in result["detections"]:
@@ -209,25 +228,29 @@ def annotate_image(frame: Any, result: dict[str, Any]) -> Any:
         )
 
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+        label_scale = 1.15
+        label_thickness = 2
         (text_width, text_height), baseline = cv2.getTextSize(
-            label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+            label, cv2.FONT_HERSHEY_SIMPLEX, label_scale, label_thickness
         )
-        label_top = max(0, y1 - text_height - baseline - 8)
+        label_height = text_height + baseline + 12
+        label_left = min(x1, max(0, annotated.shape[1] - text_width - 16))
+        label_top = y1 - label_height if y1 >= label_height else y1
         cv2.rectangle(
             annotated,
-            (x1, label_top),
-            (x1 + text_width + 10, y1),
+            (label_left, label_top),
+            (label_left + text_width + 16, label_top + label_height),
             color,
             -1,
         )
         cv2.putText(
             annotated,
             label,
-            (x1 + 5, max(text_height + 2, y1 - baseline - 4)),
+            (label_left + 8, label_top + text_height + 6),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
+            label_scale,
             (20, 24, 32),
-            2,
+            label_thickness,
             cv2.LINE_AA,
         )
 

@@ -270,6 +270,11 @@
       <span class="px-3 py-2 rounded-lg bg-surface-container text-secondary font-body-md text-body-md">Waiting for detections...</span>
     </div>
     <p id="capture-zone-status" class="mt-2 font-body-md text-body-md text-secondary">Auto capture zone: waiting for detections...</p>
+    <div class="mt-3 inline-flex items-center gap-3 rounded-lg bg-primary-fixed px-4 py-2 text-on-primary-fixed-variant">
+      <span class="font-button text-button">Eggs exited auto capture zone</span>
+      <strong id="egg-zone-count" class="font-headline-md text-headline-md">0</strong>
+    </div>
+    <p id="last-zone-capture" class="mt-2 font-body-md text-body-md text-secondary">No egg captured in this session yet</p>
   </div>
 
   <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mt-4 pt-4 border-t border-surface-container">
@@ -315,6 +320,8 @@ const statusText = document.getElementById('detection-status');
 const errorPanel = document.getElementById('camera-error');
 const countsPanel = document.getElementById('detection-counts');
 const totalLabel = document.getElementById('detection-total');
+const zoneEggCount = document.getElementById('egg-zone-count');
+const lastZoneCapture = document.getElementById('last-zone-capture');
 const hardwareStatus = document.getElementById('hardware-status');
 const hardwareEvent = document.getElementById('hardware-event');
 const latestEggRecord = document.getElementById('latest-egg-record');
@@ -324,35 +331,6 @@ let statusTimer = null;
 let cameraStatusTimer = null;
 let cameraStatusPending = false;
 let feedConnected = false;
-let finalSensorResetTimer = null;
-let activeFinalSignature = null;
-let hiddenFinalSignature = null;
-
-function clearFinalSensorReset() {
-  if (finalSensorResetTimer) {
-    window.clearTimeout(finalSensorResetTimer);
-    finalSensorResetTimer = null;
-  }
-  activeFinalSignature = null;
-  hiddenFinalSignature = null;
-}
-
-function scheduleFinalSensorReset(signature) {
-  if (activeFinalSignature === signature && finalSensorResetTimer) {
-    return;
-  }
-  if (finalSensorResetTimer) {
-    window.clearTimeout(finalSensorResetTimer);
-  }
-  activeFinalSignature = signature;
-  finalSensorResetTimer = window.setTimeout(() => {
-    hiddenFinalSignature = signature;
-    activeFinalSignature = null;
-    finalSensorResetTimer = null;
-    hardwareEvent.textContent = 'Waiting for load cell...';
-  }, 3000);
-}
-
 function showCameraError(message) {
   errorPanel.textContent = message;
   errorPanel.classList.remove('hidden');
@@ -411,6 +389,10 @@ function updateCounts(state) {
     : ['crack', 'rotten', 'good', 'undefined'].includes(zoneLabel)
       ? `Auto capture zone: ${zoneLabel} (${Math.round(state.zone_confidence * 100)}%)`
       : 'Auto capture zone: no egg detected';
+  zoneEggCount.textContent = String(state.egg_count ?? 0);
+  lastZoneCapture.textContent = state.last_capture
+    ? `Last counted: Egg #${state.last_capture.capture_id} • ${state.last_capture.label}`
+    : 'No egg captured in this session yet';
   totalLabel.textContent = `${state.total} ${state.total === 1 ? 'object' : 'objects'}`;
   const entries = Object.entries(state.counts || {});
   if (!entries.length) {
@@ -499,28 +481,36 @@ async function refreshHardwareState() {
       ? 'font-button text-button text-green-700 mt-2'
       : 'font-button text-button text-secondary mt-2';
     const diagnostics = hardware.diagnostics || {};
+    const retainedGateEvent = diagnostics.last_gate_event;
+    const sensorEvent = diagnostics.latest_sensor_event;
+    const captureLabel = diagnostics.capture_id != null
+      ? `Egg #${diagnostics.capture_id}`
+      : 'Egg';
     const qualityText = diagnostics.measurement_quality
       ? ` • Quality: ${diagnostics.measurement_quality}`
       : '';
     const hasFinalWeight = diagnostics.final_weight_grams != null;
-    const finalSignature = hasFinalWeight
-      ? `${diagnostics.final_weight_grams}|${diagnostics.measurement_quality || ''}`
-      : null;
-    if (!hasFinalWeight) {
-      clearFinalSensorReset();
-    }
     if (hardware.connected && diagnostics.awaiting_egg) {
-      hardwareEvent.textContent = 'Waiting for load cell...';
-    } else if (hardware.connected && hasFinalWeight && hiddenFinalSignature === finalSignature) {
-      hardwareEvent.textContent = 'Waiting for load cell...';
+      hardwareEvent.textContent = sensorEvent || 'Waiting for load cell...';
     } else if (hardware.connected && hasFinalWeight) {
+      const gateStatus = diagnostics.pca9685_ready === false
+        ? 'PCA9685 not found; load-cell gate cannot open'
+        : sensorEvent || retainedGateEvent;
       hardwareEvent.textContent =
-        `Final weight: ${diagnostics.final_weight_grams} g${qualityText}`;
-      scheduleFinalSensorReset(finalSignature);
+        gateStatus || `${captureLabel} • Final weight: ${diagnostics.final_weight_grams} g${qualityText}`;
     } else if (hardware.connected && diagnostics.measurement_weight_grams != null) {
       const readingNumber = diagnostics.measurement_reading_number ?? 1;
       hardwareEvent.textContent =
-        `Scale reading ${readingNumber}: ${diagnostics.measurement_weight_grams} g${qualityText} • 3 stable readings required`;
+        `${captureLabel} • Scale reading ${readingNumber}: ${diagnostics.measurement_weight_grams} g${qualityText} • waiting for 2 identical readings`;
+    } else if (hardware.connected && !diagnostics.awaiting_egg) {
+      const weightText = diagnostics.live_weight_grams != null
+        ? `${diagnostics.live_weight_grams} g`
+        : 'weight pending';
+      hardwareEvent.textContent = diagnostics.live_weight_grams === 0
+        ? 'Egg detected, but scale now reads 0 g; check placement or tare.'
+        : diagnostics.measurement_quality
+          ? `${captureLabel} on load cell: ${weightText}${qualityText} • starting measurement`
+          : `Egg on load cell: ${weightText} • waiting for Good/Undefined zone exit capture`;
     } else if (hardware.connected && diagnostics.live_weight_grams !== null) {
       const hxStatus = diagnostics.hx711_ready === false ? 'HX711 not ready' : 'HX711 ready';
       const servoStatus = diagnostics.pca9685_ready === false ? 'PCA9685 not found' : 'PCA9685 ready';

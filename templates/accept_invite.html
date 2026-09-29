@@ -29,6 +29,25 @@
         using username <strong class="text-[#555d52]">{{ invited_user.username }}</strong>.
       </p>
 
+      {% if google_ready and not google_verified %}
+      <div class="mt-6 rounded-xl bg-[#f2f4ea] p-4">
+        <p class="text-sm text-[#555d52]">
+          First, verify the Google account for <strong>{{ invited_user.email }}</strong>.
+          Its Google profile name and photo will be used for this staff account.
+        </p>
+        <a
+          href="{{ url_for('google_login') }}"
+          class="mt-4 flex w-full items-center justify-center rounded-xl border border-[#dedccf] bg-white px-4 py-3 font-bold text-[#3a4238] hover:bg-[#faf9f4]"
+        >
+          Continue with Google
+        </a>
+      </div>
+      {% elif google_verified %}
+      <p class="mt-5 rounded-xl bg-[#e5f1e7] p-4 text-sm font-semibold text-[#3e6248]">
+        Google account verified. Create your staff password to finish setup.
+      </p>
+      {% endif %}
+
       {% if error %}
       <p class="mt-5 rounded-lg border-l-4 border-red-500 bg-red-50 p-4 text-sm font-semibold text-red-700">
         {{ error }}
@@ -87,7 +106,8 @@
         </div>
         <button
           type="submit"
-          class="w-full rounded-xl bg-[#4a7355] px-4 py-3.5 font-bold text-white hover:bg-[#3e6248]"
+          {% if google_ready and not google_verified %}disabled aria-disabled="true"{% endif %}
+          class="w-full rounded-xl bg-[#4a7355] px-4 py-3.5 font-bold text-white hover:bg-[#3e6248] disabled:cursor-not-allowed disabled:opacity-50"
         >
           Activate Staff Account
         </button>

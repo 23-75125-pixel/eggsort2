@@ -100,8 +100,12 @@ app.config["AUTO_START_SORTING_ON_LOGIN"] = os.environ.get(
 SORTING_RUNTIME_INSTANCE = secrets.token_hex(8)
 
 
-# SQLite database configuration
-app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///database.db"
+# Database configuration. Keep SQLite for local development; Render can use a
+# persistent disk with DATABASE_URL=sqlite:////var/data/database.db.
+app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
+    "DATABASE_URL",
+    "sqlite:///database.db",
+).strip()
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 
@@ -114,6 +118,12 @@ oauth.register(
     client_secret=app.config["GOOGLE_CLIENT_SECRET"],
     client_kwargs={"scope": "openid email profile"},
 )
+
+
+@app.get("/health")
+def health_check() -> Any:
+    """Lightweight deployment health check; does not access camera hardware."""
+    return jsonify(status="ok")
 
 
 INITIAL_ADMIN_EMAIL = app.config["ADMIN_EMAIL"]
@@ -164,6 +174,12 @@ def external_url(endpoint: str, **values: Any) -> str:
     if app.config["PUBLIC_BASE_URL"]:
         return f"{app.config['PUBLIC_BASE_URL']}{path}"
     return url_for(endpoint, _external=True, **values)
+
+
+def google_is_configured() -> bool:
+    return bool(
+        app.config["GOOGLE_CLIENT_ID"] and app.config["GOOGLE_CLIENT_SECRET"]
+    )
 
 
 def send_staff_invitation(user: "User", invite_url: str) -> None:
@@ -537,8 +553,8 @@ QUALITY_NAMES = {
     "undefined": "Undefined",
 }
 CAMERA_QUALITY_SAMPLES = max(
-    2,
-    int(os.environ.get("CAMERA_QUALITY_SAMPLES", "3")),
+    1,
+    int(os.environ.get("CAMERA_QUALITY_SAMPLES", "1")),
 )
 
 SALE_SIZES = ["Small", "Medium", "Large", "Extra Large", "Jumbo"]
@@ -696,7 +712,7 @@ def _flow_is_current(
 
 
 def _inspect_then_measure(sequence: int) -> None:
-    """Match the load-cell egg to the oldest rolling center-zone capture."""
+    """Match the scale egg to the oldest one-shot zone exit capture."""
     global EGG_FLOW_STAGE, EGG_FLOW_QUALITY
     while _flow_is_current(sequence, {"inspecting"}):
         quality_result = CAMERA_SESSION.wait_for_captured_quality(timeout=1.0)
@@ -717,6 +733,7 @@ def _inspect_then_measure(sequence: int) -> None:
         captured = {
             "label": quality,
             "confidence": float(quality_result["confidence"]),
+            "capture_id": quality_result["capture_id"],
         }
         with EGG_FLOW_LOCK:
             if (
@@ -726,13 +743,16 @@ def _inspect_then_measure(sequence: int) -> None:
                 return
             EGG_FLOW_QUALITY = captured
         ESP32_BRIDGE.publish_status(
-            f"Queued camera result matched: {quality}. Starting weight measurement."
+            f"Egg #{captured['capture_id']} matched: {quality}. "
+            "Starting weight measurement."
         )
 
         reported_wait = False
         while _flow_is_current(sequence, {"inspecting"}):
             try:
-                ESP32_BRIDGE.measure_egg(quality)
+                ESP32_BRIDGE.measure_egg(
+                    quality, capture_id=captured["capture_id"]
+                )
                 with EGG_FLOW_LOCK:
                     if (
                         sequence == EGG_FLOW_SEQUENCE
@@ -763,7 +783,7 @@ def begin_egg_flow() -> None:
         EGG_FLOW_QUALITY = None
         EGG_FLOW_PENDING = None
     ESP32_BRIDGE.publish_status(
-        "Egg held on load cell. Waiting for its queued center-zone capture."
+        "Egg on load cell. Waiting for its one-shot zone exit capture."
     )
     Thread(
         target=_inspect_then_measure,
@@ -798,6 +818,7 @@ def queue_sort_after_measurement(event: dict[str, Any]) -> None:
 
     size = classify_egg_size(int(weight))
     pending = {
+        "_capture_id": quality_result["capture_id"],
         "weight_grams": int(weight),
         "size": size,
         "quality": quality_result["label"],
@@ -817,7 +838,8 @@ def queue_sort_after_measurement(event: dict[str, Any]) -> None:
         EGG_FLOW_STAGE = "sorting"
 
     ESP32_BRIDGE.publish_status(
-        f"Weight locked: {weight} g ({size}). ESP32 is routing automatically."
+        f"Egg #{quality_result['capture_id']}: {weight} g ({size}). "
+        "ESP32 is routing automatically."
     )
 
 
@@ -847,6 +869,7 @@ def save_sorted_egg(event: dict[str, Any]) -> None:
             "flow_error",
         )
 
+    capture_id = pending.pop("_capture_id")
     with app.app_context():
         record = EggRecord(**pending)
         db.session.add(record)
@@ -868,7 +891,7 @@ def save_sorted_egg(event: dict[str, Any]) -> None:
         EGG_FLOW_PENDING = None
         EGG_FLOW_STAGE = "waiting_removal"
     ESP32_BRIDGE.publish_status(
-        f"EGG-{egg_id:06d} sorted and saved to Egg Records."
+        f"Egg #{capture_id} saved as EGG-{egg_id:06d}."
     )
 
 
@@ -886,6 +909,7 @@ def handle_esp32_event(event: dict[str, Any]) -> None:
 
 ESP32_BRIDGE.set_event_handler(handle_esp32_event)
 CAMERA_SESSION.set_reject_handler(ESP32_BRIDGE.reject_egg)
+CAMERA_SESSION.set_capture_handler(ESP32_BRIDGE.publish_camera_capture)
 
 
 @app.before_request
@@ -990,11 +1014,27 @@ def accept_invite(token: str) -> Any:
         is_active=True,
     ).first()
     valid_invite = user is not None and invitation_is_valid(user)
-    error = None
+    error = session.pop("invite_error", None)
+
+    # Keep the raw token only in this browser's signed session while it moves
+    # through Google OAuth. The database continues to hold only its hash.
+    if valid_invite:
+        session["pending_invite_token"] = token
+    elif session.get("pending_invite_token") == token:
+        session.pop("pending_invite_token", None)
+        session.pop("invite_google_verified_user_id", None)
 
     if request.method == "POST":
         if not valid_invite or user is None:
             error = "This invitation is invalid, expired, or already used."
+        elif (
+            google_is_configured()
+            and session.get("invite_google_verified_user_id") != user.id
+        ):
+            error = (
+                "Continue with the invited Google account first so we can verify "
+                "the invitation and use its profile photo."
+            )
         else:
             password = request.form.get("password", "")
             password_confirmation = request.form.get(
@@ -1019,9 +1059,11 @@ def accept_invite(token: str) -> Any:
                     commit=False,
                 )
                 db.session.commit()
+                session.pop("pending_invite_token", None)
+                session.pop("invite_google_verified_user_id", None)
                 session["login_notice"] = (
-                    "Account activated. You can now sign in with Google or "
-                    "your staff password."
+                    "Account activated. You can now sign in with your staff password "
+                    "or the verified Google account."
                 )
                 return redirect(url_for("login"))
 
@@ -1030,15 +1072,18 @@ def accept_invite(token: str) -> Any:
         error=error,
         valid_invite=valid_invite,
         invited_user=user,
+        google_ready=google_is_configured(),
+        google_verified=(
+            valid_invite
+            and user is not None
+            and session.get("invite_google_verified_user_id") == user.id
+        ),
     )
 
 
 @app.get("/auth/google")
 def google_login() -> Any:
-    if not (
-        app.config["GOOGLE_CLIENT_ID"]
-        and app.config["GOOGLE_CLIENT_SECRET"]
-    ):
+    if not google_is_configured():
         session["login_error"] = (
             "Google sign-in is not configured yet. Add the Google OAuth "
             "client ID and secret, then restart EggSort+."
@@ -1077,6 +1122,47 @@ def google_callback() -> Any:
             "Google did not provide a verified email address."
         )
         return redirect(url_for("login"))
+
+    # An invitation is tied to its recipient's verified Google email. This is
+    # the only safe way to collect a Google profile photo: Google will not
+    # disclose a person's profile from an email address supplied by an admin.
+    pending_token = session.get("pending_invite_token")
+    if pending_token:
+        invited_user = User.query.filter_by(
+            invite_token_hash=invite_token_hash(pending_token),
+            role="staff",
+            is_active=True,
+        ).first()
+        if invited_user is None or not invitation_is_valid(invited_user):
+            session.pop("pending_invite_token", None)
+            session.pop("invite_google_verified_user_id", None)
+            session["login_error"] = "This staff invitation is no longer valid."
+            return redirect(url_for("login"))
+        if invited_user.email.casefold() != email.casefold():
+            session["invite_error"] = (
+                "Use the Google account for the invited email address "
+                f"({invited_user.email})."
+            )
+            return redirect(url_for("accept_invite", token=pending_token))
+        bound_user = User.query.filter_by(google_sub=google_sub).first()
+        if bound_user is not None and bound_user.id != invited_user.id:
+            session["invite_error"] = (
+                "That Google account is already connected to another EggSort+ account."
+            )
+            return redirect(url_for("accept_invite", token=pending_token))
+
+        invited_user.google_sub = google_sub
+        invited_user.display_name = (
+            str(userinfo.get("name", "")).strip()[:120]
+            or invited_user.display_name
+            or email.split("@", 1)[0]
+        )
+        avatar_url = normalize_avatar_url(userinfo.get("picture"))
+        if avatar_url:
+            invited_user.avatar_url = avatar_url
+        db.session.commit()
+        session["invite_google_verified_user_id"] = invited_user.id
+        return redirect(url_for("accept_invite", token=pending_token))
 
     user = User.query.filter_by(google_sub=google_sub).first()
     if user is None:

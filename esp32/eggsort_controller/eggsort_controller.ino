@@ -1,5 +1,6 @@
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
+#include <Preferences.h>
 #include "HX711.h"
 
 // EggSort+ ESP32 controller
@@ -15,6 +16,7 @@
 
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 HX711 scale;
+Preferences scaleSettings;
 
 // ESP32 wiring.
 static const uint8_t SDA_PIN = 21;
@@ -31,7 +33,7 @@ static const uint8_t LARGE_SERVO = 4;
 static const uint8_t EXTRA_LARGE_SERVO = 3;
 
 // Proven load-cell gate settings.
-static const int LOADCELL_CLOSED = 350;
+static const int LOADCELL_CLOSED = 305;
 static const int LOADCELL_OPEN = 180;
 static const int LOADCELL_OPEN_SPEED = 15;
 static const unsigned long LOADCELL_OPEN_TIME = 3000;
@@ -52,20 +54,24 @@ static const int LARGE_CLOSED = 80;
 static const int LARGE_OPEN = 0;
 static const int EXTRA_LARGE_CLOSED = 0;
 static const int EXTRA_LARGE_OPEN = 80;
-static const int SIZE_CLOSE_SPEED = 20;
+static const int SIZE_CLOSE_SPEED = 25;
 static const unsigned long SIZE_GATE_OPEN_TIME = 1500;
 static const unsigned long SM_TRAVEL_TIME = 2000;
-static const unsigned long LX_TRAVEL_TIME = 8500;
+static const unsigned long LARGE_TRAVEL_TIME = 8700;
+static const unsigned long EXTRA_LARGE_TRAVEL_TIME = 8500;
 
 
-static const float CALIBRATION_FACTOR = 622.0f;
+static const float DEFAULT_CALIBRATION_FACTOR = 622.0f;
+float calibrationFactor = DEFAULT_CALIBRATION_FACTOR;
 static const int EGG_PRESENT_THRESHOLD_GRAMS = 30;
 static const int EGG_CLEAR_THRESHOLD_GRAMS = 10;
-// The reference sketch requires three exactly identical readings.
+// Release the Good/Undefined egg after two consecutive rounded readings
+// agree exactly. A changed reading starts a new consecutive pair.
 static const int STABLE_TOLERANCE_GRAMS = 0;
 static const uint8_t STABLE_SAMPLE_COUNT = 2;
+static const uint8_t WEIGHT_SAMPLES_PER_READING = 5;
 static const int INVALID_WEIGHT = -10000;
-static const unsigned long SAMPLE_INTERVAL_MS = 600;
+static const unsigned long SAMPLE_INTERVAL_MS = 500;
 static const unsigned long STATUS_INTERVAL_MS = 15000;
 static const unsigned long IDLE_WEIGHT_INTERVAL_MS = 3000;
 
@@ -152,7 +158,7 @@ int readWeight() {
   // therefore report a healthy 10 SPS module as unavailable. Wait through the
   // conversion window before deciding that the sensor is disconnected.
   float totalUnits = 0.0f;
-  for (uint8_t sample = 0; sample < 10; sample++) {
+  for (uint8_t sample = 0; sample < WEIGHT_SAMPLES_PER_READING; sample++) {
     unsigned long startedAt = millis();
     while (!scale.is_ready()) {
       if (millis() - startedAt >= 1000) {
@@ -161,7 +167,7 @@ int readWeight() {
       }
       waitWithRejectService(1);
     }
-    // One conversion is ready; avoid the blocking ten-conversion library call.
+    // One conversion is ready; average a small batch for faster response.
     totalUnits += scale.get_units(1);
     waitWithRejectService(1);
   }
@@ -169,7 +175,7 @@ int readWeight() {
   hx711Ready = true;
   // A reversed A+/A- load-cell connection changes only the sign. Using the
   // magnitude lets the calibrated scale work with either polarity.
-  float units = fabs(totalUnits / 10.0f);
+  float units = fabs(totalUnits / WEIGHT_SAMPLES_PER_READING);
   if (isnan(units) || isinf(units)) return INVALID_WEIGHT;
   if (units < 1.5f) units = 0.0f;
   return (int)round(units);
@@ -258,6 +264,8 @@ void printHardwareStatus() {
   Serial.println(hx711Ready ? "YES" : "NO");
   Serial.print("PCA9685 READY : ");
   Serial.println(pcaReady ? "YES" : "NO");
+  Serial.print("SCALE FACTOR : ");
+  Serial.println(calibrationFactor, 3);
   if (weight == INVALID_WEIGHT) {
     Serial.println("LIVE WEIGHT : UNAVAILABLE");
   } else {
@@ -338,19 +346,23 @@ void performSort(const String &requestedSize) {
   // Release the egg from the load cell with the working slow-open motion.
   moveLoadCellServoSlow(LOADCELL_CLOSED, LOADCELL_OPEN,
                         LOADCELL_OPEN_SPEED);
+  Serial.println("LOAD CELL GATE: OPEN");
 
   // Match the reference sketch: travel time begins when the load-cell gate
   // reaches its fully open position. Its three-second hold counts as travel.
   unsigned long travelStartedAt = millis();
   waitWithRejectService(LOADCELL_OPEN_TIME);
   pwm.setPWM(LOADCELL_SERVO, 0, LOADCELL_CLOSED);
+  Serial.println("LOAD CELL GATE: CLOSED");
 
   unsigned long selectedTravelTime = 0;
   if (routeSize == "PEEWEE" || routeSize == "SMALL" ||
       routeSize == "MEDIUM") {
     selectedTravelTime = SM_TRAVEL_TIME;
-  } else if (routeSize == "LARGE" || routeSize == "EXTRA_LARGE") {
-    selectedTravelTime = LX_TRAVEL_TIME;
+  } else if (routeSize == "LARGE") {
+    selectedTravelTime = LARGE_TRAVEL_TIME;
+  } else if (routeSize == "EXTRA_LARGE") {
+    selectedTravelTime = EXTRA_LARGE_TRAVEL_TIME;
   }
 
   while (millis() - travelStartedAt < selectedTravelTime) {
@@ -363,6 +375,26 @@ void performSort(const String &requestedSize) {
   Serial.print("SERVO SORTED : ");
   Serial.println(routeSize);
   waitForEggToLeave();
+}
+
+void finishMeasurementAndRelease() {
+  finalWeight = averagedStableWeight();
+  measuredSize = classifySize(finalWeight);
+  measurementAuthorized = false;
+  measurementReady = true;
+  lastStatusAt = millis();
+
+  // Send the completed measurement before moving the gate, so the PC can
+  // retain the correct record while the egg travels to its size chute.
+  Serial.print("FINAL WEIGHT : ");
+  Serial.print(finalWeight);
+  Serial.println(" g");
+  Serial.print("SIZE : ");
+  Serial.println(measuredSize);
+  Serial.println("WEIGHT COMPLETE; OPENING LOAD CELL GATE");
+
+  // The load-cell servo must only open after a stable final weight exists.
+  performSort(measuredSize);
 }
 
 void testAllServos() {
@@ -381,8 +413,10 @@ void testAllServos() {
 
   moveLoadCellServoSlow(LOADCELL_CLOSED, LOADCELL_OPEN,
                         LOADCELL_OPEN_SPEED);
+  Serial.println("LOAD CELL GATE: OPEN");
   waitWithRejectService(LOADCELL_OPEN_TIME);
   pwm.setPWM(LOADCELL_SERVO, 0, LOADCELL_CLOSED);
+  Serial.println("LOAD CELL GATE: CLOSED");
   waitWithRejectService(500);
 
   activateCrackServo();
@@ -409,8 +443,10 @@ void advanceLoadCellGate() {
   Serial.println("ADVANCE STARTED");
   moveLoadCellServoSlow(LOADCELL_CLOSED, LOADCELL_OPEN,
                         LOADCELL_OPEN_SPEED);
+  Serial.println("LOAD CELL GATE: OPEN");
   waitWithRejectService(LOADCELL_OPEN_TIME);
   pwm.setPWM(LOADCELL_SERVO, 0, LOADCELL_CLOSED);
+  Serial.println("LOAD CELL GATE: CLOSED");
   Serial.println("ADVANCE COMPLETE");
 }
 
@@ -486,6 +522,35 @@ void handleSerialCommands(bool urgentOnly) {
       continue;
     }
 
+    if (command.startsWith("CALIBRATE:")) {
+      String massText = command.substring(10);
+      massText.trim();
+      float referenceGrams = massText.toFloat();
+      if (measurementAuthorized || measurementReady || sorting) {
+        Serial.println("CALIBRATION REJECTED: EGG CYCLE ACTIVE");
+      } else if (referenceGrams <= 0.0f || referenceGrams > 1000.0f ||
+                 isnan(referenceGrams) || isinf(referenceGrams)) {
+        Serial.println("CALIBRATION REJECTED: USE A KNOWN MASS IN GRAMS");
+      } else if (!scale.wait_ready_timeout(1000)) {
+        Serial.println("CALIBRATION REJECTED: HX711 NOT READY");
+      } else {
+        // Tare with an empty platform first. get_value() subtracts that
+        // stored offset but does not apply the old scale factor.
+        float newFactor = (float)scale.get_value(10) / referenceGrams;
+        if (isnan(newFactor) || isinf(newFactor) || fabs(newFactor) < 1.0f) {
+          Serial.println("CALIBRATION REJECTED: CHECK TARE AND REFERENCE MASS");
+        } else {
+          calibrationFactor = newFactor;
+          scale.set_scale(calibrationFactor);
+          scaleSettings.putFloat("scale_factor", calibrationFactor);
+          resetEggState();
+          Serial.println("CALIBRATION COMPLETE");
+          printHardwareStatus();
+        }
+      }
+      continue;
+    }
+
     if (command == "ADVANCE") {
       advanceLoadCellGate();
       continue;
@@ -503,6 +568,28 @@ void handleSerialCommands(bool urgentOnly) {
         Serial.println("MEASURE REJECTED: INVALID QUALITY");
       } else {
         lockedQuality = quality;
+        measurementAuthorized = true;
+        stableWeightCount = 0;
+        readingNumber = 0;
+        lastReadingAt = 0;
+        Serial.print("CAMERA QUALITY : ");
+        Serial.println(lockedQuality);
+        Serial.println("MEASUREMENT STARTED");
+      }
+      continue;
+    }
+
+    // Permit a simple camera "GOOD" / "UNDEFINED" result as an alias for
+    // MEASURE:<QUALITY>. The Flask bridge sends MEASURE:GOOD, but accepting
+    // this form prevents a compatible camera sender from leaving a good egg
+    // held on the scale without starting the load-cell cycle.
+    if (command == "GOOD" || command == "UNDEFINED") {
+      if (!eggDetected) {
+        Serial.println("MEASURE REJECTED: NO EGG");
+      } else if (measurementReady || sorting) {
+        Serial.println("MEASURE REJECTED: CYCLE ALREADY MEASURED");
+      } else {
+        lockedQuality = command;
         measurementAuthorized = true;
         stableWeightCount = 0;
         readingNumber = 0;
@@ -551,13 +638,19 @@ void setup() {
   }
 
   scale.begin(HX711_DOUT_PIN, HX711_CLK_PIN);
+  scaleSettings.begin("eggsort", false);
+  calibrationFactor = scaleSettings.getFloat("scale_factor", DEFAULT_CALIBRATION_FACTOR);
+  if (isnan(calibrationFactor) || isinf(calibrationFactor) ||
+      fabs(calibrationFactor) < 1.0f) {
+    calibrationFactor = DEFAULT_CALIBRATION_FACTOR;
+  }
+  scale.set_scale(calibrationFactor);
   unsigned long hxStartedAt = millis();
   while (!scale.is_ready() && millis() - hxStartedAt < 3000) {
     delay(25);
   }
   hx711Ready = scale.is_ready();
   if (hx711Ready) {
-    scale.set_scale(CALIBRATION_FACTOR);
     scale.tare(25);
   }
 
@@ -606,6 +699,9 @@ void loop() {
       occupiedReadingCount = 0;
       lastStatusAt = now;
       Serial.println("Egg Detected");
+      Serial.print("LIVE WEIGHT : ");
+      Serial.print(weight);
+      Serial.println(" g");
       Serial.println("WAITING FOR CAMERA QUALITY");
     }
     return;
@@ -615,6 +711,11 @@ void loop() {
     if (now - lastReadingAt >= 500) {
       lastReadingAt = now;
       int weight = readWeight();
+      if (weight != INVALID_WEIGHT) {
+        Serial.print("LIVE WEIGHT : ");
+        Serial.print(weight);
+        Serial.println(" g");
+      }
       if (weight != INVALID_WEIGHT && weight <= EGG_CLEAR_THRESHOLD_GRAMS) {
         emptyReadingCount++;
         if (emptyReadingCount >= 3) {
@@ -666,19 +767,7 @@ void loop() {
     addStableWeight(weight);
 
     if (stableWeightAvailable()) {
-      finalWeight = averagedStableWeight();
-      measuredSize = classifySize(finalWeight);
-      measurementAuthorized = false;
-      measurementReady = true;
-      lastStatusAt = now;
-
-      Serial.print("FINAL WEIGHT : ");
-      Serial.print(finalWeight);
-      Serial.println(" g");
-      Serial.print("SIZE : ");
-      Serial.println(measuredSize);
-      Serial.println("WEIGHT STABLE; AUTO RELEASING LOAD CELL GATE");
-      performSort(measuredSize);
+      finishMeasurementAndRelease();
     }
     return;
   }

@@ -25,6 +25,7 @@ class Esp32ProtocolParser:
     LIVE_WEIGHT = re.compile(r"LIVE WEIGHT\s*:\s*(-?\d+)\s*g", re.I)
     HX711_READY = re.compile(r"HX711 READY\s*:\s*(YES|NO)", re.I)
     PCA9685_READY = re.compile(r"PCA9685 READY\s*:\s*(YES|NO)", re.I)
+    LOAD_CELL_GATE = re.compile(r"LOAD CELL GATE\s*:\s*(OPEN|CLOSED)", re.I)
     CONTROLLER_STATE = re.compile(r"CONTROLLER STATE\s*:\s*(.+)", re.I)
     CAMERA_QUALITY = re.compile(
         r"CAMERA QUALITY\s*:\s*(CRACK|GOOD|ROTTEN|UNDEFINED)", re.I
@@ -54,6 +55,13 @@ class Esp32ProtocolParser:
             return [{
                 "type": "pca9685_status",
                 "ready": pca9685_ready.group(1).upper() == "YES",
+                "message": clean,
+            }]
+        load_cell_gate = self.LOAD_CELL_GATE.fullmatch(clean)
+        if load_cell_gate:
+            return [{
+                "type": "load_cell_gate",
+                "state": load_cell_gate.group(1).upper(),
                 "message": clean,
             }]
         live_weight = self.LIVE_WEIGHT.fullmatch(clean)
@@ -161,8 +169,12 @@ class Esp32Bridge:
             "measurement_reading_number": None,
             "final_weight_grams": None,
             "measurement_quality": None,
+            "capture_id": None,
             "awaiting_egg": True,
             "controller_state": None,
+            "load_cell_gate_state": None,
+            "last_gate_event": None,
+            "latest_sensor_event": None,
         }
         self.baud_rate = int(os.environ.get("ESP32_BAUD_RATE", "115200"))
 
@@ -250,7 +262,7 @@ class Esp32Bridge:
         })
         return command
 
-    def measure_egg(self, quality: str) -> str:
+    def measure_egg(self, quality: str, capture_id: int | None = None) -> str:
         quality_code = quality.upper().replace(" ", "_")
         if quality_code not in {"GOOD", "UNDEFINED"}:
             raise ValueError(f"Unsupported egg quality: {quality}")
@@ -259,9 +271,19 @@ class Esp32Bridge:
         self._publish({
             "type": "measurement_command",
             "quality": quality,
+            "capture_id": capture_id,
             "message": command,
         })
         return command
+
+    def publish_camera_capture(self, capture: dict[str, Any]) -> None:
+        """Expose the counted one-shot zone capture on the sensor display."""
+        self._publish({
+            "type": "camera_capture",
+            "capture_id": capture["capture_id"],
+            "quality": str(capture["label"]).title(),
+            "message": f"Egg #{capture['capture_id']} exited auto capture zone.",
+        })
 
     def publish_status(self, message: str, event_type: str = "flow_status") -> None:
         """Expose application-coordinator state in the hardware status feed."""
@@ -370,7 +392,11 @@ class Esp32Bridge:
                 while not self._stop_event.is_set():
                     with self._lock:
                         needs_status = self._diagnostics["pca9685_ready"] is None
-                    if needs_status:
+                        waiting_for_capture = (
+                            not self._diagnostics["awaiting_egg"]
+                            and self._diagnostics["measurement_quality"] is None
+                        )
+                    if needs_status or waiting_for_capture:
                         self._request_hardware_status()
                     raw = connection.readline()
                     if not raw:
@@ -412,27 +438,58 @@ class Esp32Bridge:
                 self._diagnostics["hx711_ready"] = event.get("ready")
             elif event_type == "pca9685_status":
                 self._diagnostics["pca9685_ready"] = event.get("ready")
+            elif event_type == "camera_capture":
+                capture_id = event.get("capture_id")
+                quality = event.get("quality")
+                outcome = (
+                    "rejected at camera gate"
+                    if quality in {"Crack", "Rotten"}
+                    else "pending load-cell weighing"
+                )
+                self._diagnostics["latest_sensor_event"] = (
+                    f"Egg #{capture_id} - {quality} - {outcome}"
+                )
             elif event_type == "load_cell_status":
                 self._diagnostics["live_weight_grams"] = event.get(
                     "weight_grams"
                 )
             elif event_type == "egg_detected":
+                self._diagnostics["live_weight_grams"] = None
                 self._diagnostics["measurement_weight_grams"] = None
                 self._diagnostics["measurement_reading_number"] = None
                 self._diagnostics["final_weight_grams"] = None
                 self._diagnostics["measurement_quality"] = None
+                self._diagnostics["capture_id"] = None
                 self._diagnostics["awaiting_egg"] = False
+                self._diagnostics["load_cell_gate_state"] = None
+                self._diagnostics["last_gate_event"] = None
+                self._diagnostics["latest_sensor_event"] = (
+                    "Egg on load cell; waiting for its zone exit capture"
+                )
             elif event_type == "egg_left":
+                self._diagnostics["live_weight_grams"] = None
+                if self._diagnostics["final_weight_grams"] is None:
+                    self._diagnostics["latest_sensor_event"] = (
+                        "Egg left load cell without a completed weight"
+                    )
                 self._diagnostics["measurement_weight_grams"] = None
                 self._diagnostics["measurement_reading_number"] = None
                 self._diagnostics["final_weight_grams"] = None
                 self._diagnostics["measurement_quality"] = None
+                self._diagnostics["capture_id"] = None
                 self._diagnostics["awaiting_egg"] = True
             elif event_type in {"measurement_quality", "measurement_command"}:
                 self._diagnostics["measurement_quality"] = event.get(
                     "quality"
                 )
                 self._diagnostics["awaiting_egg"] = False
+                if event_type == "measurement_command":
+                    self._diagnostics["capture_id"] = event.get("capture_id")
+                    egg_id = self._diagnostics["capture_id"]
+                    label = f"Egg #{egg_id}" if egg_id is not None else "Egg"
+                    self._diagnostics["latest_sensor_event"] = (
+                        f"{label} - {event.get('quality')} - weighing on load cell"
+                    )
             elif event_type == "weight_reading":
                 self._diagnostics["measurement_weight_grams"] = event.get(
                     "weight_grams"
@@ -450,6 +507,45 @@ class Esp32Bridge:
                     "weight_grams"
                 )
                 self._diagnostics["awaiting_egg"] = False
+                egg_id = self._diagnostics["capture_id"]
+                label = f"Egg #{egg_id}" if egg_id is not None else "Egg"
+                quality = self._diagnostics["measurement_quality"] or "Unknown"
+                self._diagnostics["last_gate_event"] = (
+                    f"{label} - {quality} - {event.get('weight_grams')} g - "
+                    "waiting for load-cell gate confirmation"
+                )
+                self._diagnostics["latest_sensor_event"] = self._diagnostics[
+                    "last_gate_event"
+                ]
+            elif event_type == "load_cell_gate":
+                state = event.get("state")
+                self._diagnostics["load_cell_gate_state"] = state
+                egg_id = self._diagnostics["capture_id"]
+                label = f"Egg #{egg_id}" if egg_id is not None else "Egg"
+                quality = self._diagnostics["measurement_quality"] or "Unknown"
+                weight = self._diagnostics["final_weight_grams"]
+                weight_text = f"{weight} g" if weight is not None else "weight pending"
+                self._diagnostics["last_gate_event"] = (
+                    f"{label} - {quality} - {weight_text} - load-cell gate opened"
+                    if state == "OPEN"
+                    else f"{label} - {quality} - {weight_text} - load-cell gate closed"
+                )
+                self._diagnostics["latest_sensor_event"] = self._diagnostics[
+                    "last_gate_event"
+                ]
+            elif event_type == "sort_complete":
+                egg_id = self._diagnostics["capture_id"]
+                label = f"Egg #{egg_id}" if egg_id is not None else "Egg"
+                quality = self._diagnostics["measurement_quality"] or "Unknown"
+                weight = self._diagnostics["final_weight_grams"]
+                weight_text = f"{weight} g" if weight is not None else "weight unknown"
+                self._diagnostics["last_gate_event"] = (
+                    f"{label} - {quality} - {weight_text} - "
+                    f"{event.get('size', 'selected')} size route complete"
+                )
+                self._diagnostics["latest_sensor_event"] = self._diagnostics[
+                    "last_gate_event"
+                ]
             elif event_type == "controller_state":
                 self._diagnostics["controller_state"] = event.get("state")
             self._events.append(event)
