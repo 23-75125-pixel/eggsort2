@@ -7,6 +7,7 @@ import re
 from collections import deque
 from datetime import datetime, timezone
 from threading import Event, RLock, Thread
+from time import monotonic
 from typing import Any, Callable
 from egg_standards import classify_egg_size, servo_command
 
@@ -25,6 +26,9 @@ class Esp32ProtocolParser:
     HX711_READY = re.compile(r"HX711 READY\s*:\s*(YES|NO)", re.I)
     PCA9685_READY = re.compile(r"PCA9685 READY\s*:\s*(YES|NO)", re.I)
     CONTROLLER_STATE = re.compile(r"CONTROLLER STATE\s*:\s*(.+)", re.I)
+    CAMERA_QUALITY = re.compile(
+        r"CAMERA QUALITY\s*:\s*(CRACK|GOOD|ROTTEN|UNDEFINED)", re.I
+    )
 
     def __init__(self) -> None:
         self.final_weight: int | None = None
@@ -64,6 +68,13 @@ class Esp32ProtocolParser:
             return [{
                 "type": "controller_state",
                 "state": controller_state.group(1).strip(),
+                "message": clean,
+            }]
+        camera_quality = self.CAMERA_QUALITY.fullmatch(clean)
+        if camera_quality:
+            return [{
+                "type": "measurement_quality",
+                "quality": camera_quality.group(1).title(),
                 "message": clean,
             }]
         if lowered == "egg detected":
@@ -141,10 +152,16 @@ class Esp32Bridge:
         self._port: str | None = None
         self._error: str | None = None
         self._last_command: str | None = None
+        self._last_status_request_at: float | None = None
         self._diagnostics: dict[str, Any] = {
             "hx711_ready": None,
             "pca9685_ready": None,
             "live_weight_grams": None,
+            "measurement_weight_grams": None,
+            "measurement_reading_number": None,
+            "final_weight_grams": None,
+            "measurement_quality": None,
+            "awaiting_egg": True,
             "controller_state": None,
         }
         self.baud_rate = int(os.environ.get("ESP32_BAUD_RATE", "115200"))
@@ -210,9 +227,32 @@ class Esp32Bridge:
         })
         return command
 
+    def reject_egg(self, quality: str) -> str:
+        quality_code = quality.strip().upper()
+        if quality_code not in {"CRACK", "ROTTEN"}:
+            raise ValueError(f"Unsupported reject quality: {quality}")
+        command = f"REJECT:{quality_code}"
+        with self._lock:
+            if not self._connected or self._serial is None:
+                raise RuntimeError("ESP32 is disconnected; reconnect its USB serial link.")
+            readiness = self._diagnostics["pca9685_ready"]
+            if readiness is False:
+                raise RuntimeError(
+                    "ESP32 reports PCA9685 not found. Check its power and I2C wiring."
+                )
+            if readiness is None:
+                self._request_hardware_status()
+                raise RuntimeError("Requesting ESP32 hardware status; retrying while egg is visible.")
+            self._send_command(command)
+        self._publish({
+            "type": "reject_command", "quality": quality_code.title(),
+            "message": f"{command} sent: channel 0, 10-second hold; skip weighing.",
+        })
+        return command
+
     def measure_egg(self, quality: str) -> str:
         quality_code = quality.upper().replace(" ", "_")
-        if quality_code not in {"CRACK", "GOOD", "ROTTEN", "UNDEFINED"}:
+        if quality_code not in {"GOOD", "UNDEFINED"}:
             raise ValueError(f"Unsupported egg quality: {quality}")
         command = f"MEASURE:{quality_code}"
         self._send_command(command)
@@ -226,6 +266,19 @@ class Esp32Bridge:
     def publish_status(self, message: str, event_type: str = "flow_status") -> None:
         """Expose application-coordinator state in the hardware status feed."""
         self._publish({"type": event_type, "message": message})
+
+    def _request_hardware_status(self, force: bool = False) -> None:
+        """Recover missed boot diagnostics without flooding the serial command queue."""
+        with self._lock:
+            now = monotonic()
+            if (
+                not force
+                and self._last_status_request_at is not None
+                and now - self._last_status_request_at < 3.0
+            ):
+                return
+            self._send_command("STATUS")
+            self._last_status_request_at = now
 
     def _send_command(self, command: str) -> None:
         with self._lock:
@@ -307,8 +360,18 @@ class Esp32Bridge:
                     self._port = port
                     self._connected = True
                     self._error = None
+                    self._diagnostics["pca9685_ready"] = None
+                    self._diagnostics["hx711_ready"] = None
+                    self._last_status_request_at = None
 
+                # Opening a port may attach to an already running ESP32, or
+                # its reset banner may be lost. Do not depend on that banner.
+                self._request_hardware_status(force=True)
                 while not self._stop_event.is_set():
+                    with self._lock:
+                        needs_status = self._diagnostics["pca9685_ready"] is None
+                    if needs_status:
+                        self._request_hardware_status()
                     raw = connection.readline()
                     if not raw:
                         continue
@@ -316,8 +379,7 @@ class Esp32Bridge:
                     for event in parser.parse(line):
                         self._publish(event)
                         if event.get("type") == "ready":
-                            connection.write(b"STATUS\n")
-                            connection.flush()
+                            self._request_hardware_status(force=True)
             except Exception as exc:
                 with self._lock:
                     self._connected = False
@@ -354,6 +416,40 @@ class Esp32Bridge:
                 self._diagnostics["live_weight_grams"] = event.get(
                     "weight_grams"
                 )
+            elif event_type == "egg_detected":
+                self._diagnostics["measurement_weight_grams"] = None
+                self._diagnostics["measurement_reading_number"] = None
+                self._diagnostics["final_weight_grams"] = None
+                self._diagnostics["measurement_quality"] = None
+                self._diagnostics["awaiting_egg"] = False
+            elif event_type == "egg_left":
+                self._diagnostics["measurement_weight_grams"] = None
+                self._diagnostics["measurement_reading_number"] = None
+                self._diagnostics["final_weight_grams"] = None
+                self._diagnostics["measurement_quality"] = None
+                self._diagnostics["awaiting_egg"] = True
+            elif event_type in {"measurement_quality", "measurement_command"}:
+                self._diagnostics["measurement_quality"] = event.get(
+                    "quality"
+                )
+                self._diagnostics["awaiting_egg"] = False
+            elif event_type == "weight_reading":
+                self._diagnostics["measurement_weight_grams"] = event.get(
+                    "weight_grams"
+                )
+                self._diagnostics["measurement_reading_number"] = event.get(
+                    "reading_number"
+                )
+                self._diagnostics["final_weight_grams"] = None
+                self._diagnostics["awaiting_egg"] = False
+            elif event_type == "final_weight":
+                self._diagnostics["measurement_weight_grams"] = event.get(
+                    "weight_grams"
+                )
+                self._diagnostics["final_weight_grams"] = event.get(
+                    "weight_grams"
+                )
+                self._diagnostics["awaiting_egg"] = False
             elif event_type == "controller_state":
                 self._diagnostics["controller_state"] = event.get("state")
             self._events.append(event)

@@ -225,11 +225,11 @@ can ignore this email.
 
 def start_sorting_runtime() -> tuple[dict[str, Any], dict[str, Any]]:
     """Start camera inference and the ESP32 link as one station runtime."""
-    camera_state = CAMERA_SESSION.start()
+    hardware_state = ESP32_BRIDGE.start()
     try:
-        hardware_state = ESP32_BRIDGE.start()
+        camera_state = CAMERA_SESSION.start()
     except Exception:
-        CAMERA_SESSION.stop()
+        ESP32_BRIDGE.stop()
         raise
     return camera_state, hardware_state
 
@@ -696,13 +696,10 @@ def _flow_is_current(
 
 
 def _inspect_then_measure(sequence: int) -> None:
-    """Lock this egg's camera quality before authorizing weight readings."""
+    """Match the load-cell egg to the oldest rolling center-zone capture."""
     global EGG_FLOW_STAGE, EGG_FLOW_QUALITY
     while _flow_is_current(sequence, {"inspecting"}):
-        quality_result = CAMERA_SESSION.wait_for_egg_quality(
-            timeout=1.0,
-            min_samples=CAMERA_QUALITY_SAMPLES,
-        )
+        quality_result = CAMERA_SESSION.wait_for_captured_quality(timeout=1.0)
         if quality_result is None:
             camera_state = CAMERA_SESSION.status()
             if not camera_state["running"] or camera_state.get("error"):
@@ -729,7 +726,7 @@ def _inspect_then_measure(sequence: int) -> None:
                 return
             EGG_FLOW_QUALITY = captured
         ESP32_BRIDGE.publish_status(
-            f"Camera quality locked: {quality}. Starting weight measurement."
+            f"Queued camera result matched: {quality}. Starting weight measurement."
         )
 
         reported_wait = False
@@ -754,7 +751,7 @@ def _inspect_then_measure(sequence: int) -> None:
 
 
 def begin_egg_flow() -> None:
-    """Start a new camera-first inspection for the egg held on the scale."""
+    """Match a scale arrival to its already captured rolling inspection."""
     global EGG_FLOW_SEQUENCE, EGG_FLOW_STAGE
     global EGG_FLOW_QUALITY, EGG_FLOW_PENDING
     with EGG_FLOW_LOCK:
@@ -765,9 +762,8 @@ def begin_egg_flow() -> None:
         EGG_FLOW_STAGE = "inspecting"
         EGG_FLOW_QUALITY = None
         EGG_FLOW_PENDING = None
-    CAMERA_SESSION.begin_egg_inspection()
     ESP32_BRIDGE.publish_status(
-        "Egg held on load cell. Waiting for one stable camera quality."
+        "Egg held on load cell. Waiting for its queued center-zone capture."
     )
     Thread(
         target=_inspect_then_measure,
@@ -778,7 +774,7 @@ def begin_egg_flow() -> None:
 
 
 def queue_sort_after_measurement(event: dict[str, Any]) -> None:
-    """Keep the egg held, remember its result, and command its size route."""
+    """Remember the result before the controller confirms its automatic route."""
     global EGG_FLOW_STAGE, EGG_FLOW_PENDING
     weight = event.get("weight_grams")
     if weight is None:
@@ -818,41 +814,11 @@ def queue_sort_after_measurement(event: dict[str, Any]) -> None:
         ):
             return
         EGG_FLOW_PENDING = pending
-        EGG_FLOW_STAGE = "route_pending"
+        EGG_FLOW_STAGE = "sorting"
 
     ESP32_BRIDGE.publish_status(
-        f"Weight locked: {weight} g ({size}). Sending servo route."
+        f"Weight locked: {weight} g ({size}). ESP32 is routing automatically."
     )
-    Thread(
-        target=_send_sort_when_connected,
-        args=(sequence, size),
-        name=f"eggsort-route-{sequence}",
-        daemon=True,
-    ).start()
-
-
-def _send_sort_when_connected(sequence: int, size: str) -> None:
-    """Retry the route command while this egg remains held."""
-    global EGG_FLOW_STAGE
-    reported_wait = False
-    while _flow_is_current(sequence, {"route_pending"}):
-        try:
-            ESP32_BRIDGE.sort_egg(size)
-            with EGG_FLOW_LOCK:
-                if (
-                    sequence == EGG_FLOW_SEQUENCE
-                    and EGG_FLOW_STAGE == "route_pending"
-                ):
-                    EGG_FLOW_STAGE = "sorting"
-            return
-        except RuntimeError:
-            if not reported_wait:
-                ESP32_BRIDGE.publish_status(
-                    "Egg held: waiting for the ESP32 connection before sorting.",
-                    "flow_error",
-                )
-                reported_wait = True
-            sleep(1)
 
 
 def save_sorted_egg(event: dict[str, Any]) -> None:
@@ -861,7 +827,7 @@ def save_sorted_egg(event: dict[str, Any]) -> None:
     with EGG_FLOW_LOCK:
         # Moving to "saving" before touching the database makes repeated
         # SERVO SORTED lines idempotent: one physical egg can create one row.
-        if EGG_FLOW_STAGE not in {"route_pending", "sorting"}:
+        if EGG_FLOW_STAGE != "sorting":
             return
         pending = dict(EGG_FLOW_PENDING) if EGG_FLOW_PENDING else None
         if pending is not None:
@@ -919,6 +885,7 @@ def handle_esp32_event(event: dict[str, Any]) -> None:
 
 
 ESP32_BRIDGE.set_event_handler(handle_esp32_event)
+CAMERA_SESSION.set_reject_handler(ESP32_BRIDGE.reject_egg)
 
 
 @app.before_request
@@ -1358,7 +1325,9 @@ def stop_camera() -> Any:
 @app.get("/api/camera/status")
 @login_required
 def camera_status() -> Any:
-    return jsonify(CAMERA_SESSION.status())
+    response = jsonify(CAMERA_SESSION.status())
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/api/camera/feed")

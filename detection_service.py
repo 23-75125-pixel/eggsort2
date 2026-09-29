@@ -181,6 +181,20 @@ def annotate_image(frame: Any, result: dict[str, Any]) -> Any:
         ) from exc
 
     annotated = frame.copy()
+    inspection_zone = result.get("inspection_zone")
+    if inspection_zone and len(inspection_zone) == 4:
+        left, top, right, bottom = (int(value) for value in inspection_zone)
+        cv2.rectangle(annotated, (left, top), (right, bottom), (255, 255, 0), 2)
+        cv2.putText(
+            annotated,
+            "AUTO CAPTURE ZONE",
+            (left + 6, max(22, top - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
     for detection in result["detections"]:
         x1, y1, x2, y2 = (int(value) for value in detection["box"])
         class_id = detection["class_id"]

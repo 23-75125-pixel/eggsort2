@@ -13,7 +13,7 @@ The firmware is:
 - ESP32 development board (the firmware targets the common ESP32 Dev Module)
 - HX711 load-cell amplifier and load cell
 - PCA9685 16-channel PWM servo driver
-- Five servos: one load-cell gate plus Small, Medium, Large, and Extra Large
+- Six servos: load-cell, Crack, Small, Medium, Large, and Extra Large gates
 - Regulated 5-6 V servo power supply sized for the combined servo stall current
 - USB data cable for the ESP32
 - Common ground wiring and suitable terminal blocks/connectors
@@ -55,6 +55,7 @@ negative output to PCA9685 `GND`. Connect that same ground to ESP32 `GND`.
 
 | PCA9685 channel | Gate |
 |---:|---|
+| 0 | Shared reject gate (camera quality `CRACK` or `ROTTEN`, any weight size) |
 | 1 | Load-cell release gate |
 | 5 | Small gate (Peewee also uses this physical chute) |
 | 2 | Medium gate |
@@ -80,6 +81,11 @@ power, and orange/yellow/white is signal. Confirm the markings for each servo.
    ESP32 and confirm that `Egg Sorting Ready` appears.
 8. Close Serial Monitor before starting Flask. Only one program can own the
    COM port at a time.
+
+To test every servo without an egg, open Serial Monitor at 115200 baud, set
+the line ending to newline, and send `SERVO_TEST`. The controller moves channel
+1, then channels 0, 5, 2, 4, and 3 in sequence and returns every gate to closed.
+Stop Flask first so Serial Monitor can open the COM port.
 
 If no port appears, use a known USB data cable and install the driver for the
 board's USB-to-serial chip, commonly CP210x or CH340.
@@ -124,22 +130,30 @@ From the project folder:
    `no egg` in that order.
 2. Open **Sorting Sessions** and confirm that **ESP32 link** shows
    `Connected on COM... @ 115200`.
-3. Put one egg on the load cell. The load-cell gate stays closed and the ESP32
-   sends `Egg Detected`; it does not start its final weighing yet.
-4. Flask clears detections from the previous egg. From each new inference frame
-   it keeps exactly one highest-confidence result from the trained classes
-   `Crack`, `Good`, `Rotten`, `Undefined`, and `no egg`.
-5. `no egg` is never recorded. The other four labels must agree for three
-   consecutive frames before Flask locks one quality for the physical egg.
-6. Flask sends `MEASURE:<QUALITY>` to the ESP32.
-7. The ESP32 takes three readings, calculates the final weight and size, then
-   keeps the egg held while it waits for a route command.
-8. Flask combines the locked quality with the weight and sends `SORT:<SIZE>`.
-9. The ESP32 opens the load-cell gate, waits for the egg's travel time, moves
-   the correct size gate, and sends `SERVO SORTED : <SIZE>`.
-10. Only after that hardware confirmation does Flask save one row in Egg
+3. As each egg rolls through the marked center zone, Flask automatically
+   collects its detections without stopping the rollers. The first accepted
+   Crack or Rotten detection immediately sends `REJECT:CRACK` or
+   `REJECT:ROTTEN`. Channel 0 opens at the camera, before the load cell, holds
+   for 10 seconds, and closes. Repeated frames of the same egg do not restart
+   the timer. A separate rejected egg starts a new 10-second hold.
+4. Rejected eggs are excluded from the weighing queue, even if later frames
+   say Good. They receive no weight or size and do not create a weighed Egg
+   Record. Good and Undefined passages need at least three accepted frames;
+   their quality is queued after leaving the zone. `no egg` is never recorded.
+5. When an accepted egg reaches the load cell, its gate stays closed and the ESP32
+   sends `Egg Detected`. Flask matches it to the oldest queued camera result
+   and sends `MEASURE:<QUALITY>`.
+6. The ESP32 takes three consecutive stable readings and calculates their
+   average as the final weight and size. The third stable reading automatically
+   triggers sorting; no separate route command is required.
+7. The ESP32 opens servo channel 1 (the load-cell gate), waits for the egg's
+   travel time, then moves exactly one correct size gate: channel 5 for Small,
+   channel 2 for Medium, channel 4 for Large, or channel 3 for Extra Large.
+   It then sends `SERVO SORTED : <SIZE>` with
+   the measured size so the PC retains the egg's weight, size, and quality.
+8. Only after that hardware confirmation does Flask save one row in Egg
    Records. Dashboard totals update automatically on their next poll.
-11. Duplicate controller messages are ignored until `Egg Left` resets the
+9. Duplicate controller messages are ignored until `Egg Left` resets the
     cycle, so one physical egg cannot create multiple records.
 
 Logging out stops both the ESP32 serial bridge and camera session. If an
@@ -152,17 +166,31 @@ ESP32. Every sensor and servo is controlled through this one controller.
 
 | Saved size | Weight | Physical route |
 |---|---:|---|
-| Peewee | below 42 g | Small chute |
-| Small | 42-49 g | Small chute |
-| Medium | 50-56 g | Medium chute |
-| Large | 57-63 g | Large chute |
-| Extra Large | 64-70 g | Extra Large chute |
-| Jumbo | 71 g and above | Straight/final chute |
-
-Peewee remains a distinct database category, but the supplied mechanism has
-only four actuated size gates, so Peewee and Small share a physical chute.
+| Small | below 45 g | Small chute, channel 5 |
+| Medium | 45-54 g | Medium chute, channel 2 |
+| Large | 55-62 g | Large chute, channel 4 |
+| Extra Large | 63-69 g | Extra Large chute, channel 3 |
+| Jumbo | 70 g and above | Straight/final chute |
 
 ## Calibration and mechanical tuning
+
+The crack gate starts closed at `CRACK_CLOSED = 0` degrees. On the camera's
+`REJECT:CRACK` or `REJECT:ROTTEN` command, channel 0 opens immediately to
+`CRACK_OPEN = 80` degrees without waiting for load-cell detection or weighing.
+For both camera qualities, the crack gate stays open for
+`CRACK_GATE_OPEN_TIME = 10000` ms (10 seconds), then receives a direct command
+to close to 0 degrees, matching the reference code's closing motion.
+These are starting values: tune the angles and timing to the actual crack
+chute. `SERVO_TEST` also exercises channel 0 without an egg.
+
+Upload the updated firmware and restart Flask together: older firmware does
+not understand `REJECT:`. With Flask stopped, send `REJECT:CRACK` or
+`REJECT:ROTTEN` in Serial Monitor (115200 baud, newline) to test channel 0
+without putting an egg on the scale. Expect `CAMERA REJECT`, then
+`REJECT SERVO: OPEN; HOLD 10000 MS`, and `REJECT SERVO: CLOSED` after 10 seconds.
+The timer and reject commands are serviced during normal weighing and size
+gate travel. Camera send failures appear on the sorting page and retry while
+the same egg is visible; rejected eggs are never queued for weighing.
 
 The imported ESP32 program used an HX711 calibration factor of `605.0`. Verify
 it with a known calibration weight before sorting eggs. If readings are
@@ -173,11 +201,19 @@ All mechanism-specific values are near the top of the firmware:
 
 - `calibrationFactor`
 - `LOADCELL_CLOSED` and `LOADCELL_OPEN`
+- `LOADCELL_OPEN_SPEED`, `LOADCELL_CLOSE_SPEED`, and
+  `LOADCELL_CLOSE_SETTLE_TIME`
 - each size gate's `*_CLOSED` and `*_OPEN` angles
+- `SIZE_GATE_OPEN_TIME`, `SIZE_GATE_CLOSE_DELAY`,
+  `LARGE_SIZE_GATE_CLOSE_DELAY`, `SIZE_CLOSE_SPEED`,
+  `LARGE_SIZE_OPEN_SPEED`, and `LARGE_SIZE_CLOSE_SPEED`
 - `SM_TRAVEL_TIME_MS` and `LX_TRAVEL_TIME_MS`
 
 Disconnect servo power before changing linkages. Tune one gate at a time with
 small angle changes so a servo is not driven against a mechanical stop.
+Channel 1 remains energized at `LOADCELL_CLOSED` after its settling delay so
+it can hold the next egg. Its available holding torque comes from the external
+5-6 V servo supply; software cannot increase torque beyond the supplied power.
 
 ## Troubleshooting
 
@@ -191,6 +227,9 @@ small angle changes so a servo is not driven against a mechanical stop.
   sure the egg exceeds the 30 g detection threshold.
 - **Wrong chute:** verify PCA9685 channel wiring first, then tune gate angles
   and travel time constants.
+- **No servo moves after weighing:** check Serial Monitor for
+  `SERVO ERROR: PCA9685 NOT FOUND AT 0x40`, verify the external 5-6 V servo
+  supply, and confirm that PCA9685 ground and ESP32 ground are connected.
 - **Record saves but gate does not move:** check the latest hardware event for
   `SORT:...`, then verify PCA9685 power, common ground, address `0x40`, and the
   channel mapping above.

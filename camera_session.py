@@ -7,7 +7,7 @@ from collections import deque
 from datetime import datetime, timezone
 from threading import Condition, Event, RLock, Thread
 from time import monotonic
-from typing import Any
+from typing import Any, Callable
 
 from detection_service import (
     CONFIDENCE,
@@ -59,6 +59,13 @@ class CameraDetectionSession:
         self._quality_history: deque[tuple[float, str, float]] = deque(
             maxlen=200
         )
+        self._captured_qualities: deque[dict[str, Any]] = deque(maxlen=50)
+        self._passage_samples: list[tuple[str, float]] = []
+        self._passage_misses = 0
+        self._passage_defect: str | None = None
+        self._passage_reject_sent = False
+        self._reject_handler: Callable[[str], Any] | None = None
+        self._reject_error: str | None = None
 
         self._error: str | None = None
         self._started_at: str | None = None
@@ -76,6 +83,27 @@ class CameraDetectionSession:
         self.camera_height = int(os.environ.get("CAMERA_HEIGHT", "720"))
         self.camera_fps = int(os.environ.get("CAMERA_FPS", "30"))
         self.jpeg_quality = int(os.environ.get("CAMERA_JPEG_QUALITY", "72"))
+        self.inspection_left = float(
+            os.environ.get("CAMERA_INSPECTION_LEFT", "0.35")
+        )
+        self.inspection_right = float(
+            os.environ.get("CAMERA_INSPECTION_RIGHT", "0.65")
+        )
+        self.inspection_top = float(
+            os.environ.get("CAMERA_INSPECTION_TOP", "0.20")
+        )
+        self.inspection_bottom = float(
+            os.environ.get("CAMERA_INSPECTION_BOTTOM", "0.90")
+        )
+        self.passage_exit_samples = max(
+            1, int(os.environ.get("CAMERA_PASSAGE_EXIT_SAMPLES", "2"))
+        )
+        self.capture_min_samples = max(
+            1, int(os.environ.get("CAMERA_QUALITY_SAMPLES", "3"))
+        )
+        self.capture_max_age = max(
+            1.0, float(os.environ.get("CAMERA_CAPTURE_MAX_AGE_SECONDS", "60"))
+        )
 
     def start(self) -> dict[str, Any]:
         with self._lock:
@@ -114,6 +142,12 @@ class CameraDetectionSession:
             self._frame_sequence = 0
             self._latest_result = None
             self._quality_history.clear()
+            self._captured_qualities.clear()
+            self._passage_samples.clear()
+            self._passage_misses = 0
+            self._passage_defect = None
+            self._passage_reject_sent = False
+            self._reject_error = None
             self._error = None
             self._stream_fps = 0.0
             self._detection_fps = 0.0
@@ -163,14 +197,26 @@ class CameraDetectionSession:
     def status(self) -> dict[str, Any]:
         with self._lock:
             result = self._latest_result or {}
+            detections = result.get("detections", [])
+            counts: dict[str, int] = {}
+            for detection in detections:
+                label = normalize_model_label(detection.get("label", ""))
+                counts[label] = counts.get(label, 0) + 1
+            zone_quality, zone_confidence = self._select_frame_observation(
+                detections, result.get("inspection_zone")
+            )
             return {
                 "running": self._running,
                 "error": self._error,
                 "started_at": self._started_at,
                 "session_ref": self._session_ref,
                 "frame_ready": self._latest_jpeg is not None,
-                "total": result.get("total", 0),
-                "counts": result.get("counts", {}),
+                "total": len(detections),
+                "counts": counts,
+                "detections": detections,
+                "detection_ready": self._latest_result is not None,
+                "zone_quality": zone_quality,
+                "zone_confidence": zone_confidence,
                 "confidence_threshold": result.get(
                     "confidence_threshold", CONFIDENCE
                 ),
@@ -178,7 +224,35 @@ class CameraDetectionSession:
                 "detection_fps": round(self._detection_fps, 1),
                 "inference_ms": round(self._inference_ms),
                 "model": dict(self._model_info) if self._model_info else None,
+                "quality_queue": len(self._captured_qualities),
+                "inspection_active": bool(self._passage_samples),
+                "reject_error": self._reject_error,
             }
+
+    def wait_for_captured_quality(
+        self,
+        timeout: float = 1.0,
+    ) -> dict[str, Any] | None:
+        """Return the oldest center-zone capture for the next load-cell egg."""
+        deadline = monotonic() + timeout
+        with self._quality_ready:
+            while True:
+                cutoff = monotonic() - self.capture_max_age
+                while (
+                    self._captured_qualities
+                    and self._captured_qualities[0]["captured_at"] < cutoff
+                ):
+                    self._captured_qualities.popleft()
+                if self._captured_qualities:
+                    result = dict(self._captured_qualities.popleft())
+                    result.pop("captured_at", None)
+                    return result
+                if not self._running or self._error:
+                    return None
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    return None
+                self._quality_ready.wait(timeout=remaining)
 
     def quality_snapshot(self, window_seconds: float = 3.0) -> dict[str, Any]:
         """Return the strongest recent camera quality classification."""
@@ -248,6 +322,7 @@ class CameraDetectionSession:
     @staticmethod
     def _select_frame_observation(
         detections: list[dict[str, Any]],
+        inspection_zone: tuple[float, float, float, float] | None = None,
     ) -> tuple[str, float]:
         """Choose one unambiguous model observation for a camera frame.
 
@@ -259,12 +334,94 @@ class CameraDetectionSession:
         for detection in detections:
             label = normalize_model_label(detection.get("label", ""))
             if label in EGG_QUALITY_LABELS or label == NO_EGG_LABEL:
+                if inspection_zone is not None and label != NO_EGG_LABEL:
+                    box = detection.get("box", ())
+                    if len(box) != 4:
+                        continue
+                    center_x = (float(box[0]) + float(box[2])) / 2
+                    center_y = (float(box[1]) + float(box[3])) / 2
+                    left, top, right, bottom = inspection_zone
+                    if not (
+                        left <= center_x <= right and top <= center_y <= bottom
+                    ):
+                        continue
                 recognized.append(
                     (label, float(detection.get("confidence", 0.0)))
                 )
         if not recognized:
             return NO_EGG_LABEL, 0.0
-        return max(recognized, key=lambda item: item[1])
+        # Safety defects win over confidence. In particular, one accepted
+        # Crack observation can never be overwritten by later Good frames.
+        return max(
+            recognized,
+            key=lambda item: (
+                item[0] == "crack", item[0] == "rotten",
+                item[0] in EGG_QUALITY_LABELS, item[1],
+            ),
+        )
+
+    def set_reject_handler(self, handler: Callable[[str], Any]) -> None:
+        with self._lock:
+            self._reject_handler = handler
+
+    def _process_auto_capture(self, label: str, confidence: float) -> None:
+        """Send a defect immediately, outside the camera lock; retry while visible."""
+        with self._quality_ready:
+            self._update_auto_capture(label, confidence)
+            defect = self._passage_defect
+            handler = self._reject_handler
+            should_send = defect is not None and not self._passage_reject_sent
+            self._quality_ready.notify_all()
+        if not should_send:
+            return
+        try:
+            if handler is None:
+                raise RuntimeError("Camera reject command handler is not connected.")
+            handler(defect)
+        except RuntimeError as exc:
+            with self._lock:
+                self._reject_error = f"Channel 0 reject command failed: {exc}"
+        else:
+            with self._lock:
+                self._passage_reject_sent = True
+                self._reject_error = None
+
+    def _update_auto_capture(self, label: str, confidence: float) -> None:
+        """Latch defects on first detection; queue only eggs eligible for weighing."""
+        if label in EGG_QUALITY_LABELS:
+            self._passage_samples.append((label, confidence))
+            self._passage_misses = 0
+            if label in {"crack", "rotten"} and self._passage_defect is None:
+                self._passage_defect = label
+            return
+
+        if not self._passage_samples:
+            return
+        self._passage_misses += 1
+        if self._passage_misses < self.passage_exit_samples:
+            return
+
+        samples = self._passage_samples
+        self._passage_samples = []
+        self._passage_misses = 0
+        rejected = self._passage_defect is not None
+        self._passage_defect = None
+        self._passage_reject_sent = False
+        # Rejects leave the conveyor before the scale. Queuing them would
+        # incorrectly assign their quality to the next egg on the load cell.
+        if rejected:
+            return
+        if len(samples) < self.capture_min_samples:
+            return
+
+        summary = self._summarize_quality(samples)
+        selected_label = str(summary["label"])
+        peak_confidence = float(summary["confidence"])
+        self._captured_qualities.append({
+            "label": selected_label,
+            "confidence": round(peak_confidence, 4),
+            "captured_at": monotonic(),
+        })
 
     def wait_for_frame(
         self, previous_sequence: int, timeout: float = 2.0
@@ -409,18 +566,30 @@ class CameraDetectionSession:
                 result = detect_image(frame)
                 elapsed = monotonic() - started
                 with self._quality_ready:
+                    width = float(result.get("image_width", frame.shape[1]))
+                    height = float(result.get("image_height", frame.shape[0]))
+                    inspection_zone = (
+                        width * self.inspection_left,
+                        height * self.inspection_top,
+                        width * self.inspection_right,
+                        height * self.inspection_bottom,
+                    )
+                    result["inspection_zone"] = [
+                        round(value) for value in inspection_zone
+                    ]
                     self._latest_result = result
                     captured_at = monotonic()
+                    label, confidence = self._select_frame_observation(
+                        result["detections"], inspection_zone
+                    )
                     if processed_sequence >= self._inspection_min_sequence:
-                        label, confidence = self._select_frame_observation(
-                            result["detections"]
-                        )
                         self._quality_history.append(
                             (captured_at, label, confidence)
                         )
                     self._quality_ready.notify_all()
                     self._inference_ms = elapsed * 1000
                     self._detection_fps = 1 / elapsed if elapsed else 0.0
+                self._process_auto_capture(label, confidence)
         except Exception as exc:
             self._fail(str(exc))
         finally:
