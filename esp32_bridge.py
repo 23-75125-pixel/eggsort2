@@ -354,13 +354,6 @@ class Esp32Bridge:
                     f"Unable to send {command} to the ESP32: {exc}"
                 ) from exc
 
-    def advance_gate(self) -> None:
-        self._send_command("ADVANCE")
-        self._publish({
-            "type": "gate_command",
-            "message": "ADVANCE",
-        })
-
     def _find_port(self) -> str:
         configured = env_text("ESP32_PORT")
         if configured:

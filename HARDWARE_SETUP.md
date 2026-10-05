@@ -163,8 +163,9 @@ From the project folder:
 Logging out stops both the ESP32 serial bridge and camera session. If an
 operator manually stops the session, **Restart Camera & ESP32** starts it again.
 
-The web page's **Advance Load-cell Gate** button sends `ADVANCE` to the same
-ESP32. Every sensor and servo is controlled through this one controller.
+The load-cell gate opens automatically after a stable weight is measured and
+the egg is classified. Every sensor and servo is controlled through this one
+ESP32.
 
 ## Weight sizes and physical routes
 

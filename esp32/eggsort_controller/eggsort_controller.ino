@@ -308,24 +308,6 @@ void handleSerialCommands(bool urgentOnly) {
       continue;
     }
 
-    // Explicit operator-only override from the web "Advance Load-cell Gate"
-    // button. Automatic sorting remains locked until a Good camera capture
-    // authorizes it, but an operator can safely release an egg for testing or
-    // recovery when it is physically waiting on the load cell.
-    if (command == "ADVANCE") {
-      if (processingEgg) {
-        Serial.println("ADVANCE FAILED: EGG ALREADY PROCESSING");
-      } else if (!eggDetected) {
-        Serial.println("ADVANCE FAILED: NO EGG ON LOAD CELL");
-      } else if (openLoadCellGate()) {
-        Serial.println("MANUAL LOAD CELL GATE: OPEN");
-        waitWithRejectService(LOADCELL_OPEN_TIME);
-        closeLoadCellGate();
-        Serial.println("MANUAL LOAD CELL GATE: CLOSED");
-      }
-      continue;
-    }
-
     // ---------- CRACK_TEST ----------
     if (command == "CRACK_TEST") {
 
@@ -404,12 +386,11 @@ void moveLoadCellServoSlow(
 // LOAD-CELL GATE CONTROL
 // =====================================================
 
-// Opens the load-cell gate for an operator-requested ADVANCE command.
-// Returning false lets the caller report that the PCA9685 is unavailable.
+// Opens the load-cell gate during the automatic sorting cycle.
 bool openLoadCellGate() {
 
   if (!pcaReady) {
-    Serial.println("ADVANCE FAILED: PCA9685 NOT FOUND");
+    Serial.println("LOAD CELL GATE FAILED: PCA9685 NOT FOUND");
     return false;
   }
 

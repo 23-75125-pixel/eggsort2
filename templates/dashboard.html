@@ -6,19 +6,8 @@
     <meta content="width=device-width, initial-scale=1.0" name="viewport" />
     <title>EGGSor+ Operational Dashboard</title>
     <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
-    <link
-      href="https://fonts.googleapis.com/css2?family=Poppins:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;1,400&amp;display=swap"
-      rel="stylesheet"
-    />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap"
-      rel="stylesheet"
-    />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap"
-      rel="stylesheet"
-    />
-    <script id="tailwind-config">
+        <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet" />
+<script id="tailwind-config">
       tailwind.config = {
         darkMode: "class",
         theme: {
@@ -89,14 +78,14 @@
               margin: "32px",
             },
             fontFamily: {
-              caption: ["Poppins", "sans-serif"],
-              "headline-md": ["Poppins", "sans-serif"],
-              button: ["Poppins", "sans-serif"],
-              "headline-lg": ["Poppins", "sans-serif"],
-              "body-lg": ["Poppins", "sans-serif"],
-              "label-caps": ["Poppins", "sans-serif"],
-              "headline-lg-mobile": ["Poppins", "sans-serif"],
-              "body-md": ["Poppins", "sans-serif"],
+              caption: ["Inter", "sans-serif"],
+              "headline-md": ["Inter", "sans-serif"],
+              button: ["Inter", "sans-serif"],
+              "headline-lg": ["Inter", "sans-serif"],
+              "body-lg": ["Inter", "sans-serif"],
+              "label-caps": ["Inter", "sans-serif"],
+              "headline-lg-mobile": ["Inter", "sans-serif"],
+              "body-md": ["Inter", "sans-serif"],
             },
             fontSize: {
               caption: ["12px", { lineHeight: "1.4", fontWeight: "400" }],
@@ -168,11 +157,7 @@
           >
             EGGSor+
           </h1>
-          <p
-            class="font-label-caps text-label-caps text-surface-variant/70 tracking-widest mt-xs"
-          >
-            IOT EGG SORTING SYS
-          </p>
+
         </div>
       </div>
       <!-- Links -->
@@ -443,6 +428,16 @@
                 machine sorting events
               </p>
             </div>
+            {% if current_user_role == "admin" %}
+            <button
+              id="clear-audit-logs"
+              type="button"
+              class="inline-flex items-center gap-2 rounded-lg border border-red-200 px-4 py-2 text-sm font-semibold text-red-700 hover:bg-red-50 transition-colors"
+            >
+              <span class="material-symbols-outlined text-base">delete_sweep</span>
+              Clear Logs
+            </button>
+            {% endif %}
           </div>
           <div id="dashboard-audit-logs" class="flex flex-col items-center justify-center py-12 text-center">
             <span class="material-symbols-outlined text-4xl text-secondary-fixed-dim mb-4">history</span>
@@ -572,6 +567,23 @@
 
     let dashboardRequestPending = false;
     let renderedSections = {};
+
+    document.getElementById('clear-audit-logs')?.addEventListener('click', async (event) => {
+      if (!window.confirm('Clear all current System Security Audit Logs? This cannot be undone.')) return;
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        const response = await fetch('/api/dashboard/audit-logs/clear', { method: 'POST' });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || 'Could not clear audit logs.');
+        renderedSections.audit = null;
+        await refreshDashboard({ manual: false });
+      } catch (error) {
+        window.alert(error.message || 'Could not clear audit logs.');
+      } finally {
+        button.disabled = false;
+      }
+    });
     let successFlashTimer = null;
 
     const refreshButton = document.getElementById('refresh-dashboard');

@@ -1384,20 +1384,6 @@ def hardware_status() -> Any:
     return jsonify(ESP32_BRIDGE.status())
 
 
-@app.post("/api/hardware/gate/advance")
-@login_required
-def advance_load_cell_gate() -> Any:
-    try:
-        ESP32_BRIDGE.advance_gate()
-        write_audit_log(
-            "gate_advanced",
-            "Operator manually advanced the load-cell gate.",
-        )
-        return jsonify(ok=True, message="Load-cell gate command sent.")
-    except RuntimeError as exc:
-        return jsonify(error=str(exc)), 503
-
-
 @app.get("/api/egg-records")
 @login_required
 def egg_records_data() -> Any:
@@ -1513,6 +1499,14 @@ def dashboard_stats() -> Any:
         ],
         audit_logs=[log.to_dict() for log in recent_audits],
     )
+
+
+@app.post("/api/dashboard/audit-logs/clear")
+@admin_required
+def clear_dashboard_audit_logs() -> Any:
+    deleted_count = AuditLog.query.delete(synchronize_session=False)
+    db.session.commit()
+    return jsonify(deleted_count=deleted_count)
 
 
 @app.get("/api/alerts")
