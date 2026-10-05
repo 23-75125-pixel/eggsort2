@@ -459,16 +459,30 @@
       overlay.classList.toggle('hidden');
     }
 
-    const sizeOrder = ['Peewee', 'Small', 'Medium', 'Large', 'Extra Large', 'Jumbo'];
+    const sizeOrder = ['Small', 'Medium', 'Large', 'Extra Large', 'Jumbo'];
 
-    function renderDailyTrend(trend) {
+    function renderDailyTrend(trend, selectedDate) {
       const container = document.getElementById('dashboard-daily-trend');
       container.replaceChildren();
 
+      const heading = document.createElement('div');
+      heading.className = 'flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-6';
       const title = document.createElement('h4');
-      title.className = 'font-headline-md text-body-lg font-bold text-on-background mb-6';
+      title.className = 'font-headline-md text-body-lg font-bold text-on-background';
       title.textContent = 'Daily Sorting Trend';
-      container.appendChild(title);
+      const dateLabel = document.createElement('label');
+      dateLabel.className = 'flex items-center gap-2 text-sm text-secondary';
+      dateLabel.textContent = 'Through';
+      const datePicker = document.createElement('input');
+      datePicker.type = 'date';
+      datePicker.id = 'dashboard-trend-date';
+      datePicker.className = 'rounded-lg border border-outline-variant/50 px-3 py-2 text-on-surface';
+      datePicker.value = selectedDate;
+      datePicker.setAttribute('aria-label', 'Choose end date for daily sorting trend');
+      datePicker.addEventListener('change', () => refreshDashboard());
+      dateLabel.appendChild(datePicker);
+      heading.append(title, dateLabel);
+      container.appendChild(heading);
 
       const chart = document.createElement('div');
       chart.className = 'h-48 flex items-end justify-between gap-2 sm:gap-3';
@@ -604,7 +618,10 @@
       if (options.manual) setDashboardStatus('busy', 'Refreshing...');
       let succeeded = false;
       try {
-        const response = await fetch('/api/dashboard/stats', {
+        const trendDate = document.getElementById('dashboard-trend-date')?.value || '';
+        const statsUrl = new URL('/api/dashboard/stats', window.location.origin);
+        if (trendDate) statsUrl.searchParams.set('date', trendDate);
+        const response = await fetch(statsUrl, {
           credentials: 'same-origin',
           cache: 'no-store'
         });
@@ -618,7 +635,7 @@
         document.getElementById('dashboard-total-sorted').textContent = stats.total_sorted;
         document.getElementById('dashboard-total-note').textContent =
           stats.latest_record
-            ? `Latest: ${stats.latest_record.weight_grams} g • ${stats.latest_record.size}`
+            ? `Latest: ${stats.latest_record.weight_grams == null ? 'N/A' : `${stats.latest_record.weight_grams} g`} • ${stats.latest_record.size}`
             : 'Waiting for load cell';
         document.getElementById('dashboard-trays').textContent = stats.trays_completed;
         document.getElementById('dashboard-trays-note').textContent =
@@ -637,7 +654,8 @@
          */
         const trendKey = JSON.stringify(stats.daily_trend || []);
         if (trendKey !== renderedSections.trend) {
-          renderDailyTrend(stats.daily_trend || []);
+          const trend = stats.daily_trend || [];
+          renderDailyTrend(trend, trendDate || trend.at(-1)?.date || '');
           renderedSections.trend = trendKey;
         }
 

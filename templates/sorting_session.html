@@ -525,7 +525,7 @@ async function refreshHardwareState() {
 
     const record = recordsPayload.records[0];
     latestEggRecord.textContent = record
-      ? `${record.egg_id} • ${record.weight_grams} g • ${record.size} • ${record.quality}`
+      ? `${record.egg_id} • ${record.weight_grams == null ? 'N/A' : `${record.weight_grams} g`} • ${record.size} • ${record.quality}`
       : 'No completed egg yet';
   } catch (error) {
     hardwareStatus.textContent = 'Hardware status unavailable';

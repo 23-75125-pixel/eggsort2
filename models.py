@@ -49,7 +49,9 @@ class EggRecord(db.Model):
         return {
             "id": self.id,
             "egg_id": f"EGG-{self.id:06d}",
-            "weight_grams": self.weight_grams,
+            # Camera rejects bypass the load cell, so zero is the storage
+            # sentinel for an unavailable weight rather than a measurement.
+            "weight_grams": self.weight_grams or None,
             "size": self.size,
             "quality": self.quality,
             "confidence": round(self.confidence, 4),

@@ -143,6 +143,28 @@ def google_is_configured() -> bool:
     )
 
 
+def open_mail_connection() -> tuple[Any, bool]:
+    """Connect using configured SMTP, with Gmail's implicit TLS port as fallback."""
+    server = app.config["MAIL_SERVER"]
+    port = app.config["MAIL_PORT"]
+    # Port 465 is implicit TLS. Accommodate MAIL_PORT=465 even if a local
+    # .env still has the former port-587 MAIL_USE_SSL=0 setting.
+    use_ssl = app.config["MAIL_USE_SSL"] or port == 465
+    if use_ssl:
+        return smtplib.SMTP_SSL(server, port, timeout=15), True
+
+    try:
+        return smtplib.SMTP(server, port, timeout=15), False
+    except (OSError, smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected):
+        if port != 587 or not app.config["MAIL_USE_TLS"]:
+            raise
+        app.logger.warning(
+            "SMTP connection to %s:587 failed; retrying with implicit TLS on port 465",
+            server,
+        )
+        return smtplib.SMTP_SSL(server, 465, timeout=15), True
+
+
 def send_staff_invitation(user: "User", invite_url: str) -> None:
     required_settings = {
         "MAIL_SERVER": app.config["MAIL_SERVER"],
@@ -174,20 +196,9 @@ can ignore this email.
     )
 
     try:
-        if app.config["MAIL_USE_SSL"]:
-            smtp = smtplib.SMTP_SSL(
-                app.config["MAIL_SERVER"],
-                app.config["MAIL_PORT"],
-                timeout=15,
-            )
-        else:
-            smtp = smtplib.SMTP(
-                app.config["MAIL_SERVER"],
-                app.config["MAIL_PORT"],
-                timeout=15,
-            )
+        smtp, implicit_tls = open_mail_connection()
         with smtp:
-            if app.config["MAIL_USE_TLS"] and not app.config["MAIL_USE_SSL"]:
+            if app.config["MAIL_USE_TLS"] and not implicit_tls:
                 smtp.starttls()
             if app.config["MAIL_USERNAME"]:
                 smtp.login(
@@ -196,8 +207,46 @@ can ignore this email.
                 )
             smtp.send_message(message)
     except (OSError, smtplib.SMTPException) as exc:
+        app.logger.exception("Staff invitation email delivery failed")
+        if isinstance(exc, smtplib.SMTPAuthenticationError):
+            if "gmail" in app.config["MAIL_SERVER"].lower():
+                detail = (
+                    "Gmail rejected the SMTP login. Check that MAIL_USERNAME "
+                    "is the sending Gmail account and MAIL_PASSWORD is its "
+                    "current Google app password (with 2-Step Verification enabled)."
+                )
+            else:
+                detail = (
+                    "The mail server rejected the login. Check MAIL_USERNAME "
+                    "and use an app password or SMTP credential supported by "
+                    "your mail provider."
+                )
+        elif isinstance(exc, smtplib.SMTPRecipientsRefused):
+            detail = "The recipient address was refused by the mail server. Check the staff email address."
+        elif isinstance(exc, (smtplib.SMTPConnectError, OSError)):
+            ports = (
+                "587 and fallback 465"
+                if app.config["MAIL_PORT"] == 587
+                and app.config["MAIL_USE_TLS"]
+                else str(app.config["MAIL_PORT"])
+            )
+            detail = (
+                f"The app could not connect to the mail server on port(s) {ports}. "
+                "Check the internet connection, firewall, and MAIL_SERVER settings."
+            )
+        elif isinstance(exc, smtplib.SMTPServerDisconnected):
+            detail = (
+                "The server closed the connection during SMTP login. Check "
+                "MAIL_USERNAME and MAIL_PASSWORD; for Gmail, use a current "
+                "Google app password for that mailbox with 2-Step Verification enabled."
+            )
+        else:
+            detail = (
+                f"The mail server rejected the message ({type(exc).__name__}). "
+                "Check the mail settings and server logs."
+            )
         raise InvitationDeliveryError(
-            "The invitation was created, but the email could not be sent."
+            f"The invitation was created, but the email could not be sent. {detail}"
         ) from exc
 
 
@@ -218,9 +267,9 @@ The link expires in 30 minutes. If you did not request this, ignore this email.
 """
     )
     try:
-        smtp_class = smtplib.SMTP_SSL if app.config["MAIL_USE_SSL"] else smtplib.SMTP
-        with smtp_class(app.config["MAIL_SERVER"], app.config["MAIL_PORT"], timeout=15) as smtp:
-            if app.config["MAIL_USE_TLS"] and not app.config["MAIL_USE_SSL"]:
+        smtp, implicit_tls = open_mail_connection()
+        with smtp:
+            if app.config["MAIL_USE_TLS"] and not implicit_tls:
                 smtp.starttls()
             if app.config["MAIL_USERNAME"]:
                 smtp.login(app.config["MAIL_USERNAME"], app.config["MAIL_PASSWORD"])
@@ -341,7 +390,7 @@ def write_audit_log(
 
 
 def backfill_completed_tray_alerts() -> None:
-    total_sorted = EggRecord.query.count()
+    total_sorted = EggRecord.query.filter_by(quality="Good").count()
     created = False
     for tray_number in range(1, (total_sorted // TRAY_CAPACITY) + 1):
         boundary_record = (
@@ -582,7 +631,7 @@ def save_sorted_egg(event: dict[str, Any]) -> None:
             record = EggRecord(**pending)
             db.session.add(record)
             db.session.flush()
-            total_sorted = EggRecord.query.count()
+            total_sorted = EggRecord.query.filter_by(quality="Good").count()
             create_tray_alert_if_needed(total_sorted, pending["session_ref"])
             write_audit_log(
                 "egg_sorted",
@@ -630,7 +679,48 @@ def handle_esp32_event(event: dict[str, Any]) -> None:
 
 ESP32_BRIDGE.set_event_handler(handle_esp32_event)
 CAMERA_SESSION.set_reject_handler(ESP32_BRIDGE.reject_egg)
-CAMERA_SESSION.set_capture_handler(ESP32_BRIDGE.publish_camera_capture)
+
+
+def save_camera_capture(capture: dict[str, Any]) -> None:
+    """Save camera-rejected eggs too; they leave through the reject gate."""
+    quality = str(capture.get("label", "")).strip().lower()
+    if quality in {"crack", "rotten"}:
+        try:
+            with app.app_context():
+                record = EggRecord(
+                    weight_grams=0,
+                    size="N/A",
+                    quality=quality.title(),
+                    confidence=float(capture.get("confidence", 0.0)),
+                    session_ref=(
+                        CAMERA_SESSION.status().get("session_ref")
+                        or "NO-ACTIVE-SESSION"
+                    ),
+                )
+                db.session.add(record)
+                db.session.flush()
+                write_audit_log(
+                    "egg_rejected",
+                    (
+                        f"EGG-{record.id:06d} completed camera inspection as "
+                        f"{record.quality}; rejected before weighing."
+                    ),
+                    event_key=f"egg-rejected:{record.id}",
+                    commit=False,
+                )
+                db.session.commit()
+        except Exception:
+            with app.app_context():
+                db.session.rollback()
+            app.logger.exception("Unable to persist a camera-rejected egg")
+            ESP32_BRIDGE.publish_status(
+                "Camera-rejected egg completed, but saving its record failed.",
+                "flow_error",
+            )
+    ESP32_BRIDGE.publish_camera_capture(capture)
+
+
+CAMERA_SESSION.set_capture_handler(save_camera_capture)
 
 
 @app.before_request
@@ -1373,8 +1463,16 @@ def dashboard_stats() -> Any:
     quality_counts = {quality: count for quality, count in quality_rows}
     good_count = quality_counts.get("Good", 0)
     latest_record = EggRecord.query.order_by(EggRecord.id.desc()).first()
-    today = datetime.now(timezone.utc).date()
-    trend_days = [today - timedelta(days=offset) for offset in range(6, -1, -1)]
+    selected_date_value = request.args.get("date")
+    try:
+        selected_date = (
+            datetime.strptime(selected_date_value, "%Y-%m-%d").date()
+            if selected_date_value
+            else datetime.now(timezone.utc).date()
+        )
+    except ValueError:
+        return jsonify(error="Date must use YYYY-MM-DD format."), 400
+    trend_days = [selected_date - timedelta(days=offset) for offset in range(6, -1, -1)]
     trend_counts = {day.isoformat(): 0 for day in trend_days}
     trend_start = datetime.combine(trend_days[0], time.min, tzinfo=timezone.utc)
     recent_records = EggRecord.query.filter(EggRecord.sorted_at >= trend_start).all()
@@ -1394,7 +1492,7 @@ def dashboard_stats() -> Any:
 
     return jsonify(
         total_sorted=total_sorted,
-        trays_completed=total_sorted // TRAY_CAPACITY,
+        trays_completed=EggRecord.query.filter_by(quality="Good").count() // TRAY_CAPACITY,
         quality_rate=round(
             (good_count / total_sorted * 100) if total_sorted else 0,
             1,
@@ -1811,14 +1909,14 @@ def check_mail() -> None:
         )
         return
 
+    phase = "connecting"
     try:
-        if app.config["MAIL_USE_SSL"]:
-            smtp = smtplib.SMTP_SSL(server, app.config["MAIL_PORT"], timeout=15)
-        else:
-            smtp = smtplib.SMTP(server, app.config["MAIL_PORT"], timeout=15)
+        smtp, implicit_tls = open_mail_connection()
         with smtp:
-            if app.config["MAIL_USE_TLS"] and not app.config["MAIL_USE_SSL"]:
+            if app.config["MAIL_USE_TLS"] and not implicit_tls:
+                phase = "TLS negotiation"
                 smtp.starttls()
+            phase = "SMTP login"
             smtp.login(username, app.config["MAIL_PASSWORD"])
     except smtplib.SMTPAuthenticationError as exc:
         detail = exc.smtp_error
@@ -1834,8 +1932,16 @@ def check_mail() -> None:
             print("For Gmail/Google, the app password must belong to the account in")
             print("MAIL_USERNAME, and 2-Step Verification must be enabled on it.")
     except (OSError, smtplib.SMTPException) as exc:
-        print(f"\nFAIL: could not complete the connection "
+        print(f"\nFAIL: error during {phase} "
               f"({type(exc).__name__}: {exc}).")
+        if phase == "SMTP login" and isinstance(
+            exc, smtplib.SMTPServerDisconnected
+        ):
+            print(
+                "The server closed the connection during login. For Gmail, "
+                "verify 2-Step Verification and create a fresh app password "
+                "for MAIL_USERNAME."
+            )
     else:
         print("\nOK: SMTP login succeeded, invitation emails should send.")
 

@@ -461,7 +461,7 @@
 
       const values = [
         record.egg_id,
-        `${record.weight_grams} g`,
+        record.weight_grams == null ? 'N/A' : `${record.weight_grams} g`,
         record.size,
         record.quality,
         new Date(record.sorted_at).toLocaleString(),

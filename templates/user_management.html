@@ -254,14 +254,14 @@
           type="button"
           class="pb-3 border-b-2 border-transparent text-secondary hover:text-on-surface transition-colors font-button text-button whitespace-nowrap shrink-0"
         >
-          Audit History Trail
+          
         </button>
         <button
           id="tab-docs"
           type="button"
           class="pb-3 border-b-2 border-transparent text-secondary hover:text-on-surface transition-colors font-button text-button whitespace-nowrap shrink-0"
         >
-          Systems Architect Docs
+          
         </button>
       </div>
       <!-- Content Area -->
@@ -407,12 +407,18 @@
     function showInviteModal(url, emailSent = false, warning = null) {
       inviteUrl.value = url;
       copyStatus.textContent = '';
+      const success = "Check your email inbox for the invitation link. If you don't see it, check your spam folder.";
+      const inviteHost = new URL(url).hostname.toLowerCase();
+      const localInviteUrl = ['localhost', '127.0.0.1', '::1'].includes(inviteHost);
+      const localUrlNotice = localInviteUrl
+        ? ' This link uses the local computer address, so staff on another device cannot open it. Set PUBLIC_BASE_URL to the app’s reachable HTTPS address and create a new invitation.'
+        : '';
       inviteModalTitle.textContent = emailSent
         ? 'Invitation Email Sent'
         : 'Invitation Email Not Sent';
       inviteDeliveryStatus.textContent = emailSent
-        ? 'The staff member received the activation link by email.'
-        : (warning || 'Email was not sent. Copy this private link and send it to the staff member.');
+        ? `The invitation email was accepted by the mail server.${success}`
+        : `${warning || 'Email was not sent. Copy this private link and send it to the staff member.'}${success}`;
       inviteCopyControls.classList.toggle('hidden', emailSent);
       inviteCopyControls.classList.toggle('flex', !emailSent);
       inviteModal.classList.remove('hidden');
