@@ -135,20 +135,12 @@
       class="h-screen w-64 flex-col fixed left-0 top-0 bg-inverse-surface border-r border-outline-variant/10 shadow-xl flex z-50 -translate-x-full md:translate-x-0 transition-transform duration-300 ease-in-out"
     >
       <!-- Brand -->
-      <div class="px-gutter py-margin flex items-center gap-sm">
-        <div
-          class="w-10 h-10 rounded-lg bg-primary-container flex items-center justify-center text-white"
-        >
-          <span class="material-symbols-outlined filled">egg</span>
-        </div>
-        <div>
-          <h1
-            class="text-headline-md font-headline-md text-primary-fixed tracking-tight"
-          >
-            EGGSor+
-          </h1>
-          
-        </div>
+      <div class="px-gutter py-3 flex justify-center">
+        <img
+          src="{{ url_for('static', filename='images/eggsort.png') }}"
+          alt="EGGSor+ logo"
+          class="w-full max-w-[220px] aspect-[1.4/1] object-cover"
+        />
       </div>
       <!-- Links -->
       <div class="flex flex-col py-gutter px-2 flex-1 min-h-0 overflow-y-auto">
