@@ -132,6 +132,8 @@
       .nav-active-glow { box-shadow: -4px 0 0 0 theme("colors.primary-container") inset; }
     </style>
     <link rel="stylesheet" href="/static/responsive.css" />
+    <meta name="csrf-token" content="{{ csrf_token() }}" />
+    <script src="{{ url_for('static', filename='security.js') }}" defer></script>
   </head>
   <body
     class="font-body-md text-on-background antialiased flex h-screen overflow-hidden"
@@ -193,13 +195,6 @@
         </a>
         <a
           class="text-surface-variant/70 hover:text-white transition-colors py-3 px-6 flex items-center gap-3 hover:bg-surface-variant/10 transition-all active:scale-95 duration-150 ease-in-out rounded-lg mx-2 mt-xs"
-          href="/sales"
-        >
-          <span class="material-symbols-outlined">payments</span>
-          <span class="font-button text-button">Sales</span>
-        </a>
-        <a
-          class="text-surface-variant/70 hover:text-white transition-colors py-3 px-6 flex items-center gap-3 hover:bg-surface-variant/10 transition-all active:scale-95 duration-150 ease-in-out rounded-lg mx-2 mt-xs"
           href="/reports"
         >
           <span class="material-symbols-outlined">assessment</span>
@@ -245,7 +240,16 @@
               </h2>
             </div>
           </div>
-          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4 w-full md:w-auto">
+          <div class="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 sm:gap-4 w-full md:w-auto">
+            <div
+              id="records-status"
+              role="status"
+              aria-live="polite"
+              class="h-[48px] px-4 rounded-full bg-surface-container-low flex items-center justify-center gap-2 text-primary text-sm font-bold"
+            >
+              <span id="records-status-dot" class="w-2 h-2 rounded-full bg-primary-container animate-pulse"></span>
+              <span id="records-status-text">Loading live records...</span>
+            </div>
             <button
               id="export-records"
               type="button"
@@ -311,7 +315,6 @@
               <option>Good</option>
               <option>Crack</option>
               <option>Rotten</option>
-              <option>Undefined</option>
             </select>
             <button
               id="reset-record-filters"
@@ -424,15 +427,30 @@
     const recordSearch = document.getElementById('record-search');
     const sizeFilter = document.getElementById('size-filter');
     const qualityFilter = document.getElementById('quality-filter');
+    const recordsStatusDot = document.getElementById('records-status-dot');
+    const recordsStatusText = document.getElementById('records-status-text');
     let currentRecords = [];
     let recordSearchTimer = null;
+    let recordsRequestPending = false;
+    let renderedRecordsKey = '';
+
+    function formatRefreshTimestamp(date = new Date()) {
+      return date.toLocaleString([], { dateStyle: 'medium', timeStyle: 'medium' });
+    }
+
+    function setRecordsStatus(message, failed = false) {
+      recordsStatusText.textContent = message;
+      recordsStatusText.classList.toggle('text-[#ba1a1a]', failed);
+      recordsStatusDot.classList.toggle('bg-[#ba1a1a]', failed);
+      recordsStatusDot.classList.toggle('bg-primary-container', !failed);
+      recordsStatusDot.classList.toggle('animate-pulse', !failed);
+    }
 
     function qualityClasses(quality) {
       const normalized = quality.toLowerCase();
       if (normalized === 'good') return 'bg-green-100 text-green-800';
       if (normalized === 'crack') return 'bg-red-100 text-red-800';
       if (normalized === 'rotten') return 'bg-amber-100 text-amber-900';
-      if (normalized === 'undefined') return 'bg-slate-100 text-slate-700';
       return 'bg-surface-container text-secondary';
     }
 
@@ -483,6 +501,8 @@
     }
 
     async function refreshEggRecords() {
+      if (recordsRequestPending) return;
+      recordsRequestPending = true;
       try {
         const params = new URLSearchParams({
           q: recordSearch.value.trim(),
@@ -491,7 +511,8 @@
           limit: '500'
         });
         const response = await fetch(`/api/egg-records?${params}`, {
-          credentials: 'same-origin'
+          credentials: 'same-origin',
+          cache: 'no-store'
         });
         if (response.redirected) {
           window.location.href = response.url;
@@ -501,9 +522,17 @@
         if (!response.ok) throw new Error(payload.error || 'Unable to load egg records.');
 
         currentRecords = payload.records || [];
-        renderRecords(currentRecords);
+        const recordsKey = JSON.stringify(currentRecords);
+        if (recordsKey !== renderedRecordsKey) {
+          renderRecords(currentRecords);
+          renderedRecordsKey = recordsKey;
+        }
+        setRecordsStatus(`Updated ${formatRefreshTimestamp()}`);
       } catch (error) {
         console.error('Egg record refresh failed:', error);
+        setRecordsStatus('Live refresh failed', true);
+      } finally {
+        recordsRequestPending = false;
       }
     }
 

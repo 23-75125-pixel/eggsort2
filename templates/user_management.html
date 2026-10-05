@@ -142,6 +142,8 @@
       .nav-active-glow { box-shadow: -4px 0 0 0 theme("colors.primary-container") inset; }
     </style>
     <link rel="stylesheet" href="/static/responsive.css" />
+    <meta name="csrf-token" content="{{ csrf_token() }}" />
+    <script src="{{ url_for('static', filename='security.js') }}" defer></script>
   </head>
   <body class="bg-surface text-on-surface font-body-md min-h-screen flex">
     <!-- SideNavBar -->
@@ -198,13 +200,6 @@
         >
           <span class="material-symbols-outlined">notifications</span>
           <span class="font-button text-button">Alerts</span>
-        </a>
-        <a
-          class="text-surface-variant/70 hover:text-white transition-colors py-3 px-6 flex items-center gap-3 hover:bg-surface-variant/10 transition-all active:scale-95 duration-150 ease-in-out rounded-lg mx-2 mt-xs"
-          href="/sales"
-        >
-          <span class="material-symbols-outlined">payments</span>
-          <span class="font-button text-button">Sales</span>
         </a>
         <a
           class="text-surface-variant/70 hover:text-white transition-colors py-3 px-6 flex items-center gap-3 hover:bg-surface-variant/10 transition-all active:scale-95 duration-150 ease-in-out rounded-lg mx-2 mt-xs"
@@ -294,7 +289,7 @@
       <section id="docs-panel" class="hidden bg-white border border-surface-variant rounded-xl p-6">
         <h2 class="font-headline-md text-headline-md">Systems Architect Docs</h2>
         <div class="mt-4 space-y-2 text-secondary">
-          <p>Operators can access live sorting, records, alerts, sales, and reports.</p>
+          <p>Operators can access live sorting, records, alerts, and reports.</p>
           <p>Only non-current operator accounts can be deleted, and at least one account must remain.</p>
         </div>
       </section>

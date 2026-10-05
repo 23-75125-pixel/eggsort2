@@ -24,7 +24,7 @@ class CameraAutoCaptureTests(unittest.TestCase):
 
     def test_live_status_reports_each_quality_from_detection_boxes(self) -> None:
         session = CameraDetectionSession()
-        for label in ("Rotten", "Crack", "Good", "Undefined"):
+        for label in ("Rotten", "Crack", "Good"):
             with self.subTest(label=label):
                 session._latest_result = {
                     "detections": [{
@@ -123,18 +123,15 @@ class CameraAutoCaptureTests(unittest.TestCase):
             session._update_auto_capture(label, 0.8)
         for label in ("crack", "good", "good", "no egg", "no egg"):
             session._update_auto_capture(label, 0.7)
-        for label in ("undefined", "undefined", "undefined", "no egg", "no egg"):
-            session._update_auto_capture(label, 0.8)
-
         self.assertEqual(
             [result["label"] for result in session._captured_qualities],
-            ["good", "undefined"],
+            ["good"],
         )
         self.assertEqual(
             [result["capture_id"] for result in session._captured_qualities],
-            [1, 3],
+            [1],
         )
-        self.assertEqual(session.status()["egg_count"], 3)
+        self.assertEqual(session.status()["egg_count"], 2)
 
     def test_one_shot_count_and_capture_event_on_exit(self) -> None:
         session = CameraDetectionSession()
@@ -220,17 +217,16 @@ class CameraAutoCaptureTests(unittest.TestCase):
                 )
                 self.assertFalse(session._captured_qualities)
 
-    def test_good_and_undefined_only_enter_weighing_queue(self) -> None:
+    def test_only_good_enters_the_weighing_queue(self) -> None:
         session = self.make_session()
         handler = Mock()
         session.set_reject_handler(handler)
-        for quality in ("good", "undefined"):
-            for label in (quality, quality, quality, "no egg", "no egg"):
-                session._process_auto_capture(label, 0.8)
+        for label in ("good", "good", "good", "no egg", "no egg"):
+            session._process_auto_capture(label, 0.8)
         handler.assert_not_called()
         self.assertEqual(
             [entry["label"] for entry in session._captured_qualities],
-            ["good", "undefined"],
+            ["good"],
         )
 
     def test_only_boxes_centered_in_zone_are_used(self) -> None:
@@ -244,6 +240,42 @@ class CameraAutoCaptureTests(unittest.TestCase):
                 detections, (30, 30, 70, 70)
             ),
             ("good", 0.80),
+        )
+
+    def test_outside_zone_defect_is_ignored_as_no_egg(self) -> None:
+        detections = [{
+            "label": "Crack", "confidence": 0.99, "box": [0, 0, 20, 20],
+        }]
+
+        self.assertEqual(
+            CameraDetectionSession._select_frame_observation(
+                detections, (30, 30, 70, 70)
+            ),
+            ("no egg", 0.0),
+        )
+
+    def test_partly_entered_egg_does_not_trigger_capture(self) -> None:
+        detections = [{
+            "label": "Rotten", "confidence": 0.99, "box": [0, 40, 20, 60],
+        }]
+
+        self.assertEqual(
+            CameraDetectionSession._select_frame_observation(
+                detections, (30, 30, 70, 70)
+            ),
+            ("no egg", 0.0),
+        )
+
+    def test_large_centered_egg_is_accepted(self) -> None:
+        detections = [{
+            "label": "Good", "confidence": 0.97, "box": [10, 20, 90, 80],
+        }]
+
+        self.assertEqual(
+            CameraDetectionSession._select_frame_observation(
+                detections, (30, 30, 70, 70)
+            ),
+            ("good", 0.97),
         )
 
     def test_crack_wins_over_higher_confidence_good_in_same_frame(self) -> None:

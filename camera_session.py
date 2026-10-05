@@ -9,6 +9,7 @@ from threading import Condition, Event, RLock, Thread
 from time import monotonic
 from typing import Any, Callable
 
+from config import env_float, env_int, env_text
 from detection_service import (
     CONFIDENCE,
     DetectorUnavailableError,
@@ -18,10 +19,9 @@ from detection_service import (
 )
 
 
-# Exact class set used by the trained five-class egg-quality model.  "no egg"
-# is a negative observation: it can break a run of quality samples, but it is
-# never saved as an egg quality.
-EGG_QUALITY_LABELS = {"crack", "good", "rotten", "undefined"}
+# Exact class set used by the trained three-class egg-quality model. A missing
+# detection is treated as "no egg"; it is never stored as an egg quality.
+EGG_QUALITY_LABELS = {"crack", "good", "rotten"}
 NO_EGG_LABEL = "no egg"
 
 
@@ -79,35 +79,47 @@ class CameraDetectionSession:
         self._detection_fps = 0.0
         self._inference_ms = 0.0
         self._model_info: dict[str, Any] | None = None
-        self.camera_index = int(os.environ.get("CAMERA_INDEX", "0"))
-        self.camera_backend = os.environ.get(
+        self.camera_index = env_int("CAMERA_INDEX", 0, minimum=0)
+        self.camera_backend = env_text(
             "CAMERA_BACKEND",
             "dshow" if os.name == "nt" else "auto",
         ).lower()
-        self.camera_width = int(os.environ.get("CAMERA_WIDTH", "1280"))
-        self.camera_height = int(os.environ.get("CAMERA_HEIGHT", "720"))
-        self.camera_fps = int(os.environ.get("CAMERA_FPS", "30"))
-        self.jpeg_quality = int(os.environ.get("CAMERA_JPEG_QUALITY", "72"))
-        self.inspection_left = float(
-            os.environ.get("CAMERA_INSPECTION_LEFT", "0.25")
+        self.camera_width = env_int("CAMERA_WIDTH", 1280, minimum=160, maximum=7680)
+        self.camera_height = env_int("CAMERA_HEIGHT", 720, minimum=120, maximum=4320)
+        self.camera_fps = env_int("CAMERA_FPS", 30, minimum=1, maximum=240)
+        self.jpeg_quality = env_int(
+            "CAMERA_JPEG_QUALITY", 72, minimum=1, maximum=100
         )
-        self.inspection_right = float(
-            os.environ.get("CAMERA_INSPECTION_RIGHT", "0.75")
+        self.inspection_left = env_float(
+            "CAMERA_INSPECTION_LEFT", 0.40, minimum=0.0, maximum=1.0
         )
-        self.inspection_top = float(
-            os.environ.get("CAMERA_INSPECTION_TOP", "0.20")
+        self.inspection_right = env_float(
+            "CAMERA_INSPECTION_RIGHT", 0.60, minimum=0.0, maximum=1.0
         )
-        self.inspection_bottom = float(
-            os.environ.get("CAMERA_INSPECTION_BOTTOM", "0.90")
+        self.inspection_top = env_float(
+            "CAMERA_INSPECTION_TOP", 0.36, minimum=0.0, maximum=1.0
         )
-        self.passage_exit_samples = max(
-            1, int(os.environ.get("CAMERA_PASSAGE_EXIT_SAMPLES", "2"))
+        self.inspection_bottom = env_float(
+            "CAMERA_INSPECTION_BOTTOM", 0.64, minimum=0.0, maximum=1.0
         )
-        self.capture_min_samples = max(
-            1, int(os.environ.get("CAMERA_QUALITY_SAMPLES", "1"))
+        if not self.inspection_left < self.inspection_right:
+            raise ValueError(
+                "CAMERA_INSPECTION_LEFT must be less than "
+                "CAMERA_INSPECTION_RIGHT."
+            )
+        if not self.inspection_top < self.inspection_bottom:
+            raise ValueError(
+                "CAMERA_INSPECTION_TOP must be less than "
+                "CAMERA_INSPECTION_BOTTOM."
+            )
+        self.passage_exit_samples = env_int(
+            "CAMERA_PASSAGE_EXIT_SAMPLES", 2, minimum=1, maximum=120
         )
-        self.capture_max_age = max(
-            1.0, float(os.environ.get("CAMERA_CAPTURE_MAX_AGE_SECONDS", "60"))
+        self.capture_min_samples = env_int(
+            "CAMERA_QUALITY_SAMPLES", 1, minimum=1, maximum=120
+        )
+        self.capture_max_age = env_float(
+            "CAMERA_CAPTURE_MAX_AGE_SECONDS", 60.0, minimum=1.0, maximum=3600.0
         )
 
     def start(self) -> dict[str, Any]:
@@ -123,7 +135,7 @@ class CameraDetectionSession:
             ) from exc
 
         # Fail camera startup immediately when YOLO_MODEL_PATH points to the
-        # wrong weights or the weights do not contain the trained five-class
+        # wrong weights or the weights do not contain the trained three-class
         # label set. This avoids showing a running session that can never
         # produce a valid egg record.
         try:
@@ -341,30 +353,36 @@ class CameraDetectionSession:
         detections: list[dict[str, Any]],
         inspection_zone: tuple[float, float, float, float] | None = None,
     ) -> tuple[str, float]:
-        """Choose one unambiguous model observation for a camera frame.
+        """Choose the quality only when the egg's box center is in the zone.
 
-        A frame can contain overlapping YOLO boxes. Selecting one recognized
-        class with the highest confidence prevents one physical egg from
-        contributing several contradictory samples to the same cycle.
+        Detections outside the auto-capture-zone bounding box are display-only:
+        they cannot reject an egg, authorize weighing, or create a record.
+        The smaller centered target is sized for the egg. Its YOLO bounding-box
+        center must enter that target, so a partly entered egg cannot trigger
+        the crack gate, load cell, or size gates. Requiring the whole detected
+        rectangle to fit is unreliable because YOLO boxes vary with egg size
+        and camera angle. A frame without a fully centered recognized egg is
+        treated as ``no egg``. If overlapping model boxes are present for the
+        same egg, a defect still wins over Good for safe sorting.
         """
         recognized: list[tuple[str, float]] = []
         for detection in detections:
             label = normalize_model_label(detection.get("label", ""))
-            if label in EGG_QUALITY_LABELS or label == NO_EGG_LABEL:
-                if inspection_zone is not None and label != NO_EGG_LABEL:
-                    box = detection.get("box", ())
-                    if len(box) != 4:
-                        continue
-                    center_x = (float(box[0]) + float(box[2])) / 2
-                    center_y = (float(box[1]) + float(box[3])) / 2
-                    left, top, right, bottom = inspection_zone
-                    if not (
-                        left <= center_x <= right and top <= center_y <= bottom
-                    ):
-                        continue
-                recognized.append(
-                    (label, float(detection.get("confidence", 0.0)))
+            if label not in EGG_QUALITY_LABELS:
+                continue
+            if inspection_zone is not None:
+                box = detection.get("box", ())
+                if len(box) != 4:
+                    continue
+                left_box, top_box, right_box, bottom_box = (
+                    float(value) for value in box
                 )
+                center_x = (left_box + right_box) / 2
+                center_y = (top_box + bottom_box) / 2
+                left, top, right, bottom = inspection_zone
+                if not (left <= center_x <= right and top <= center_y <= bottom):
+                    continue
+            recognized.append((label, float(detection.get("confidence", 0.0))))
         if not recognized:
             return NO_EGG_LABEL, 0.0
         # Safety defects win over confidence. In particular, one accepted
@@ -399,7 +417,9 @@ class CameraDetectionSession:
         if should_send:
             try:
                 if handler is None:
-                    raise RuntimeError("Camera reject command handler is not connected.")
+                    raise RuntimeError(
+                        "Camera reject command handler is not connected."
+                    )
                 handler(defect)
             except RuntimeError as exc:
                 with self._lock:
@@ -414,7 +434,7 @@ class CameraDetectionSession:
     def _update_auto_capture(
         self, label: str, confidence: float
     ) -> dict[str, Any] | None:
-        """Capture one egg per zone passage; queue Good/Undefined on exit."""
+        """Capture one egg per zone passage; queue Good eggs on exit."""
         if label in EGG_QUALITY_LABELS:
             if self._active_capture is None:
                 self._active_capture = {
@@ -452,7 +472,7 @@ class CameraDetectionSession:
         self._quality_counts[capture["label"]] += 1
         self._last_capture = dict(capture)
         # Rejected eggs are counted, but never assigned to a load-cell egg.
-        if capture["label"] in {"good", "undefined"}:
+        if capture["label"] == "good":
             self._captured_qualities.append(dict(capture))
         return capture
 

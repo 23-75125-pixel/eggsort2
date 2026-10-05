@@ -1,6 +1,4 @@
-import os
 import hashlib
-import re
 import secrets
 import smtplib
 from datetime import datetime, time, timedelta, timezone
@@ -10,7 +8,6 @@ from threading import RLock, Thread
 from time import sleep
 from typing import Callable, Any
 from authlib.integrations.base_client.errors import OAuthError
-from authlib.integrations.flask_client import OAuth
 from joserfc.errors import JoseError
 
 from dotenv import load_dotenv
@@ -27,13 +24,15 @@ from flask import (
     stream_with_context,
     url_for,
 )
-from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import String, cast, func, inspect, or_, text
+from sqlalchemy import String, cast, func, or_, text
+from sqlalchemy.exc import SQLAlchemyError
 from werkzeug.security import check_password_hash, generate_password_hash
 
 load_dotenv()
 
 from camera_session import CAMERA_SESSION, CameraSessionError
+from config import build_app_config, env_bool, env_int
+from database import initialize_database
 from egg_standards import SIZE_ORDER, classify_egg_size
 from esp32_bridge import ESP32_BRIDGE
 from detection_service import (
@@ -41,86 +40,26 @@ from detection_service import (
     InvalidFrameError,
     detect_frame,
 )
+from extensions import db, oauth
+from models import AuditLog, EggRecord, TrayAlert, TRAY_CAPACITY, User
+from security import AttemptLimiter, init_web_security
+from validation import (
+    ValidationError,
+    is_valid_email,
+    normalize_avatar_url,
+    parse_staff_profile,
+)
 
 app = Flask(__name__)
-
-app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
-app.permanent_session_lifetime = timedelta(days=30)
-app.config["SESSION_COOKIE_HTTPONLY"] = True
-app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-app.config["GOOGLE_CLIENT_ID"] = os.environ.get(
-    "GOOGLE_CLIENT_ID",
-    "",
-).strip()
-app.config["GOOGLE_CLIENT_SECRET"] = os.environ.get(
-    "GOOGLE_CLIENT_SECRET",
-    "",
-).strip()
-app.config["ADMIN_EMAIL"] = os.environ.get(
-    "ADMIN_EMAIL",
-    "capstonecutie1@gmail.com",
-).strip().lower()
-app.config["ADMIN_GOOGLE_SUB"] = os.environ.get(
-    "ADMIN_GOOGLE_SUB",
-    "",
-).strip()
-app.config["PUBLIC_BASE_URL"] = os.environ.get(
-    "PUBLIC_BASE_URL",
-    "",
-).strip().rstrip("/")
-app.config["SESSION_COOKIE_SECURE"] = app.config["PUBLIC_BASE_URL"].startswith(
-    "https://"
-)
-app.config["GOOGLE_AUTH_CLOCK_SKEW_SECONDS"] = int(
-    os.environ.get("GOOGLE_AUTH_CLOCK_SKEW_SECONDS", "120")
-)
-app.config["MAIL_SERVER"] = os.environ.get("MAIL_SERVER", "")
-app.config["MAIL_PORT"] = int(os.environ.get("MAIL_PORT", "587"))
-app.config["MAIL_USE_TLS"] = os.environ.get(
-    "MAIL_USE_TLS",
-    "1",
-).lower() in {"1", "true", "yes", "on"}
-app.config["MAIL_USE_SSL"] = os.environ.get(
-    "MAIL_USE_SSL",
-    "0",
-).lower() in {"1", "true", "yes", "on"}
-app.config["MAIL_USERNAME"] = os.environ.get("MAIL_USERNAME", "")
-app.config["MAIL_PASSWORD"] = os.environ.get(
-    "MAIL_PASSWORD",
-    "",
-).replace(" ", "")
-app.config["MAIL_FROM"] = os.environ.get(
-    "MAIL_FROM",
-    app.config["MAIL_USERNAME"],
-)
-app.config["AUTO_START_SORTING_ON_LOGIN"] = os.environ.get(
-    "AUTO_START_SORTING_ON_LOGIN",
-    "1",
-).lower() in {"1", "true", "yes", "on"}
+app.config.from_mapping(build_app_config())
+init_web_security(app)
 SORTING_RUNTIME_INSTANCE = secrets.token_hex(8)
+LOGIN_LIMITER = AttemptLimiter(max_attempts=5, window_seconds=300)
+DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_urlsafe(32))
 
 
-# Database configuration. DATABASE_URL remains supported for Render and local
-# SQLite deployments. SUPABASE_DB_URL is the documented Supabase setting and
-# must take effect when DATABASE_URL is blank or absent.
-database_url = (
-    os.environ.get("DATABASE_URL", "").strip()
-    or os.environ.get("SUPABASE_DB_URL", "").strip()
-    or "sqlite:///database.db"
-)
-# SQLAlchemy uses the postgresql dialect spelling. Some Supabase connection
-# dialogs still provide postgres://, and Psycopg does not accept Prisma's
-# pgbouncer query option.
-if database_url.startswith("postgres://"):
-    database_url = "postgresql://" + database_url[len("postgres://"):]
-database_url = re.sub(r"([?&])pgbouncer=true(?:&|$)", r"\1", database_url)
-database_url = database_url.rstrip("?&")
-app.config["SQLALCHEMY_DATABASE_URI"] = database_url
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
-
-db = SQLAlchemy(app)
-oauth = OAuth(app)
+db.init_app(app)
+oauth.init_app(app)
 oauth.register(
     name="google",
     server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
@@ -132,16 +71,28 @@ oauth.register(
 
 @app.get("/health")
 def health_check() -> Any:
-    """Lightweight deployment health check; does not access camera hardware."""
-    return jsonify(status="ok")
+    """Check the web process and its configured database without hardware."""
+    db.session.execute(text("SELECT 1"))
+    return jsonify(status="ok", database="connected")
+
+
+@app.errorhandler(SQLAlchemyError)
+def handle_database_error(error: SQLAlchemyError) -> Any:
+    db.session.rollback()
+    app.logger.exception("Database operation failed", exc_info=error)
+    message = "The database is temporarily unavailable. Please try again."
+    if request.path.startswith("/api/"):
+        return jsonify(error=message), 503
+    return message, 503
 
 
 INITIAL_ADMIN_EMAIL = app.config["ADMIN_EMAIL"]
 INITIAL_ADMIN_GOOGLE_SUB = app.config["ADMIN_GOOGLE_SUB"]
-VALID_ROLES = {"admin", "staff"}
-EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]{3,30}$")
-INVITE_LIFETIME = timedelta(hours=24)
+INVITE_LIFETIME_HOURS = 24
+INVITE_LIFETIME = timedelta(hours=INVITE_LIFETIME_HOURS)
+PASSWORD_RESET_LIFETIME = timedelta(minutes=30)
+MAX_RECORD_RESULTS = 500
+MAX_ALERT_RESULTS = 200
 
 
 def user_display_label(user: "User") -> str:
@@ -216,7 +167,8 @@ An administrator invited you to EggSort+.
 Create your password using this single-use link:
 {invite_url}
 
-The link expires in 24 hours. If you were not expecting this invitation, you
+The link expires in {INVITE_LIFETIME_HOURS} hours. If you were not expecting
+this invitation, you
 can ignore this email.
 """
     )
@@ -247,6 +199,34 @@ can ignore this email.
         raise InvitationDeliveryError(
             "The invitation was created, but the email could not be sent."
         ) from exc
+
+
+def send_password_reset(user: "User", reset_url: str) -> None:
+    if not app.config["MAIL_SERVER"] or not app.config["MAIL_FROM"]:
+        raise InvitationDeliveryError("Password reset email is not configured.")
+    message = EmailMessage()
+    message["Subject"] = "Reset your EggSort+ password"
+    message["From"] = app.config["MAIL_FROM"]
+    message["To"] = user.email
+    message.set_content(
+        f"""Hello {user_display_label(user)},
+
+Use this single-use link to reset your EggSort+ password:
+{reset_url}
+
+The link expires in 30 minutes. If you did not request this, ignore this email.
+"""
+    )
+    try:
+        smtp_class = smtplib.SMTP_SSL if app.config["MAIL_USE_SSL"] else smtplib.SMTP
+        with smtp_class(app.config["MAIL_SERVER"], app.config["MAIL_PORT"], timeout=15) as smtp:
+            if app.config["MAIL_USE_TLS"] and not app.config["MAIL_USE_SSL"]:
+                smtp.starttls()
+            if app.config["MAIL_USERNAME"]:
+                smtp.login(app.config["MAIL_USERNAME"], app.config["MAIL_PASSWORD"])
+            smtp.send_message(message)
+    except (OSError, smtplib.SMTPException) as exc:
+        raise InvitationDeliveryError("Password reset email could not be sent.") from exc
 
 
 def start_sorting_runtime() -> tuple[dict[str, Any], dict[str, Any]]:
@@ -290,288 +270,21 @@ def sign_in_user(user: "User", remember: bool = False) -> None:
 
 
 
-# User Model
-class User(db.Model):
-
-    id = db.Column(
-        db.Integer,
-        primary_key=True
-    )
-
-    username = db.Column(
-        db.String(50),
-        unique=True,
-        nullable=False
-    )
-
-    password = db.Column(
-        db.String(200),
-        nullable=False
-    )
-
-    email = db.Column(
-        db.String(254),
-        unique=True,
-        nullable=True,
-    )
-
-    google_sub = db.Column(
-        db.String(255),
-        unique=True,
-        nullable=True,
-    )
-
-    display_name = db.Column(
-        db.String(120),
-        nullable=True,
-    )
-
-    avatar_url = db.Column(
-        db.String(1024),
-        nullable=True,
-    )
-
-    role = db.Column(
-        db.String(20),
-        nullable=False,
-        default="staff",
-    )
-
-    is_active = db.Column(
-        db.Boolean,
-        nullable=False,
-        default=True,
-    )
-
-    password_set = db.Column(
-        db.Boolean,
-        nullable=False,
-        default=False,
-    )
-
-    invite_token_hash = db.Column(
-        db.String(64),
-        nullable=True,
-    )
-
-    invite_expires_at = db.Column(
-        db.DateTime(timezone=True),
-        nullable=True,
-    )
-
-
-class EggRecord(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    weight_grams = db.Column(db.Integer, nullable=False)
-    size = db.Column(db.String(30), nullable=False)
-    quality = db.Column(db.String(30), nullable=False)
-    confidence = db.Column(db.Float, nullable=False, default=0.0)
-    session_ref = db.Column(db.String(40), nullable=False)
-    sorted_at = db.Column(
-        db.DateTime(timezone=True),
-        nullable=False,
-        default=lambda: datetime.now(timezone.utc),
-    )
-
-    def to_dict(self) -> dict[str, Any]:
-        sorted_at = self.sorted_at
-        if sorted_at.tzinfo is None:
-            sorted_at = sorted_at.replace(tzinfo=timezone.utc)
-        return {
-            "id": self.id,
-            "egg_id": f"EGG-{self.id:06d}",
-            "weight_grams": self.weight_grams,
-            "size": self.size,
-            "quality": self.quality,
-            "confidence": round(self.confidence, 4),
-            "session_ref": self.session_ref,
-            "sorted_at": sorted_at.isoformat(),
-        }
-
-
-class TrayAlert(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    tray_number = db.Column(db.Integer, unique=True, nullable=False)
-    egg_count = db.Column(db.Integer, nullable=False)
-    session_ref = db.Column(db.String(40), nullable=False)
-    is_read = db.Column(db.Boolean, nullable=False, default=False)
-    created_at = db.Column(
-        db.DateTime(timezone=True),
-        nullable=False,
-        default=lambda: datetime.now(timezone.utc),
-    )
-
-    def to_dict(self) -> dict[str, Any]:
-        created_at = self.created_at
-        if created_at.tzinfo is None:
-            created_at = created_at.replace(tzinfo=timezone.utc)
-        return {
-            "id": self.id,
-            "tray_number": self.tray_number,
-            "egg_count": self.egg_count,
-            "session_ref": self.session_ref,
-            "is_read": self.is_read,
-            "created_at": created_at.isoformat(),
-            "title": f"Tray {self.tray_number} completed",
-            "message": (
-                f"Tray {self.tray_number} reached 30 sorted eggs "
-                f"({self.egg_count} total eggs)."
-            ),
-        }
-
-
-class Sale(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    buyer_name = db.Column(db.String(120), nullable=False)
-    size = db.Column(db.String(30), nullable=False)
-    quantity = db.Column(db.Integer, nullable=False)
-    total_amount = db.Column(db.Float, nullable=False)
-    payment_method = db.Column(db.String(30), nullable=False)
-    status = db.Column(db.String(30), nullable=False, default="Completed")
-    sold_at = db.Column(
-        db.DateTime(timezone=True),
-        nullable=False,
-        default=lambda: datetime.now(timezone.utc),
-    )
-
-    def to_dict(self) -> dict[str, Any]:
-        sold_at = self.sold_at
-        if sold_at.tzinfo is None:
-            sold_at = sold_at.replace(tzinfo=timezone.utc)
-        return {
-            "id": self.id,
-            "invoice_id": f"INV-{self.id:06d}",
-            "buyer_name": self.buyer_name,
-            "size": self.size,
-            "quantity": self.quantity,
-            "total_amount": round(self.total_amount, 2),
-            "payment_method": self.payment_method,
-            "status": self.status,
-            "sold_at": sold_at.isoformat(),
-        }
-
-
-class AuditLog(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    event_type = db.Column(db.String(40), nullable=False)
-    actor = db.Column(db.String(80), nullable=False, default="System")
-    description = db.Column(db.String(300), nullable=False)
-    event_key = db.Column(db.String(100), unique=True, nullable=True)
-    created_at = db.Column(
-        db.DateTime(timezone=True),
-        nullable=False,
-        default=lambda: datetime.now(timezone.utc),
-    )
-
-    def to_dict(self) -> dict[str, Any]:
-        created_at = self.created_at
-        if created_at.tzinfo is None:
-            created_at = created_at.replace(tzinfo=timezone.utc)
-        return {
-            "id": self.id,
-            "event_type": self.event_type,
-            "actor": self.actor,
-            "description": self.description,
-            "created_at": created_at.isoformat(),
-        }
-
-
-# Create and safely extend the database without deleting existing records.
-with app.app_context():
-    db.create_all()
-    user_columns = {
-        column["name"]
-        for column in inspect(db.engine).get_columns("user")
-    }
-    migration_statements = {
-        "email": "ALTER TABLE \"user\" ADD COLUMN email VARCHAR(254)",
-        "google_sub": "ALTER TABLE \"user\" ADD COLUMN google_sub VARCHAR(255)",
-        "display_name": "ALTER TABLE \"user\" ADD COLUMN display_name VARCHAR(120)",
-        "avatar_url": "ALTER TABLE \"user\" ADD COLUMN avatar_url VARCHAR(1024)",
-        "role": (
-            "ALTER TABLE \"user\" ADD COLUMN role VARCHAR(20) "
-            "NOT NULL DEFAULT 'staff'"
-        ),
-        "is_active": (
-            "ALTER TABLE \"user\" ADD COLUMN is_active BOOLEAN "
-            "NOT NULL DEFAULT 1"
-        ),
-        "password_set": (
-            "ALTER TABLE \"user\" ADD COLUMN password_set BOOLEAN "
-            "NOT NULL DEFAULT 0"
-        ),
-        "invite_token_hash": (
-            "ALTER TABLE \"user\" ADD COLUMN invite_token_hash VARCHAR(64)"
-        ),
-        "invite_expires_at": (
-            "ALTER TABLE \"user\" ADD COLUMN invite_expires_at DATETIME"
-        ),
-    }
-    for column_name, statement in migration_statements.items():
-        if column_name not in user_columns:
-            db.session.execute(text(statement))
-    db.session.execute(
-        text(
-            "CREATE UNIQUE INDEX IF NOT EXISTS ix_user_email "
-            "ON \"user\" (email)"
-        )
-    )
-    db.session.execute(
-        text(
-            "CREATE UNIQUE INDEX IF NOT EXISTS ix_user_google_sub "
-            "ON \"user\" (google_sub)"
-        )
-    )
-    db.session.commit()
-
-    initial_admin = User.query.filter(
-        func.lower(User.email) == INITIAL_ADMIN_EMAIL
-    ).first()
-    if initial_admin is None:
-        initial_admin = User.query.filter(
-            func.lower(User.username) == "admin"
-        ).first()
-    if initial_admin is None:
-        initial_admin = User.query.filter(
-            func.lower(User.username) == INITIAL_ADMIN_EMAIL
-        ).first()
-    if initial_admin is None and User.query.count() == 1:
-        initial_admin = User.query.first()
-    # The migration copies the local user IDs verbatim. Do not insert a new
-    # bootstrap admin first, otherwise it can occupy ID 1 and cause the
-    # source administrator to be skipped by the idempotent import.
-    if initial_admin is None and os.environ.get("DATABASE_MIGRATION_MODE") != "1":
-        initial_admin = User(
-            username=INITIAL_ADMIN_EMAIL,
-            password=generate_password_hash(secrets.token_urlsafe(32)),
-            email=INITIAL_ADMIN_EMAIL,
-            google_sub=INITIAL_ADMIN_GOOGLE_SUB or None,
-            role="admin",
-            is_active=True,
-        )
-        db.session.add(initial_admin)
-    elif initial_admin is not None:
-        initial_admin.email = INITIAL_ADMIN_EMAIL
-        if INITIAL_ADMIN_GOOGLE_SUB:
-            initial_admin.google_sub = INITIAL_ADMIN_GOOGLE_SUB
-        initial_admin.role = "admin"
-        initial_admin.is_active = True
-    db.session.commit()
+initialize_database(
+    app,
+    admin_email=INITIAL_ADMIN_EMAIL,
+    admin_google_sub=INITIAL_ADMIN_GOOGLE_SUB,
+)
 
 
 QUALITY_NAMES = {
     "crack": "Crack",
     "good": "Good",
     "rotten": "Rotten",
-    "undefined": "Undefined",
 }
-CAMERA_QUALITY_SAMPLES = max(
-    1,
-    int(os.environ.get("CAMERA_QUALITY_SAMPLES", "1")),
+CAMERA_QUALITY_SAMPLES = env_int(
+    "CAMERA_QUALITY_SAMPLES", 1, minimum=1, maximum=120
 )
-
-SALE_SIZES = ["Small", "Medium", "Large", "Extra Large", "Jumbo"]
-
 
 def parse_date_boundary(value: str | None, end: bool = False) -> datetime | None:
     if not value:
@@ -581,35 +294,13 @@ def parse_date_boundary(value: str | None, end: bool = False) -> datetime | None
     return datetime.combine(parsed_date, boundary, tzinfo=timezone.utc)
 
 
-def sellable_stock_counts() -> dict[str, int]:
-    available_rows = (
-        db.session.query(EggRecord.size, func.count(EggRecord.id))
-        .filter(EggRecord.quality == "Good")
-        .group_by(EggRecord.size)
-        .all()
-    )
-    sold_rows = (
-        db.session.query(Sale.size, func.coalesce(func.sum(Sale.quantity), 0))
-        .filter(Sale.status != "Cancelled")
-        .group_by(Sale.size)
-        .all()
-    )
-    available = {size: 0 for size in SALE_SIZES}
-    available.update({size: count for size, count in available_rows})
-    sold = {size: count for size, count in sold_rows}
-    return {
-        size: max(0, int(available.get(size, 0)) - int(sold.get(size, 0)))
-        for size in SALE_SIZES
-    }
-
-
 def create_tray_alert_if_needed(
     total_sorted: int,
     session_ref: str,
 ) -> TrayAlert | None:
-    if total_sorted <= 0 or total_sorted % 30 != 0:
+    if total_sorted <= 0 or total_sorted % TRAY_CAPACITY != 0:
         return None
-    tray_number = total_sorted // 30
+    tray_number = total_sorted // TRAY_CAPACITY
     existing = TrayAlert.query.filter_by(tray_number=tray_number).first()
     if existing is not None:
         return None
@@ -652,11 +343,11 @@ def write_audit_log(
 def backfill_completed_tray_alerts() -> None:
     total_sorted = EggRecord.query.count()
     created = False
-    for tray_number in range(1, (total_sorted // 30) + 1):
+    for tray_number in range(1, (total_sorted // TRAY_CAPACITY) + 1):
         boundary_record = (
             EggRecord.query
             .order_by(EggRecord.id.asc())
-            .offset((tray_number * 30) - 1)
+            .offset((tray_number * TRAY_CAPACITY) - 1)
             .first()
         )
         session_ref = (
@@ -664,7 +355,9 @@ def backfill_completed_tray_alerts() -> None:
             if boundary_record is not None
             else "HISTORICAL"
         )
-        alert = create_tray_alert_if_needed(tray_number * 30, session_ref)
+        alert = create_tray_alert_if_needed(
+            tray_number * TRAY_CAPACITY, session_ref
+        )
         created = created or alert is not None
     if created:
         db.session.commit()
@@ -865,6 +558,7 @@ def save_sorted_egg(event: dict[str, Any]) -> None:
         if EGG_FLOW_STAGE != "sorting":
             return
         pending = dict(EGG_FLOW_PENDING) if EGG_FLOW_PENDING else None
+        sequence = EGG_FLOW_SEQUENCE
         if pending is not None:
             EGG_FLOW_STAGE = "saving"
     if pending is None:
@@ -883,23 +577,37 @@ def save_sorted_egg(event: dict[str, Any]) -> None:
         )
 
     capture_id = pending.pop("_capture_id")
-    with app.app_context():
-        record = EggRecord(**pending)
-        db.session.add(record)
-        db.session.flush()
-        total_sorted = EggRecord.query.count()
-        create_tray_alert_if_needed(total_sorted, pending["session_ref"])
-        write_audit_log(
-            "egg_sorted",
-            (
-                f"EGG-{record.id:06d} sorted at {record.weight_grams} g "
-                f"as {record.size}, quality {record.quality}."
-            ),
-            event_key=f"egg-sorted:{record.id}",
-            commit=False,
+    try:
+        with app.app_context():
+            record = EggRecord(**pending)
+            db.session.add(record)
+            db.session.flush()
+            total_sorted = EggRecord.query.count()
+            create_tray_alert_if_needed(total_sorted, pending["session_ref"])
+            write_audit_log(
+                "egg_sorted",
+                (
+                    f"EGG-{record.id:06d} sorted at {record.weight_grams} g "
+                    f"as {record.size}, quality {record.quality}."
+                ),
+                event_key=f"egg-sorted:{record.id}",
+                commit=False,
+            )
+            db.session.commit()
+            egg_id = record.id
+    except Exception:
+        with app.app_context():
+            db.session.rollback()
+        with EGG_FLOW_LOCK:
+            if sequence == EGG_FLOW_SEQUENCE and EGG_FLOW_STAGE == "saving":
+                EGG_FLOW_STAGE = "sorting"
+        app.logger.exception("Unable to persist the completed egg sort")
+        ESP32_BRIDGE.publish_status(
+            "Sort completed, but the database save failed. The egg remains "
+            "pending for recovery.",
+            "flow_error",
         )
-        db.session.commit()
-        egg_id = record.id
+        return
     with EGG_FLOW_LOCK:
         EGG_FLOW_PENDING = None
         EGG_FLOW_STAGE = "waiting_removal"
@@ -934,17 +642,32 @@ def ensure_authenticated_sorting_runtime() -> None:
         return
     if request.endpoint in {"logout", "static"}:
         return
-    if session.get("sorting_runtime_instance") == SORTING_RUNTIME_INSTANCE:
+    if session.get("sorting_runtime_auto_start_suppressed"):
         return
+    same_instance = (
+        session.get("sorting_runtime_instance") == SORTING_RUNTIME_INSTANCE
+    )
+    if same_instance:
+        camera_running = CAMERA_SESSION.status().get("running", False)
+        hardware_running = ESP32_BRIDGE.status().get("running", False)
+        if camera_running and hardware_running:
+            return
+        retry_after = float(session.get("sorting_runtime_retry_after", 0))
+        if datetime.now(timezone.utc).timestamp() < retry_after:
+            return
 
     try:
         start_sorting_runtime()
         session["sorting_runtime_started"] = True
         session.pop("sorting_runtime_error", None)
+        session.pop("sorting_runtime_retry_after", None)
     except Exception as exc:
         app.logger.exception("Unable to restore the sorting runtime")
         session["sorting_runtime_started"] = False
         session["sorting_runtime_error"] = str(exc)
+        session["sorting_runtime_retry_after"] = (
+            datetime.now(timezone.utc).timestamp() + 5
+        )
     finally:
         session["sorting_runtime_instance"] = SORTING_RUNTIME_INSTANCE
 
@@ -984,12 +707,29 @@ def login() -> Any:
                 func.lower(User.email) == identifier,
             )
         ).first()
+        limiter_key = f"user:{user.id}" if user is not None else identifier
+        if LOGIN_LIMITER.is_limited(limiter_key):
+            error = "Too many failed sign-in attempts. Try again in a few minutes."
+            return render_template(
+                "login.html",
+                error=error,
+                notice=None,
+                google_ready=bool(
+                    app.config["GOOGLE_CLIENT_ID"]
+                    and app.config["GOOGLE_CLIENT_SECRET"]
+                ),
+            ), 429
+        password_matches = check_password_hash(
+            user.password if user is not None else DUMMY_PASSWORD_HASH,
+            password,
+        )
         if (
             user is None
             or not user.is_active
             or not user.password_set
-            or not check_password_hash(user.password, password)
+            or not password_matches
         ):
+            LOGIN_LIMITER.record_failure(limiter_key)
             error = "Invalid username/email or password."
             write_audit_log(
                 "login_failed",
@@ -997,6 +737,7 @@ def login() -> Any:
                 actor=identifier or "Unknown",
             )
         else:
+            LOGIN_LIMITER.reset(limiter_key)
             sign_in_user(
                 user,
                 remember=request.form.get("remember-me") == "on",
@@ -1017,6 +758,72 @@ def login() -> Any:
             and app.config["GOOGLE_CLIENT_SECRET"]
         ),
     )
+
+
+@app.route("/forgot-password", methods=["GET", "POST"])
+def forgot_password() -> Any:
+    notice = session.pop("password_reset_notice", None)
+    error = None
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        user = User.query.filter(func.lower(User.email) == email).first() if email else None
+        if user is not None and user.is_active and user.password_set:
+            token = secrets.token_urlsafe(32)
+            user.password_reset_token_hash = invite_token_hash(token)
+            user.password_reset_expires_at = datetime.now(timezone.utc) + PASSWORD_RESET_LIFETIME
+            db.session.commit()
+            try:
+                send_password_reset(
+                    user,
+                    external_url("reset_password", token=token),
+                )
+            except InvitationDeliveryError:
+                app.logger.exception("Password reset email delivery failed")
+        session["password_reset_notice"] = (
+            "If an active account uses that email, a password reset link has been sent."
+        )
+        return redirect(url_for("forgot_password"))
+    return render_template("forgot_password.html", notice=notice, error=error)
+
+
+@app.route("/reset-password/<token>", methods=["GET", "POST"])
+def reset_password(token: str) -> Any:
+    user = User.query.filter_by(
+        password_reset_token_hash=invite_token_hash(token),
+        is_active=True,
+        password_set=True,
+    ).first()
+    expires_at = user.password_reset_expires_at if user else None
+    if expires_at is not None and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if user is None or expires_at is None or expires_at <= datetime.now(timezone.utc):
+        return render_template(
+            "reset_password.html", error="This reset link is invalid or has expired.",
+            valid_token=False, notice=None,
+        ), 400
+
+    error = None
+    if request.method == "POST":
+        password = request.form.get("password", "")
+        confirmation = request.form.get("password_confirmation", "")
+        if len(password) < 8:
+            error = "Password must be at least 8 characters."
+        elif len(password) > 128:
+            error = "Password must be 128 characters or fewer."
+        elif password != confirmation:
+            error = "Passwords do not match."
+        else:
+            user.password = generate_password_hash(password)
+            user.password_set = True
+            user.password_reset_token_hash = None
+            user.password_reset_expires_at = None
+            user.invite_token_hash = None
+            user.invite_expires_at = None
+            db.session.commit()
+            write_audit_log("password_reset", "User reset their password.", actor=user.email or user.username)
+            session["login_notice"] = "Password updated. Sign in with your new password."
+            return redirect(url_for("login"))
+    return render_template("reset_password.html", error=error, valid_token=True, notice=None)
 
 
 @app.route("/accept-invite/<token>", methods=["GET", "POST"])
@@ -1127,6 +934,12 @@ def google_callback() -> Any:
             "time may be incorrect. Synchronize Windows Time and try again."
         )
         return redirect(url_for("login"))
+    except Exception:
+        app.logger.exception("Google sign-in failed unexpectedly")
+        session["login_error"] = (
+            "Google sign-in is temporarily unavailable. Please try again."
+        )
+        return redirect(url_for("login"))
 
     email = str(userinfo.get("email", "")).strip().lower()
     google_sub = str(userinfo.get("sub", "")).strip()
@@ -1151,7 +964,10 @@ def google_callback() -> Any:
             session.pop("invite_google_verified_user_id", None)
             session["login_error"] = "This staff invitation is no longer valid."
             return redirect(url_for("login"))
-        if invited_user.email.casefold() != email.casefold():
+        if (
+            not invited_user.email
+            or invited_user.email.casefold() != email.casefold()
+        ):
             session["invite_error"] = (
                 "Use the Google account for the invited email address "
                 f"({invited_user.email})."
@@ -1261,10 +1077,14 @@ def login_required(f: Callable[..., Any]) -> Callable[..., Any]:
     @wraps(f)
     def decorated_function(*args: Any, **kwargs: Any) -> Any:
         if "user_id" not in session:
+            if request.path.startswith("/api/"):
+                return jsonify(error="Authentication is required."), 401
             return redirect(url_for("login"))
         user = db.session.get(User, session["user_id"])
         if user is None or not user.is_active:
             session.clear()
+            if request.path.startswith("/api/"):
+                return jsonify(error="Authentication is required."), 401
             return redirect(url_for("login"))
         session["username"] = user_display_label(user)
         session["email"] = user.email or ""
@@ -1401,6 +1221,8 @@ def detect() -> Any:
 def start_camera() -> Any:
     try:
         camera_state, hardware_state = start_sorting_runtime()
+        session.pop("sorting_runtime_auto_start_suppressed", None)
+        session.pop("sorting_runtime_retry_after", None)
         write_audit_log(
             "camera_started",
             f"Sorting camera session {camera_state.get('session_ref')} started.",
@@ -1414,6 +1236,7 @@ def start_camera() -> Any:
 @login_required
 def stop_camera() -> Any:
     camera_state, hardware_state = stop_sorting_runtime()
+    session["sorting_runtime_auto_start_suppressed"] = True
     write_audit_log(
         "camera_stopped",
         "Sorting camera and hardware session stopped manually.",
@@ -1489,7 +1312,13 @@ def advance_load_cell_gate() -> Any:
 @login_required
 def egg_records_data() -> Any:
     after_id = request.args.get("after_id", default=0, type=int)
-    limit = min(request.args.get("limit", default=100, type=int), 500)
+    limit = max(
+        1,
+        min(
+            request.args.get("limit", default=100, type=int),
+            MAX_RECORD_RESULTS,
+        ),
+    )
     query = EggRecord.query.filter(EggRecord.id > after_id)
     search = request.args.get("q", "").strip()
     size = request.args.get("size", "").strip()
@@ -1543,7 +1372,6 @@ def dashboard_stats() -> Any:
     size_counts.update({size: count for size, count in size_rows})
     quality_counts = {quality: count for quality, count in quality_rows}
     good_count = quality_counts.get("Good", 0)
-    camera_state = CAMERA_SESSION.status()
     latest_record = EggRecord.query.order_by(EggRecord.id.desc()).first()
     today = datetime.now(timezone.utc).date()
     trend_days = [today - timedelta(days=offset) for offset in range(6, -1, -1)]
@@ -1566,13 +1394,12 @@ def dashboard_stats() -> Any:
 
     return jsonify(
         total_sorted=total_sorted,
-        trays_completed=total_sorted // 30,
+        trays_completed=total_sorted // TRAY_CAPACITY,
         quality_rate=round(
             (good_count / total_sorted * 100) if total_sorted else 0,
             1,
         ),
-        camera_eggs_visible=camera_state.get("total", 0),
-        camera_running=camera_state.get("running", False),
+        non_good_count=total_sorted - good_count,
         size_counts=size_counts,
         quality_counts=quality_counts,
         latest_record=latest_record.to_dict() if latest_record else None,
@@ -1587,14 +1414,6 @@ def dashboard_stats() -> Any:
             for day in trend_days
         ],
         audit_logs=[log.to_dict() for log in recent_audits],
-        total_revenue=round(
-            float(
-                db.session.query(func.coalesce(func.sum(Sale.total_amount), 0))
-                .filter(Sale.status == "Completed")
-                .scalar()
-            ),
-            2,
-        ),
     )
 
 
@@ -1605,7 +1424,9 @@ def alerts_data() -> Any:
     query = TrayAlert.query
     if unread_only:
         query = query.filter_by(is_read=False)
-    alerts_list = query.order_by(TrayAlert.id.desc()).limit(200).all()
+    alerts_list = (
+        query.order_by(TrayAlert.id.desc()).limit(MAX_ALERT_RESULTS).all()
+    )
     return jsonify(
         alerts=[alert.to_dict() for alert in alerts_list],
         unread_count=TrayAlert.query.filter_by(is_read=False).count(),
@@ -1621,89 +1442,6 @@ def mark_all_alerts_read() -> Any:
     )
     db.session.commit()
     return jsonify(ok=True, unread_count=0)
-
-
-@app.get("/api/sales")
-@login_required
-def sales_data() -> Any:
-    search = request.args.get("q", "").strip()
-    status = request.args.get("status", "").strip()
-    query = Sale.query
-    if search:
-        numeric = "".join(character for character in search if character.isdigit())
-        conditions = [
-            Sale.buyer_name.ilike(f"%{search}%"),
-            Sale.size.ilike(f"%{search}%"),
-        ]
-        if numeric:
-            conditions.append(Sale.id == int(numeric))
-        query = query.filter(or_(*conditions))
-    if status and status != "All Statuses":
-        query = query.filter(Sale.status == status)
-    sales_list = query.order_by(Sale.id.desc()).limit(500).all()
-    return jsonify(
-        sales=[sale.to_dict() for sale in sales_list],
-        stocks=sellable_stock_counts(),
-        total_deals=Sale.query.count(),
-        total_revenue=round(
-            float(
-                db.session.query(func.coalesce(func.sum(Sale.total_amount), 0))
-                .filter(Sale.status == "Completed")
-                .scalar()
-            ),
-            2,
-        ),
-    )
-
-
-@app.post("/api/sales")
-@login_required
-def create_sale() -> Any:
-    payload = request.get_json(silent=True) or {}
-    buyer_name = str(payload.get("buyer_name", "")).strip()
-    size = str(payload.get("size", "")).strip()
-    payment_method = str(payload.get("payment_method", "")).strip()
-    try:
-        quantity = int(payload.get("quantity", 0))
-        total_amount = round(float(payload.get("total_amount", 0)), 2)
-    except (TypeError, ValueError):
-        return jsonify(error="Quantity and total amount must be numbers."), 400
-
-    if not buyer_name:
-        return jsonify(error="Buyer name is required."), 400
-    if size not in SALE_SIZES:
-        return jsonify(error="Select a valid egg size."), 400
-    if quantity <= 0 or total_amount < 0:
-        return jsonify(error="Quantity must be positive and amount cannot be negative."), 400
-    if payment_method != "Cash":
-        return jsonify(error="Cash is the only accepted payment method."), 400
-    available = sellable_stock_counts().get(size, 0)
-    if quantity > available:
-        return jsonify(
-            error=f"Only {available} sellable {size} eggs are available."
-        ), 409
-
-    sale = Sale(
-        buyer_name=buyer_name,
-        size=size,
-        quantity=quantity,
-        total_amount=total_amount,
-        payment_method=payment_method,
-        status="Completed",
-    )
-    db.session.add(sale)
-    db.session.flush()
-    write_audit_log(
-        "sale_created",
-        (
-            f"{sale.to_dict()['invoice_id']} recorded for {quantity} "
-            f"{size} eggs sold to {buyer_name}."
-        ),
-        event_key=f"sale-created:{sale.id}",
-        commit=False,
-    )
-    db.session.commit()
-    return jsonify(sale=sale.to_dict()), 201
 
 
 @app.get("/api/reports")
@@ -1747,13 +1485,12 @@ def reports_data() -> Any:
                 "good": 0,
                 "crack": 0,
                 "rotten": 0,
-                "undefined": 0,
                 "other": 0,
             },
         )
         row["total"] += 1
         quality_key = record.quality.lower()
-        if quality_key in {"good", "crack", "rotten", "undefined"}:
+        if quality_key in {"good", "crack", "rotten"}:
             row[quality_key] += 1
         else:
             # Retain visibility of records made with an older model without
@@ -1764,8 +1501,7 @@ def reports_data() -> Any:
     good = sum(1 for record in records if record.quality == "Good")
     crack = sum(1 for record in records if record.quality == "Crack")
     rotten = sum(1 for record in records if record.quality == "Rotten")
-    undefined = sum(1 for record in records if record.quality == "Undefined")
-    other = total - good - crack - rotten - undefined
+    other = total - good - crack - rotten
     return jsonify(
         rows=list(groups.values()),
         summary={
@@ -1773,26 +1509,11 @@ def reports_data() -> Any:
             "good": good,
             "crack": crack,
             "rotten": rotten,
-            "undefined": undefined,
             "other": other,
             "defects": total - good,
             "quality_rate": round((good / total * 100) if total else 0, 1),
-            "revenue": round(
-                float(
-                    db.session.query(func.coalesce(func.sum(Sale.total_amount), 0))
-                    .filter(Sale.status == "Completed")
-                    .scalar()
-                ),
-                2,
-            ),
         },
     )
-
-
-def normalize_avatar_url(value: Any) -> str | None:
-    """Accept only https image URLs, matching the Google sign-in capture."""
-    candidate = str(value or "").strip()[:1024]
-    return candidate if candidate.startswith("https://") else None
 
 
 def gravatar_url_for(email: str | None) -> str | None:
@@ -1805,7 +1526,7 @@ def gravatar_url_for(email: str | None) -> str | None:
     back to the initial on the image error event.
     """
     address = (email or "").strip().lower()
-    if not EMAIL_PATTERN.match(address):
+    if not is_valid_email(address):
         return None
     if not address.endswith(("@gmail.com", "@googlemail.com")):
         return None
@@ -1842,34 +1563,26 @@ def users_data() -> Any:
 @admin_required
 def create_user() -> Any:
     payload = request.get_json(silent=True) or {}
-    email = str(payload.get("email", "")).strip().lower()
-    username = str(payload.get("username", "")).strip().lower()
-    display_name = str(payload.get("display_name", "")).strip()
-    if not EMAIL_PATTERN.fullmatch(email):
-        return jsonify(error="Enter a valid email address."), 400
-    if not USERNAME_PATTERN.fullmatch(username):
-        return jsonify(
-            error=(
-                "Username must be 3-30 characters using letters, numbers, "
-                "dots, underscores, or hyphens."
-            )
-        ), 400
-    if not 2 <= len(display_name) <= 120:
-        return jsonify(error="Name must contain 2-120 characters."), 400
+    if not isinstance(payload, dict):
+        return jsonify(error="Request body must be a JSON object."), 400
+    try:
+        profile = parse_staff_profile(payload)
+    except ValidationError as exc:
+        return jsonify(error=str(exc)), 400
     existing_user = User.query.filter(
         or_(
-            func.lower(User.email) == email,
-            func.lower(User.username) == username,
+            func.lower(User.email) == profile.email,
+            func.lower(User.username) == profile.username,
         )
     ).first()
     if existing_user:
         return jsonify(error="That email or username is already registered."), 409
     user = User(
-        username=username,
+        username=profile.username,
         password=generate_password_hash(secrets.token_urlsafe(32)),
-        email=email,
-        display_name=display_name,
-        avatar_url=normalize_avatar_url(payload.get("avatar_url")),
+        email=profile.email,
+        display_name=profile.display_name,
+        avatar_url=profile.avatar_url,
         role="staff",
         is_active=True,
         password_set=False,
@@ -1879,7 +1592,7 @@ def create_user() -> Any:
     db.session.flush()
     write_audit_log(
         "staff_invited",
-        f"Staff account '{username}' was invited.",
+        f"Staff account '{profile.username}' was invited.",
         event_key=f"user-created:{user.id}",
         commit=False,
     )
@@ -1900,7 +1613,7 @@ def create_user() -> Any:
         invite_url=invite_url,
         email_sent=email_sent,
         warning=warning,
-        expires_in_hours=24,
+        expires_in_hours=INVITE_LIFETIME_HOURS,
     ), 201
 
 
@@ -1913,40 +1626,31 @@ def update_user(user_id: int) -> Any:
             error="The Google administrator profile is managed by sign-in."
         ), 409
     payload = request.get_json(silent=True) or {}
-    email = str(payload.get("email", "")).strip().lower()
-    username = str(payload.get("username", "")).strip().lower()
-    display_name = str(payload.get("display_name", "")).strip()
-    if not EMAIL_PATTERN.fullmatch(email):
-        return jsonify(error="Enter a valid email address."), 400
-    if not USERNAME_PATTERN.fullmatch(username):
-        return jsonify(
-            error=(
-                "Username must be 3-30 characters using letters, numbers, "
-                "dots, underscores, or hyphens."
-            )
-        ), 400
-    if not 2 <= len(display_name) <= 120:
-        return jsonify(error="Name must contain 2-120 characters."), 400
+    if not isinstance(payload, dict):
+        return jsonify(error="Request body must be a JSON object."), 400
+    try:
+        profile = parse_staff_profile(payload)
+    except ValidationError as exc:
+        return jsonify(error=str(exc)), 400
     duplicate = User.query.filter(
         or_(
-            func.lower(User.email) == email,
-            func.lower(User.username) == username,
+            func.lower(User.email) == profile.email,
+            func.lower(User.username) == profile.username,
         ),
         User.id != user_id,
     ).first()
     if duplicate:
         return jsonify(error="That email or username is already registered."), 409
-    user.email = email
-    user.username = username
-    user.display_name = display_name
+    user.email = profile.email
+    user.username = profile.username
+    user.display_name = profile.display_name
     # A blank field leaves the existing photo alone, so renaming an operator
     # never wipes the picture captured at Google sign-in.
-    requested_avatar = normalize_avatar_url(payload.get("avatar_url"))
-    if requested_avatar:
-        user.avatar_url = requested_avatar
+    if profile.avatar_url:
+        user.avatar_url = profile.avatar_url
     write_audit_log(
         "user_updated",
-        f"Staff account '{username}' was updated.",
+        f"Staff account '{profile.username}' was updated.",
         commit=False,
     )
     db.session.commit()
@@ -1985,7 +1689,7 @@ def regenerate_user_invite(user_id: int) -> Any:
         invite_url=invite_url,
         email_sent=email_sent,
         warning=warning,
-        expires_in_hours=24,
+        expires_in_hours=INVITE_LIFETIME_HOURS,
     )
 
 
@@ -2031,17 +1735,6 @@ def alerts() -> Any:
 
 
 
-# Sales
-@app.route("/sales")
-@login_required
-def sales() -> Any:
-    return render_template(
-        "sales.html",
-        username=session["username"]
-    )
-
-
-
 # Reports
 @app.route("/reports")
 @login_required
@@ -2064,20 +1757,16 @@ def user_management() -> Any:
 
 
 
-# Logout
-@app.route("/logout")
+@app.post("/logout")
+@login_required
 def logout() -> Any:
-    if "user_id" in session:
-        write_audit_log(
-            "logout",
-            "Operator signed out.",
-        )
-        stop_sorting_runtime()
-    session.clear()
-
-    return redirect(
-        url_for("login")
+    write_audit_log(
+        "logout",
+        "Operator signed out.",
     )
+    stop_sorting_runtime()
+    session.clear()
+    return redirect(url_for("login"))
 
 
 @app.cli.command("show-admin-google-id")
@@ -2116,7 +1805,10 @@ def check_mail() -> None:
         print("\nFAIL: MAIL_FROM and MAIL_USERNAME are both empty.")
         return
     if not username:
-        print("\nWARN: MAIL_USERNAME is empty, so delivery is attempted unauthenticated.")
+        print(
+            "\nWARN: MAIL_USERNAME is empty, so delivery is attempted "
+            "unauthenticated."
+        )
         return
 
     try:
@@ -2151,7 +1843,7 @@ def check_mail() -> None:
 
 if __name__ == "__main__":
     app.run(
-        debug=os.environ.get("FLASK_DEBUG", "0") == "1",
+        debug=env_bool("FLASK_DEBUG", False),
         threaded=True,
         # Keep the server in the process owned by the current terminal.
         # Werkzeug's reloader starts a second process which can survive after

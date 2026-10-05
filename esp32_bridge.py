@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import os
 import re
 from collections import deque
 from datetime import datetime, timezone
 from threading import Event, RLock, Thread
 from time import monotonic
 from typing import Any, Callable
+
+from config import env_int, env_text
 from egg_standards import classify_egg_size, servo_command
 
 
@@ -19,6 +20,7 @@ class Esp32ProtocolParser:
     """Parse the human-readable EggSort ESP32 serial protocol."""
 
     READING = re.compile(r"Reading\s+(\d+)\s*:\s*(-?\d+)\s*g", re.I)
+    WEIGHT = re.compile(r"WEIGHT\s*:\s*(-?\d+)\s*g", re.I)
     FINAL_WEIGHT = re.compile(r"FINAL WEIGHT\s*:\s*(-?\d+)\s*g", re.I)
     SIZE = re.compile(r"SIZE\s*:\s*([A-Z _]+)", re.I)
     SORTED = re.compile(r"SERVO SORTED\s*:\s*([A-Z _]+)", re.I)
@@ -28,8 +30,9 @@ class Esp32ProtocolParser:
     LOAD_CELL_GATE = re.compile(r"LOAD CELL GATE\s*:\s*(OPEN|CLOSED)", re.I)
     CONTROLLER_STATE = re.compile(r"CONTROLLER STATE\s*:\s*(.+)", re.I)
     CAMERA_QUALITY = re.compile(
-        r"CAMERA QUALITY\s*:\s*(CRACK|GOOD|ROTTEN|UNDEFINED)", re.I
+        r"CAMERA QUALITY\s*:\s*(CRACK|GOOD|ROTTEN)", re.I
     )
+    MEASUREMENT_FAILED = re.compile(r"MEASURE FAILED\s*:\s*(.+)", re.I)
 
     def __init__(self) -> None:
         self.final_weight: int | None = None
@@ -71,6 +74,18 @@ class Esp32ProtocolParser:
                 "weight_grams": int(live_weight.group(1)),
                 "message": clean,
             }]
+        # Backward-compatible support for controller firmware that still
+        # reports WEIGHT instead of the numbered Reading protocol.
+        weight = self.WEIGHT.fullmatch(clean)
+        if weight:
+            value = int(weight.group(1))
+            self.readings = [*self.readings[-1:], value]
+            return [{
+                "type": "weight_reading",
+                "reading_number": len(self.readings),
+                "weight_grams": value,
+                "message": clean,
+            }]
         controller_state = self.CONTROLLER_STATE.fullmatch(clean)
         if controller_state:
             return [{
@@ -83,6 +98,13 @@ class Esp32ProtocolParser:
             return [{
                 "type": "measurement_quality",
                 "quality": camera_quality.group(1).title(),
+                "message": clean,
+            }]
+        measurement_failed = self.MEASUREMENT_FAILED.fullmatch(clean)
+        if measurement_failed:
+            return [{
+                "type": "measurement_failed",
+                "reason": measurement_failed.group(1).strip(),
                 "message": clean,
             }]
         if lowered == "egg detected":
@@ -176,7 +198,9 @@ class Esp32Bridge:
             "last_gate_event": None,
             "latest_sensor_event": None,
         }
-        self.baud_rate = int(os.environ.get("ESP32_BAUD_RATE", "115200"))
+        self.baud_rate = env_int(
+            "ESP32_BAUD_RATE", 115200, minimum=1200, maximum=2_000_000
+        )
 
     def set_event_handler(self, handler: EventHandler) -> None:
         self._handler = handler
@@ -246,7 +270,9 @@ class Esp32Bridge:
         command = f"REJECT:{quality_code}"
         with self._lock:
             if not self._connected or self._serial is None:
-                raise RuntimeError("ESP32 is disconnected; reconnect its USB serial link.")
+                raise RuntimeError(
+                    "ESP32 is disconnected; reconnect its USB serial link."
+                )
             readiness = self._diagnostics["pca9685_ready"]
             if readiness is False:
                 raise RuntimeError(
@@ -254,7 +280,10 @@ class Esp32Bridge:
                 )
             if readiness is None:
                 self._request_hardware_status()
-                raise RuntimeError("Requesting ESP32 hardware status; retrying while egg is visible.")
+                raise RuntimeError(
+                    "Requesting ESP32 hardware status; retrying while egg is "
+                    "visible."
+                )
             self._send_command(command)
         self._publish({
             "type": "reject_command", "quality": quality_code.title(),
@@ -264,7 +293,7 @@ class Esp32Bridge:
 
     def measure_egg(self, quality: str, capture_id: int | None = None) -> str:
         quality_code = quality.upper().replace(" ", "_")
-        if quality_code not in {"GOOD", "UNDEFINED"}:
+        if quality_code != "GOOD":
             raise ValueError(f"Unsupported egg quality: {quality}")
         command = f"MEASURE:{quality_code}"
         self._send_command(command)
@@ -333,7 +362,7 @@ class Esp32Bridge:
         })
 
     def _find_port(self) -> str:
-        configured = os.environ.get("ESP32_PORT")
+        configured = env_text("ESP32_PORT")
         if configured:
             return configured
 
@@ -490,15 +519,35 @@ class Esp32Bridge:
                     self._diagnostics["latest_sensor_event"] = (
                         f"{label} - {event.get('quality')} - weighing on load cell"
                     )
+            elif event_type == "measurement_failed":
+                self._diagnostics["latest_sensor_event"] = (
+                    f"ESP32 measurement rejected: {event.get('reason')}"
+                )
             elif event_type == "weight_reading":
-                self._diagnostics["measurement_weight_grams"] = event.get(
-                    "weight_grams"
-                )
-                self._diagnostics["measurement_reading_number"] = event.get(
-                    "reading_number"
-                )
-                self._diagnostics["final_weight_grams"] = None
-                self._diagnostics["awaiting_egg"] = False
+                weight = event.get("weight_grams")
+                self._diagnostics["live_weight_grams"] = weight
+                # A scale can report its weight before the camera validates
+                # the Good egg. Keep that raw reading visible, but do not
+                # present it as an authorized measurement or open the gate.
+                if self._diagnostics["measurement_quality"] is None:
+                    self._diagnostics["latest_sensor_event"] = (
+                        f"Egg on load cell: {weight} g - waiting for a "
+                        "validated Good auto-capture; gate is locked"
+                    )
+                else:
+                    self._diagnostics["measurement_weight_grams"] = weight
+                    self._diagnostics["measurement_reading_number"] = event.get(
+                        "reading_number"
+                    )
+                    self._diagnostics["final_weight_grams"] = None
+                    self._diagnostics["awaiting_egg"] = False
+                    egg_id = self._diagnostics["capture_id"]
+                    label = f"Egg #{egg_id}" if egg_id is not None else "Egg"
+                    self._diagnostics["latest_sensor_event"] = (
+                        f"{label} - {self._diagnostics['measurement_quality']} - "
+                        f"reading {event.get('reading_number')}: {weight} g - "
+                        "waiting for 2 consecutive readings"
+                    )
             elif event_type == "final_weight":
                 self._diagnostics["measurement_weight_grams"] = event.get(
                     "weight_grams"
@@ -549,8 +598,23 @@ class Esp32Bridge:
             elif event_type == "controller_state":
                 self._diagnostics["controller_state"] = event.get("state")
             self._events.append(event)
-        if self._handler is not None:
-            self._handler(event)
+        handler = self._handler
+        if handler is None:
+            return
+        try:
+            handler(event)
+        except Exception as exc:
+            # Application/database failures must not be treated as serial
+            # disconnects. Keep the controller reader alive and expose the
+            # failure through diagnostics for the status UI.
+            failure = {
+                "type": "event_handler_error",
+                "message": f"Unable to process {event.get('type')}: {exc}",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            with self._lock:
+                self._events.append(failure)
+                self._diagnostics["latest_sensor_event"] = failure["message"]
 
 
 ESP32_BRIDGE = Esp32Bridge()

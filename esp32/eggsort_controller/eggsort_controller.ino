@@ -37,8 +37,8 @@ bool pcaReady = false;
 #define CRACK_CLOSED 0
 #define CRACK_OPEN 80
 
-// How long the reject gate stays open (10 seconds)
-#define CRACK_GATE_OPEN_TIME 10000
+// How long the reject gate stays open
+#define CRACK_GATE_OPEN_TIME 8000
 
 bool rejectGateOpen = false;
 unsigned long rejectOpenedAt = 0;
@@ -99,14 +99,16 @@ unsigned long rejectOpenedAt = 0;
 #define SIZE_CLOSE_SPEED 20
 
 // How long size gate stays open
-#define SIZE_GATE_OPEN_TIME 1500
+#define SIZE_GATE_OPEN_TIME 1700
 
 // =====================================================
 // TRAVEL TIMES
 // =====================================================
 
 // Small and Medium
-#define SM_TRAVEL_TIME 2000
+// Oras (mula nang mag-open ang loadcell gate) bago buksan ang size servo.
+// Dapat mas maliit ito sa LOADCELL_OPEN_TIME.
+#define SM_TRAVEL_TIME 1000
 
 // Large
 #define LARGE_TRAVEL_TIME 8700
@@ -127,6 +129,15 @@ float calibration_factor = 622.0;
 
 #define EGG_THRESHOLD 30
 
+// Ilang samples ang i-average sa bawat basa (mas mababa = mas mabilis)
+#define WEIGHT_SAMPLES 3
+
+// Pinapayagang pagkakaiba (g) para ituring na "same reading"
+#define WEIGHT_TOLERANCE 1
+
+// Ilang stable readings bago i-release ang itlog
+#define STABLE_COUNT_NEEDED 3
+
 // =====================================================
 // VARIABLES
 // =====================================================
@@ -145,6 +156,8 @@ bool measurementAuthorized = false;
 // =====================================================
 
 void handleSerialCommands(bool urgentOnly);
+bool openLoadCellGate();
+void closeLoadCellGate();
 
 // =====================================================
 // SET SERVO ANGLE
@@ -163,7 +176,7 @@ void setServoAngle(uint8_t channel, int angle) {
 // CRACK / ROTTEN REJECT SERVO FUNCTIONS
 // =====================================================
 
-// Isasara ang reject gate kapag lumipas na ang 10 seconds
+// Isasara ang reject gate kapag lumipas na ang oras
 void updateRejectServo() {
 
   if (rejectGateOpen &&
@@ -176,7 +189,7 @@ void updateRejectServo() {
   }
 }
 
-// Bubuksan ang reject gate at sisimulan ang 10 second timer
+// Bubuksan ang reject gate at sisimulan ang timer
 void startRejectServo() {
 
   setServoAngle(CRACK_SERVO, CRACK_OPEN);
@@ -184,7 +197,7 @@ void startRejectServo() {
   rejectOpenedAt = millis();
   rejectGateOpen = true;
 
-  Serial.println("REJECT SERVO: OPEN; HOLD 10000 MS");
+  Serial.println("REJECT SERVO: OPEN; HOLD 8000 MS");
 }
 
 // =====================================================
@@ -295,6 +308,24 @@ void handleSerialCommands(bool urgentOnly) {
       continue;
     }
 
+    // Explicit operator-only override from the web "Advance Load-cell Gate"
+    // button. Automatic sorting remains locked until a Good camera capture
+    // authorizes it, but an operator can safely release an egg for testing or
+    // recovery when it is physically waiting on the load cell.
+    if (command == "ADVANCE") {
+      if (processingEgg) {
+        Serial.println("ADVANCE FAILED: EGG ALREADY PROCESSING");
+      } else if (!eggDetected) {
+        Serial.println("ADVANCE FAILED: NO EGG ON LOAD CELL");
+      } else if (openLoadCellGate()) {
+        Serial.println("MANUAL LOAD CELL GATE: OPEN");
+        waitWithRejectService(LOADCELL_OPEN_TIME);
+        closeLoadCellGate();
+        Serial.println("MANUAL LOAD CELL GATE: CLOSED");
+      }
+      continue;
+    }
+
     // ---------- CRACK_TEST ----------
     if (command == "CRACK_TEST") {
 
@@ -370,12 +401,43 @@ void moveLoadCellServoSlow(
 }
 
 // =====================================================
+// LOAD-CELL GATE CONTROL
+// =====================================================
+
+// Opens the load-cell gate for an operator-requested ADVANCE command.
+// Returning false lets the caller report that the PCA9685 is unavailable.
+bool openLoadCellGate() {
+
+  if (!pcaReady) {
+    Serial.println("ADVANCE FAILED: PCA9685 NOT FOUND");
+    return false;
+  }
+
+  moveLoadCellServoSlow(
+    LOADCELL_CLOSED,
+    LOADCELL_OPEN,
+    LOADCELL_OPEN_SPEED
+  );
+
+  return true;
+}
+
+// Closes the load-cell gate immediately after its hold period.
+void closeLoadCellGate() {
+
+  if (pcaReady) {
+    pwm.setPWM(LOADCELL_SERVO, 0, LOADCELL_CLOSED);
+  }
+}
+
+// =====================================================
 // READ WEIGHT
+// (3 samples na lang para mabilis ang basa)
 // =====================================================
 
 int readWeight() {
 
-  float weight = scale.get_units(10);
+  float weight = scale.get_units(WEIGHT_SAMPLES);
 
   if (weight > -10 && weight < 10) {
     weight = 0;
@@ -385,7 +447,7 @@ int readWeight() {
 }
 
 // =====================================================
-// ACTIVATE SIZE SERVO
+// ACTIVATE SIZE SERVO (Large / XL)
 // =====================================================
 
 void activateSizeServo(
@@ -408,6 +470,36 @@ void activateSizeServo(
   setServoAngle(channel, openAngle);
 
   waitWithRejectService(SIZE_GATE_OPEN_TIME);
+
+  // CLOSE SLOWLY
+  Serial.print("SLOWLY CLOSING ");
+  Serial.print(sizeName);
+  Serial.println(" SERVO");
+
+  moveServoSlow(channel, openAngle, closedAngle, SIZE_CLOSE_SPEED);
+
+  Serial.print(sizeName);
+  Serial.println(" SERVO: CLOSED");
+}
+
+// =====================================================
+// FINISH SIZE SERVO (Small / Medium)
+// Nabuksan na ang servo nang maaga, isasara na lang
+// pagkatapos ng SIZE_GATE_OPEN_TIME
+// =====================================================
+
+void finishSizeServo(
+  uint8_t channel,
+  int openAngle,
+  int closedAngle,
+  const char* sizeName,
+  unsigned long openedAt
+) {
+
+  // Hintayin ang natitirang open time
+  while (millis() - openedAt < SIZE_GATE_OPEN_TIME) {
+    waitWithRejectService(10);
+  }
 
   // CLOSE SLOWLY
   Serial.print("SLOWLY CLOSING ");
@@ -534,7 +626,7 @@ void loop() {
       measurementAuthorized = false;
     }
 
-    waitWithRejectService(600);
+    waitWithRejectService(100);
 
     return;
   }
@@ -556,10 +648,10 @@ void loop() {
   Serial.println(" g");
 
   // ===================================================
-  // EXACT SAME READING CHECK
+  // SAME READING CHECK (may tolerance na +/- 1 g)
   // ===================================================
 
-  if (currentWeight == lastWeight) {
+  if (lastWeight != -1 && abs(currentWeight - lastWeight) <= WEIGHT_TOLERANCE) {
 
     sameCount++;
 
@@ -573,10 +665,14 @@ void loop() {
   Serial.println(sameCount);
 
   // ===================================================
-  // THREE IDENTICAL READINGS
+  // STABLE READINGS REACHED
   // ===================================================
 
-  if (sameCount >= 3 && !processingEgg && measurementAuthorized) {
+  // Do not keep a physically detected egg locked on the load cell while
+  // waiting for a serial MEASURE command.  Camera rejection happens at the
+  // upstream reject gate; a non-rejected egg is released once its weight has
+  // been stable for the needed number of readings.
+  if (sameCount >= STABLE_COUNT_NEEDED && !processingEgg) {
 
     processingEgg = true;
 
@@ -642,15 +738,48 @@ void loop() {
     // =================================================
 
     unsigned long travelStart = millis();
+    unsigned long sizeOpenedAt = 0;
 
     Serial.println("EGG RELEASED");
     Serial.println("TRAVEL TIMER STARTED");
 
     // =================================================
     // KEEP LOAD-CELL GATE OPEN
+    // Para sa Small/Medium: bubuksan ang size servo
+    // habang bukas pa ang load-cell gate
     // =================================================
 
-    waitWithRejectService(LOADCELL_OPEN_TIME);
+    if (eggSize == 1 || eggSize == 2) {
+
+      // Hintayin ang S/M travel time (2 seconds)
+      while (millis() - travelStart < SM_TRAVEL_TIME) {
+        waitWithRejectService(10);
+      }
+
+      // Buksan agad ang size servo
+      Serial.println();
+
+      if (eggSize == 1) {
+        Serial.println("SMALL EGG ARRIVING");
+        Serial.println("OPENING SMALL SERVO");
+        setServoAngle(SMALL_SERVO, SMALL_OPEN);
+      } else {
+        Serial.println("MEDIUM EGG ARRIVING");
+        Serial.println("OPENING MEDIUM SERVO");
+        setServoAngle(MEDIUM_SERVO, MEDIUM_OPEN);
+      }
+
+      sizeOpenedAt = millis();
+
+      // Tapusin ang natitirang load-cell open time
+      while (millis() - travelStart < LOADCELL_OPEN_TIME) {
+        waitWithRejectService(10);
+      }
+
+    } else {
+
+      waitWithRejectService(LOADCELL_OPEN_TIME);
+    }
 
     // =================================================
     // FAST CLOSE LOAD-CELL GATE
@@ -664,20 +793,12 @@ void loop() {
     Serial.println("LOAD CELL GATE: CLOSED");
 
     // =================================================
-    // SELECT TRAVEL TIME
+    // SELECT TRAVEL TIME (Large / XL lang)
     // =================================================
 
     unsigned long selectedTravelTime = 0;
 
-    if (eggSize == 1 || eggSize == 2) {
-
-      // SMALL / MEDIUM
-      selectedTravelTime = SM_TRAVEL_TIME;
-
-      Serial.println();
-      Serial.println("S/M TRAVEL TIME: 2.0 SECONDS");
-
-    } else if (eggSize == 3) {
+    if (eggSize == 3) {
 
       // LARGE
       selectedTravelTime = LARGE_TRAVEL_TIME;
@@ -715,7 +836,7 @@ void loop() {
 
     if (eggSize == 1) {
 
-      activateSizeServo(SMALL_SERVO, SMALL_OPEN, SMALL_CLOSED, "SMALL");
+      finishSizeServo(SMALL_SERVO, SMALL_OPEN, SMALL_CLOSED, "SMALL", sizeOpenedAt);
     }
 
     // =================================================
@@ -724,7 +845,7 @@ void loop() {
 
     else if (eggSize == 2) {
 
-      activateSizeServo(MEDIUM_SERVO, MEDIUM_OPEN, MEDIUM_CLOSED, "MEDIUM");
+      finishSizeServo(MEDIUM_SERVO, MEDIUM_OPEN, MEDIUM_CLOSED, "MEDIUM", sizeOpenedAt);
     }
 
     // =================================================
@@ -807,5 +928,5 @@ void loop() {
     waitWithRejectService(600);
   }
 
-  waitWithRejectService(600);
+  waitWithRejectService(100);
 }

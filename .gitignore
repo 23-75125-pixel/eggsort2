@@ -3,6 +3,8 @@ __pycache__/
 instance/
 .env
 .venv/
+.venv-*/
 *.log
+.kilo/
 
 client_secret*.json

@@ -2,25 +2,23 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from threading import Lock
 from typing import Any
 
+from config import env_float, env_int, env_text
 
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = Path(
-    os.environ.get("YOLO_MODEL_PATH", str(BASE_DIR / "best.pt"))
-).expanduser()
-CONFIDENCE = float(os.environ.get("YOLO_CONFIDENCE", "0.25"))
-IMAGE_SIZE = int(os.environ.get("YOLO_IMAGE_SIZE", "512"))
+MODEL_PATH = Path(env_text("YOLO_MODEL_PATH", "best.pt")).expanduser()
+if not MODEL_PATH.is_absolute():
+    MODEL_PATH = BASE_DIR / MODEL_PATH
+CONFIDENCE = env_float("YOLO_CONFIDENCE", 0.25, minimum=0.0, maximum=1.0)
+IMAGE_SIZE = env_int("YOLO_IMAGE_SIZE", 512, minimum=32, maximum=4096)
 MAX_FRAME_BYTES = 5 * 1024 * 1024
 EXPECTED_MODEL_NAMES = (
     "Crack",
     "Good",
     "Rotten",
-    "Undefined",
-    "no egg",
 )
 
 _model: Any | None = None

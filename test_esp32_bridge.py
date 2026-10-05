@@ -108,7 +108,7 @@ class Esp32BridgeDiagnosticsTests(unittest.TestCase):
         bridge = Esp32Bridge()
         bridge._connected = True
         bridge._serial = Mock()
-        for quality in ("Good", "Undefined", "no egg"):
+        for quality in ("Good", "Unknown", "no egg"):
             with self.assertRaises(ValueError):
                 bridge.reject_egg(quality)
         bridge._serial.write.assert_not_called()
@@ -148,6 +148,38 @@ class Esp32BridgeDiagnosticsTests(unittest.TestCase):
 
         self.assertEqual(events[0]["type"], "measurement_quality")
         self.assertEqual(events[0]["quality"], "Good")
+
+    def test_measurement_failure_is_exposed_to_the_status_panel(self) -> None:
+        bridge = Esp32Bridge()
+        events = Esp32ProtocolParser().parse("MEASURE FAILED: EGG ALREADY PROCESSING")
+        bridge._publish(events[0])
+
+        self.assertIn(
+            "EGG ALREADY PROCESSING",
+            bridge.status()["diagnostics"]["latest_sensor_event"],
+        )
+
+    def test_pre_camera_reading_keeps_load_cell_gate_locked(self) -> None:
+        bridge = Esp32Bridge()
+        bridge._publish({"type": "egg_detected", "message": "Egg Detected"})
+        bridge._publish({
+            "type": "weight_reading",
+            "reading_number": 2,
+            "weight_grams": 52,
+            "message": "Reading 2: 52 g",
+        })
+
+        diagnostics = bridge.status()["diagnostics"]
+        self.assertEqual(diagnostics["live_weight_grams"], 52)
+        self.assertIsNone(diagnostics["measurement_weight_grams"])
+        self.assertIn("validated Good", diagnostics["latest_sensor_event"])
+
+    def test_weight_line_from_existing_firmware_updates_measurement(self) -> None:
+        events = Esp32ProtocolParser().parse("WEIGHT: 62 g")
+
+        self.assertEqual(events[0]["type"], "weight_reading")
+        self.assertEqual(events[0]["reading_number"], 1)
+        self.assertEqual(events[0]["weight_grams"], 62)
 
     def test_load_cell_gate_messages_are_parsed_and_retained(self) -> None:
         events = Esp32ProtocolParser().parse("LOAD CELL GATE: OPEN")
@@ -249,6 +281,18 @@ class Esp32BridgeDiagnosticsTests(unittest.TestCase):
         self.assertIn("Good", latest)
         self.assertIn("64 g", latest)
         self.assertIn("Large", latest)
+
+    def test_application_handler_failure_does_not_break_bridge_state(self) -> None:
+        bridge = Esp32Bridge()
+        bridge._connected = True
+        bridge.set_event_handler(Mock(side_effect=RuntimeError("database offline")))
+
+        bridge._publish({"type": "sort_complete", "size": "Medium"})
+
+        status = bridge.status()
+        self.assertTrue(status["connected"])
+        self.assertEqual(status["latest_event"]["type"], "event_handler_error")
+        self.assertIn("database offline", status["latest_event"]["message"])
 
 
 if __name__ == "__main__":

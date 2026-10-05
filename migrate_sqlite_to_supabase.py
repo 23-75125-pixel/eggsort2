@@ -20,7 +20,7 @@ from app import app, db
 
 
 SOURCE_DATABASE = Path("instance/database.db")
-TABLES = ("user", "egg_record", "tray_alert", "sale", "audit_log")
+TABLES = ("user", "egg_record", "tray_alert", "audit_log")
 
 
 def main() -> None:

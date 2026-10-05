@@ -126,8 +126,8 @@ From the project folder:
 1. Open `http://127.0.0.1:5000` and sign in. A successful login starts the
    camera, YOLO detector, and ESP32 serial bridge automatically. Camera startup
    loads the file configured by `YOLO_MODEL_PATH` and rejects the session unless
-   its embedded classes are exactly `Crack`, `Good`, `Rotten`, `Undefined`, and
-   `no egg` in that order.
+   its embedded classes are exactly `Crack`, `Good`, and `Rotten` in that
+   order. A frame with no detection is treated as no egg.
 2. Open **Sorting Sessions** and confirm that **ESP32 link** shows
    `Connected on COM... @ 115200`.
 3. Each egg is captured once when its detection center enters the marked
@@ -139,12 +139,14 @@ From the project folder:
    the timer. A separate rejected egg starts a new 10-second hold.
 4. Rejected eggs are counted at zone exit but excluded from the weighing queue,
    even if later frames say Good. They receive no weight or size and do not
-   create a weighed Egg Record. Good and Undefined passages are queued once,
-   after leaving the zone. `no egg` is never counted as an egg.
+   create a weighed Egg Record. Only an egg whose YOLO bounding-box center is
+   inside the centered, egg-sized auto-capture zone can trigger this flow.
+   Good passages are queued once after leaving
+   the zone. A frame with no detection is never counted as an egg.
 5. When an accepted egg reaches the load cell, its gate stays closed and the ESP32
    sends `Egg Detected`. Flask matches it to the oldest queued zone exit capture
    and sends `MEASURE:<QUALITY>` with that capture number retained in diagnostics.
-6. The ESP32 takes two consecutive identical rounded gram readings and calculates their
+6. After Flask sends `MEASURE:GOOD`, the ESP32 takes two consecutive identical rounded gram readings and calculates their
    average as the final weight and size. Each reading averages five HX711
    conversions for quicker response. The second matching reading automatically
    triggers sorting; no separate route command is required.

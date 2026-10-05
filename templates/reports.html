@@ -139,6 +139,8 @@
       .nav-active-glow { box-shadow: -4px 0 0 0 theme("colors.primary-container") inset; }
     </style>
     <link rel="stylesheet" href="/static/responsive.css" />
+    <meta name="csrf-token" content="{{ csrf_token() }}" />
+    <script src="{{ url_for('static', filename='security.js') }}" defer></script>
   </head>
   <body class="bg-background text-on-background font-body-md flex min-h-screen">
     <!-- SideNavBar -->
@@ -197,13 +199,6 @@
           <span class="font-button text-button">Alerts</span>
         </a>
         <a
-          class="text-surface-variant/70 hover:text-white transition-colors py-3 px-6 flex items-center gap-3 hover:bg-surface-variant/10 transition-all active:scale-95 duration-150 ease-in-out rounded-lg mx-2 mt-xs"
-          href="/sales"
-        >
-          <span class="material-symbols-outlined">payments</span>
-          <span class="font-button text-button">Sales</span>
-        </a>
-        <a
           class="bg-primary-container/20 text-primary-fixed font-bold border-l-4 border-primary-container mx-2 rounded-r-lg py-3 px-4 flex items-center gap-3 active:scale-95 duration-150 ease-in-out nav-active-glow"
           href="/reports"
         >
@@ -245,6 +240,10 @@
           <h2 class="text-headline-md font-headline-md text-on-surface">
             Reports Management
           </h2>
+          <p id="report-updated-at" role="status" aria-live="polite"
+            class="text-caption font-caption text-secondary mt-1">
+            Loading live report...
+          </p>
           </div>
         </div>
         <button
@@ -339,7 +338,7 @@
             class="mt-4 hidden text-sm font-medium"></p>
         </div>
         <!-- KPI Cards -->
-        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-5 gap-4">
+        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
           <!-- Card 1 -->
           <div
             class="bg-surface-container-lowest border border-surface-variant rounded-lg p-4 sm:p-5 shadow-[0_2px_10px_rgba(0,0,0,0.01)] flex flex-col justify-between h-[104px]"
@@ -392,22 +391,6 @@
               —
             </div>
           </div>
-          <!-- Card 5 -->
-          <div
-            class="bg-surface-container-lowest border border-surface-variant rounded-lg p-4 sm:p-5 shadow-[0_2px_10px_rgba(0,0,0,0.01)] flex flex-col justify-between h-[104px]"
-          >
-            <h3
-              class="text-label-caps font-label-caps text-secondary uppercase tracking-widest"
-            >
-              Proj Revenue
-            </h3>
-            <div id="report-revenue"
-              class="text-headline-md font-headline-md text-on-surface flex items-center gap-1"
-            >
-              <span class="text-body-md font-body-md text-secondary">PHP</span>
-              0.00
-            </div>
-          </div>
         </div>
         <!-- Main Data Table -->
         <div
@@ -434,7 +417,6 @@
                   <th class="py-3 px-5">GOOD</th>
                   <th class="py-3 px-5">CRACK</th>
                   <th class="py-3 px-5">ROTTEN</th>
-                  <th class="py-3 px-5">UNDEFINED</th>
                   <th class="py-3 px-5">LEGACY/OTHER</th>
                 </tr>
               </thead>
@@ -461,6 +443,7 @@ const refreshButton = document.getElementById('refresh-report');
 const refreshIcon = document.getElementById('refresh-report-icon');
 let reportRequestPending = false;
 let reportSuccessTimer = null;
+let renderedReportRowsKey = '';
 
 function setReportStatus(message, isError) {
   if (!reportStatus) return;
@@ -487,6 +470,10 @@ function flashRefreshSuccess() {
   }, 1200);
 }
 
+function formatRefreshTimestamp(date = new Date()) {
+  return date.toLocaleString([], { dateStyle: 'medium', timeStyle: 'medium' });
+}
+
 /* Formats a Date as YYYY-MM-DD in the viewer's own timezone. The previous
    code used toISOString(), which converts to UTC first, so between local
    midnight and the viewer's UTC offset "today" was rendered as yesterday. */
@@ -510,7 +497,7 @@ function renderReportRows(rows) {
   if (!rows.length) {
     const row = document.createElement('tr');
     const cell = document.createElement('td');
-    cell.colSpan = 7;
+    cell.colSpan = 6;
     cell.className = 'py-12 px-5 text-center text-secondary';
     cell.textContent = 'No sorting records match this date range.';
     row.appendChild(cell);
@@ -526,7 +513,6 @@ function renderReportRows(rows) {
       entry.good,
       entry.crack,
       entry.rotten,
-      entry.undefined,
       entry.other
     ].forEach((value) => {
       const cell = document.createElement('td');
@@ -538,7 +524,7 @@ function renderReportRows(rows) {
   });
 }
 
-async function refreshReport() {
+async function refreshReport(options = {}) {
   /* The date and sampling inputs each trigger a refresh, and the button can be
      clicked on top of that. Without this guard the overlapping responses can
      land out of order and paint the KPIs from a stale filter. */
@@ -548,8 +534,10 @@ async function refreshReport() {
     return;
   }
   reportRequestPending = true;
-  setRefreshingUI(true);
-  setReportStatus('Fetching the latest report data...', false);
+  if (options.manual) {
+    setRefreshingUI(true);
+    setReportStatus('Fetching the latest report data...', false);
+  }
   let succeeded = false;
   try {
     const params = new URLSearchParams({
@@ -571,16 +559,17 @@ async function refreshReport() {
     document.getElementById('report-good').textContent = payload.summary.good;
     document.getElementById('report-defects').textContent = payload.summary.defects;
     document.getElementById('report-quality-rate').textContent = `${payload.summary.quality_rate}%`;
-    document.getElementById('report-revenue').textContent =
-      `PHP ${Number(payload.summary.revenue).toLocaleString(undefined, {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2
-      })}`;
     document.getElementById('report-description').textContent =
       `${reportSampling.value} totals from ${reportStart.value} through ${reportEnd.value}.`;
-    renderReportRows(payload.rows);
+    const reportRowsKey = JSON.stringify(payload.rows || []);
+    if (reportRowsKey !== renderedReportRowsKey) {
+      renderReportRows(payload.rows || []);
+      renderedReportRowsKey = reportRowsKey;
+    }
     succeeded = true;
-    setReportStatus('Updated ' + new Date().toLocaleTimeString(), false);
+    const updatedMessage = `Updated ${formatRefreshTimestamp()}`;
+    document.getElementById('report-updated-at').textContent = updatedMessage;
+    setReportStatus(updatedMessage, false);
   } catch (error) {
     /* Previously an unreachable server rejected the promise with no handler,
        so the button did nothing at all and left no trace. */
@@ -588,18 +577,21 @@ async function refreshReport() {
     setReportStatus('Unable to reach the server. Check that it is running.', true);
   } finally {
     reportRequestPending = false;
-    setRefreshingUI(false);
-    if (succeeded) flashRefreshSuccess();
+    if (options.manual) {
+      setRefreshingUI(false);
+      if (succeeded) flashRefreshSuccess();
+    }
   }
 }
 
 setDefaultReportDates();
-refreshButton.addEventListener('click', refreshReport);
+refreshButton.addEventListener('click', () => refreshReport({ manual: true }));
 document.getElementById('print-report').addEventListener('click', () => window.print());
-reportSampling.addEventListener('change', refreshReport);
-reportStart.addEventListener('change', refreshReport);
-reportEnd.addEventListener('change', refreshReport);
+reportSampling.addEventListener('change', () => refreshReport({ manual: true }));
+reportStart.addEventListener('change', () => refreshReport({ manual: true }));
+reportEnd.addEventListener('change', () => refreshReport({ manual: true }));
 refreshReport();
+window.setInterval(refreshReport, 1000);
 </script>
 </body>
 </html>

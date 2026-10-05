@@ -2,7 +2,20 @@ services:
   - type: web
     name: eggsort
     runtime: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt && python prepare_model.py
     startCommand: gunicorn --workers 1 --bind 0.0.0.0:$PORT app:app
     healthCheckPath: /health
     autoDeployTrigger: commit
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
+      - key: SUPABASE_DB_URL
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
+      - key: AUTO_START_SORTING_ON_LOGIN
+        value: "0"
+      - key: YOLO_MODEL_PATH
+        value: /opt/render/project/src/best.pt
+      - key: YOLO_MODEL_URL
+        sync: false

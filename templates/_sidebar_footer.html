@@ -23,11 +23,14 @@
       </p>
     </div>
   </div>
-  <a
-    class="w-full text-surface-variant/70 hover:text-white transition-colors py-3 px-4 flex items-center justify-center gap-2 hover:bg-surface-variant/10 active:scale-95 duration-150 ease-in-out rounded-lg border border-white/10"
-    href="/logout"
-  >
-    <span class="material-symbols-outlined text-[20px]">logout</span>
-    <span class="font-button text-button">Log Out</span>
-  </a>
+  <form method="post" action="{{ url_for('logout') }}">
+    <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}" />
+    <button
+      class="w-full text-surface-variant/70 hover:text-white transition-colors py-3 px-4 flex items-center justify-center gap-2 hover:bg-surface-variant/10 active:scale-95 duration-150 ease-in-out rounded-lg border border-white/10"
+      type="submit"
+    >
+      <span class="material-symbols-outlined text-[20px]">logout</span>
+      <span class="font-button text-button">Log Out</span>
+    </button>
+  </form>
 </div>

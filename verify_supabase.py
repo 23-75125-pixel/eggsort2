@@ -1,7 +1,7 @@
 """Verify EggSort's configured database connection and persisted row counts.
 
 Run with:
-    .\\.venv-local\\Scripts\\python.exe verify_supabase.py
+    .\\.venv\\Scripts\\python.exe verify_supabase.py
 """
 
 import sqlite3
@@ -12,7 +12,7 @@ from sqlalchemy import inspect, text
 from app import app, db
 
 
-TABLES = ("user", "egg_record", "tray_alert", "sale", "audit_log")
+TABLES = ("user", "egg_record", "tray_alert", "audit_log")
 LOCAL_DATABASE = Path("instance/database.db")
 
 
