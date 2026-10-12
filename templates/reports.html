@@ -130,6 +130,7 @@
     <link rel="stylesheet" href="/static/responsive.css" />
     <meta name="csrf-token" content="{{ csrf_token() }}" />
     <script src="{{ url_for('static', filename='security.js') }}" defer></script>
+    {% include "_notifications.html" %}
   </head>
   <body class="bg-background text-on-background font-body-md flex min-h-screen">
     <!-- SideNavBar -->

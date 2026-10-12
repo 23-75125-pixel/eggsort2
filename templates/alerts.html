@@ -127,6 +127,7 @@
     <link rel="stylesheet" href="/static/responsive.css" />
     <meta name="csrf-token" content="{{ csrf_token() }}" />
     <script src="{{ url_for('static', filename='security.js') }}" defer></script>
+    {% include "_notifications.html" %}
   </head>
   <body class="bg-background text-on-background font-body-md antialiased flex">
     <!-- SideNavBar -->
@@ -433,9 +434,15 @@
     allButton.addEventListener('click', () => setActiveFilter('all'));
     unreadButton.addEventListener('click', () => setActiveFilter('unread'));
     searchInput.addEventListener('input', renderAlerts);
-    document.getElementById('mark-all-read').addEventListener('click', async () => {
-      const response = await fetch('/api/alerts/read-all', { method: 'POST' });
-      if (response.ok) fetchAlerts();
+    document.getElementById('mark-all-read').addEventListener('click', async (event) => {
+      await EggSortAlerts.run({
+        button: event.currentTarget, title: 'Mark all alerts as read?',
+        text: 'All unread alerts will be marked as read.', success: 'All alerts marked as read.',
+        action: async () => {
+          await EggSortAlerts.request('/api/alerts/read-all', { method: 'POST' });
+          await fetchAlerts();
+        },
+      });
     });
 
     fetchAlerts();

@@ -142,6 +142,7 @@
       .nav-active-glow { box-shadow: -4px 0 0 0 theme("colors.primary-container") inset; }
     </style>
     <link rel="stylesheet" href="/static/responsive.css" />
+    {% include "_notifications.html" %}
   </head>
   <body class="flex h-screen overflow-hidden bg-background">
     <!-- SideNavBar -->
@@ -668,19 +669,18 @@
     saleForm.addEventListener('submit', async (event) => {
       event.preventDefault();
       const formData = new FormData(saleForm);
-      const response = await fetch('/api/sales', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(Object.fromEntries(formData.entries()))
+      await EggSortAlerts.run({
+        button: saleForm.querySelector('[type="submit"]'), title: 'Record sale?',
+        text: 'Save this sale and update the available egg stock?', success: 'Sale recorded successfully.',
+        action: async () => {
+          await EggSortAlerts.request('/api/sales', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(Object.fromEntries(formData.entries())),
+          });
+          closeSaleModal();
+          await refreshSales();
+        },
       });
-      const payload = await response.json();
-      if (!response.ok) {
-        saleError.textContent = payload.error || 'Unable to save sale.';
-        saleError.classList.remove('hidden');
-        return;
-      }
-      closeSaleModal();
-      refreshSales();
     });
 
     refreshSales();

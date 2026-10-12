@@ -135,6 +135,7 @@
     <link rel="stylesheet" href="/static/responsive.css" />
     <meta name="csrf-token" content="{{ csrf_token() }}" />
     <script src="{{ url_for('static', filename='security.js') }}" defer></script>
+    {% include "_notifications.html" %}
   </head>
   <body
     class="bg-background text-on-background font-body-md antialiased overflow-x-hidden min-h-screen flex"
@@ -561,20 +562,17 @@
     let renderedSections = {};
 
     document.getElementById('clear-audit-logs')?.addEventListener('click', async (event) => {
-      if (!window.confirm('Clear all current System Security Audit Logs? This cannot be undone.')) return;
       const button = event.currentTarget;
-      button.disabled = true;
-      try {
-        const response = await fetch('/api/dashboard/audit-logs/clear', { method: 'POST' });
-        const result = await response.json();
-        if (!response.ok) throw new Error(result.error || 'Could not clear audit logs.');
-        renderedSections.audit = null;
-        await refreshDashboard({ manual: false });
-      } catch (error) {
-        window.alert(error.message || 'Could not clear audit logs.');
-      } finally {
-        button.disabled = false;
-      }
+      await EggSortAlerts.run({
+        button, title: 'Clear audit logs?',
+        text: 'All current System Security Audit Logs will be cleared. This cannot be undone.',
+        destructive: true, success: 'Audit logs cleared successfully.',
+        action: async () => {
+          await EggSortAlerts.request('/api/dashboard/audit-logs/clear', { method: 'POST' });
+          renderedSections.audit = null;
+          await refreshDashboard({ manual: false });
+        },
+      });
     });
     let successFlashTimer = null;
 
@@ -698,11 +696,13 @@
       } catch (error) {
         console.error('Dashboard refresh failed:', error);
         setDashboardStatus('error', 'Refresh failed');
+        if (options.manual) await EggSortAlerts.error(error.message || 'Dashboard refresh failed.');
       } finally {
         dashboardRequestPending = false;
         setRefreshingUI(false);
         if (options.manual && succeeded) flashRefreshSuccess();
       }
+      if (options.manual && succeeded) await EggSortAlerts.success('Dashboard refreshed successfully.');
     }
 
     refreshButton.addEventListener('click', () => refreshDashboard({ manual: true }));

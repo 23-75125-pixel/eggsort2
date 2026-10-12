@@ -305,6 +305,9 @@ def sign_in_user(user: "User", remember: bool = False) -> None:
     session["role"] = user.role
     session["avatar_url"] = user.avatar_url or ""
     session.permanent = remember
+    session["auth_feedback"] = {
+        "icon": "success", "message": "You have signed in successfully."
+    }
     if app.config["AUTO_START_SORTING_ON_LOGIN"]:
         try:
             start_sorting_runtime()
@@ -1858,6 +1861,9 @@ def logout() -> Any:
     )
     stop_sorting_runtime()
     session.clear()
+    session["auth_feedback"] = {
+        "icon": "success", "message": "You have been logged out."
+    }
     return redirect(url_for("login"))
 
 

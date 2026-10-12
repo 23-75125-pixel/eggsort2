@@ -1,0 +1,11 @@
+<script src="https://cdn.jsdelivr.net/npm/sweetalert2@11/dist/sweetalert2.all.min.js"></script>
+<script src="{{ url_for('static', filename='notifications.js') }}"></script>
+{% set auth_feedback = session.pop('auth_feedback', none) %}
+{% if error and request.endpoint == 'login' %}
+  {% set auth_feedback = {'icon': 'error', 'message': error} %}
+{% elif notice and request.endpoint == 'login' %}
+  {% set auth_feedback = {'icon': 'success', 'message': notice} %}
+{% endif %}
+{% if auth_feedback %}
+<script id="auth-feedback" type="application/json">{{ auth_feedback | tojson }}</script>
+{% endif %}

@@ -133,6 +133,7 @@
     <link rel="stylesheet" href="/static/responsive.css" />
     <meta name="csrf-token" content="{{ csrf_token() }}" />
     <script src="{{ url_for('static', filename='security.js') }}" defer></script>
+    {% include "_notifications.html" %}
   </head>
   <body class="bg-surface text-on-surface font-body-md min-h-screen flex">
     <!-- SideNavBar -->
@@ -408,14 +409,17 @@
     }
 
     async function createNewInvite(user) {
-      const response = await fetch(`/api/users/${user.id}/invite`, { method: 'POST' });
-      const payload = await response.json();
-      if (!response.ok) {
-        window.alert(payload.error || 'Unable to create an invitation.');
-        return;
+      const payload = await EggSortAlerts.run({
+        button: usersGrid.querySelector(`[data-invite-user="${user.id}"]`),
+        title: 'Create invitation?', text: `Create a new invitation for ${user.email || user.username}?`,
+        success: 'Invitation created successfully.',
+        action: () => EggSortAlerts.request(`/api/users/${user.id}/invite`, { method: 'POST' }),
+      });
+      if (payload) {
+        showInviteModal(payload.invite_url, payload.email_sent, payload.warning);
+        if (payload.warning) await EggSortAlerts.warning(payload.warning);
+        refreshUsers();
       }
-      showInviteModal(payload.invite_url, payload.email_sent, payload.warning);
-      refreshUsers();
     }
 
     function renderUsers(users) {
@@ -468,6 +472,7 @@
         if (user.role === 'staff') {
           const invite = document.createElement('button');
           invite.type = 'button';
+          invite.dataset.inviteUser = user.id;
           invite.className = 'p-2 rounded-lg text-secondary hover:bg-surface-container';
           invite.title = user.password_set ? 'Create password reset invitation' : 'Create new invitation';
           invite.innerHTML = '<span class="material-symbols-outlined">link</span>';
@@ -489,14 +494,15 @@
         remove.disabled = user.is_current;
         remove.innerHTML = '<span class="material-symbols-outlined">delete</span>';
         remove.addEventListener('click', async () => {
-          if (!window.confirm(`Remove access for "${user.email || user.username}"?`)) return;
-          const response = await fetch(`/api/users/${user.id}`, { method: 'DELETE' });
-          const payload = await response.json();
-          if (!response.ok) {
-            window.alert(payload.error || 'Unable to delete operator.');
-            return;
-          }
-          refreshUsers();
+          await EggSortAlerts.run({
+            button: remove, title: 'Delete operator?',
+            text: `Remove access for "${user.email || user.username}"? This cannot be undone.`,
+            destructive: true, success: 'Operator deleted successfully.',
+            action: async () => {
+              await EggSortAlerts.request(`/api/users/${user.id}`, { method: 'DELETE' });
+              await refreshUsers();
+            },
+          });
         });
         actions.append(edit, remove);
         card.append(identity, actions);
@@ -506,15 +512,18 @@
     }
 
     async function refreshUsers() {
-      const response = await fetch('/api/users');
-      if (response.redirected) {
-        window.location.href = response.url;
-        return;
-      }
-      const payload = await response.json();
-      if (response.ok) {
+      try {
+        const response = await fetch('/api/users');
+        if (response.redirected) {
+          window.location.href = response.url;
+          return;
+        }
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || 'Unable to load operators.');
         usersCache = payload.users;
         renderUsers(usersCache);
+      } catch (error) {
+        await EggSortAlerts.error(error.message || 'Unable to load operators.');
       }
     }
 
@@ -549,20 +558,22 @@
         email: formData.get('email'),
         avatar_url: formData.get('avatar_url'),
       };
-      const response = await fetch(userId ? `/api/users/${userId}` : '/api/users', {
-        method: userId ? 'PATCH' : 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+      const result = await EggSortAlerts.run({
+        button: userForm.querySelector('[type="submit"]'),
+        title: userId ? 'Save staff changes?' : 'Invite staff?',
+        text: userId ? 'Update this staff account with the entered details?' : 'Create this staff account and its invitation?',
+        success: userId ? 'Staff account updated successfully.' : 'Staff account created successfully.',
+        action: () => EggSortAlerts.request(userId ? `/api/users/${userId}` : '/api/users', {
+          method: userId ? 'PATCH' : 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        }),
       });
-      const result = await response.json();
-      if (!response.ok) {
-        userError.textContent = result.error || 'Unable to save operator.';
-        userError.classList.remove('hidden');
-        return;
-      }
+      if (!result) return;
       closeUserModal();
       if (result.invite_url) {
         showInviteModal(result.invite_url, result.email_sent, result.warning);
+        if (result.warning) await EggSortAlerts.warning(result.warning);
       }
       refreshUsers();
     });

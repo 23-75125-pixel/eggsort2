@@ -117,6 +117,7 @@
 <link rel="stylesheet" href="/static/responsive.css" />
 <meta name="csrf-token" content="{{ csrf_token() }}" />
 <script src="{{ url_for('static', filename='security.js') }}" defer></script>
+{% include "_notifications.html" %}
 </head>
 <body class="bg-background text-on-background antialiased flex w-full min-h-screen overflow-x-hidden">
 <!-- SideNavBar -->
@@ -525,6 +526,12 @@ function startStatusPolling() {
 }
 
 async function startCameraSession() {
+  if (startButton.disabled) return;
+  startButton.disabled = true;
+  if (!await EggSortAlerts.confirm('Start sorting session?', 'Start the camera and egg sorting hardware?')) {
+    startButton.disabled = false;
+    return;
+  }
   clearCameraError();
   startButton.disabled = true;
   startButton.classList.add('opacity-60', 'cursor-wait');
@@ -536,9 +543,11 @@ async function startCameraSession() {
     const state = await requestJson('/api/camera/start', { method: 'POST' });
     showRunningSession(state.camera, true);
     refreshHardwareState();
+    await EggSortAlerts.success('Sorting session started successfully.');
   } catch (error) {
     showStoppedSession();
     showCameraError(error.message);
+    await EggSortAlerts.error(error.message || 'Unable to start the sorting session.');
   } finally {
     startButton.disabled = false;
     startButton.classList.remove('opacity-60', 'cursor-wait');
@@ -546,6 +555,12 @@ async function startCameraSession() {
 }
 
 async function stopCameraSession() {
+  if (stopButton.disabled) return;
+  stopButton.disabled = true;
+  if (!await EggSortAlerts.confirm('Stop sorting session?', 'Stop the camera and egg sorting hardware?')) {
+    stopButton.disabled = false;
+    return;
+  }
   stopButton.disabled = true;
   stopButton.classList.add('opacity-60', 'cursor-wait');
   statusText.textContent = 'Stopping camera session...';
@@ -553,8 +568,10 @@ async function stopCameraSession() {
     const state = await requestJson('/api/camera/stop', { method: 'POST' });
     showStoppedSession(state.camera);
     refreshHardwareState();
+    await EggSortAlerts.success('Sorting session stopped successfully.');
   } catch (error) {
     showCameraError(error.message);
+    await EggSortAlerts.error(error.message || 'Unable to stop the sorting session.');
   } finally {
     stopButton.disabled = false;
     stopButton.classList.remove('opacity-60', 'cursor-wait');
