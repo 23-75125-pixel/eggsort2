@@ -280,6 +280,12 @@ The link expires in 30 minutes. If you did not request this, ignore this email.
 
 def start_sorting_runtime() -> tuple[dict[str, Any], dict[str, Any]]:
     """Start camera inference and the ESP32 link as one station runtime."""
+    if not app.config["LOCAL_HARDWARE_ENABLED"]:
+        raise CameraSessionError(
+            "Camera and ESP32 controls are available on the sorting computer. "
+            "Run EggSort+ there to operate the machine; use this online dashboard "
+            "to view records and reports."
+        )
     hardware_state = ESP32_BRIDGE.start()
     try:
         camera_state = CAMERA_SESSION.start()
@@ -729,7 +735,7 @@ CAMERA_SESSION.set_capture_handler(save_camera_capture)
 @app.before_request
 def ensure_authenticated_sorting_runtime() -> None:
     """Restore the station runtime for authenticated sessions after restart."""
-    if not app.config["AUTO_START_SORTING_ON_LOGIN"]:
+    if not app.config["LOCAL_HARDWARE_ENABLED"] or not app.config["AUTO_START_SORTING_ON_LOGIN"]:
         return
     if "user_id" not in session:
         return
@@ -1287,13 +1293,16 @@ def dashboard() -> Any:
 def sorting_sessions() -> Any:
     return render_template(
         "sorting_session.html",
-        username=session["username"]
+        username=session["username"],
+        local_hardware_enabled=app.config["LOCAL_HARDWARE_ENABLED"],
     )
 
 
 @app.post("/api/detect")
 @login_required
 def detect() -> Any:
+    if not app.config["LOCAL_HARDWARE_ENABLED"]:
+        return jsonify(error="Image inspection is available on the sorting computer."), 409
     frame = request.files.get("frame")
     if frame is None:
         return jsonify(error="A camera frame is required."), 400
@@ -1312,6 +1321,8 @@ def detect() -> Any:
 @app.post("/api/camera/start")
 @login_required
 def start_camera() -> Any:
+    if not app.config["LOCAL_HARDWARE_ENABLED"]:
+        return jsonify(error="Start the camera and ESP32 from EggSort+ on the sorting computer."), 409
     try:
         camera_state, hardware_state = start_sorting_runtime()
         session.pop("sorting_runtime_auto_start_suppressed", None)
@@ -1328,6 +1339,8 @@ def start_camera() -> Any:
 @app.post("/api/camera/stop")
 @login_required
 def stop_camera() -> Any:
+    if not app.config["LOCAL_HARDWARE_ENABLED"]:
+        return jsonify(error="Stop the camera and ESP32 from EggSort+ on the sorting computer."), 409
     camera_state, hardware_state = stop_sorting_runtime()
     session["sorting_runtime_auto_start_suppressed"] = True
     write_audit_log(

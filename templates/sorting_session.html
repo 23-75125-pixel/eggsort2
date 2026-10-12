@@ -209,9 +209,9 @@
   <div class="w-14 md:w-16 h-14 md:h-16 rounded-2xl bg-surface-container-low flex items-center justify-center mb-4 md:mb-6 border border-surface-variant/50 relative z-10">
     <span class="material-symbols-outlined text-[28px] md:text-[32px] text-primary-container" style="font-variation-settings: 'FILL' 0;">photo_camera</span>
   </div>
-  <h3 class="font-headline-md text-headline-md text-on-surface mb-2 relative z-10">Sorting Session Is Not Running</h3>
-  <p class="font-body-md text-body-md text-secondary max-w-md mx-auto mb-6 md:mb-8 relative z-10">The camera and ESP32 normally start automatically after login. Use this button to restart them if they were stopped.</p>
-  <button id="start-camera" type="button" class="h-12 bg-[#4a7355] hover:bg-primary transition-colors text-white font-button text-button px-5 md:px-8 rounded-lg flex items-center gap-2 shadow-sm relative z-10 w-full md:w-auto justify-center">
+  <h3 class="font-headline-md text-headline-md text-on-surface mb-2 relative z-10">{% if local_hardware_enabled %}Sorting Session Is Not Running{% else %}Operate the Machine on the Sorting Computer{% endif %}</h3>
+  <p class="font-body-md text-body-md text-secondary max-w-md mx-auto mb-6 md:mb-8 relative z-10">{% if local_hardware_enabled %}The camera and ESP32 normally start automatically after login. Use this button to restart them if they were stopped.{% else %}Open EggSort+ on the computer connected to the camera and ESP32 to start or stop sorting. Completed egg records are available here when both apps use the same database.{% endif %}</p>
+  <button id="start-camera" type="button" data-hardware-enabled="{{ 'true' if local_hardware_enabled else 'false' }}" {% if not local_hardware_enabled %}disabled aria-disabled="true"{% endif %} class="h-12 bg-[#4a7355] hover:bg-primary transition-colors text-white font-button text-button px-5 md:px-8 rounded-lg flex items-center gap-2 shadow-sm relative z-10 w-full md:w-auto justify-center disabled:opacity-50 disabled:cursor-not-allowed">
     <span class="material-symbols-outlined text-[20px]">videocam</span>
     Restart Camera &amp; ESP32
   </button>
@@ -580,9 +580,11 @@ async function stopCameraSession() {
 
 startButton.addEventListener('click', startCameraSession);
 stopButton.addEventListener('click', stopCameraSession);
-refreshSessionState(true);
-refreshHardwareState();
-startStatusPolling();
+if (startButton.dataset.hardwareEnabled === 'true') {
+  refreshSessionState(true);
+  refreshHardwareState();
+  startStatusPolling();
+}
 </script>
 </body>
 </html>

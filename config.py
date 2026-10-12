@@ -129,6 +129,10 @@ def build_app_config() -> dict[str, Any]:
     database_url = normalize_database_url(
         env_text("SUPABASE_DB_URL") or env_text("DATABASE_URL")
     )
+    local_hardware_enabled = env_bool(
+        "LOCAL_HARDWARE_ENABLED",
+        not bool(env_text("RENDER") or env_text("RENDER_SERVICE_ID")),
+    )
     config = {
         "SECRET_KEY": secret_key,
         "PERMANENT_SESSION_LIFETIME": timedelta(days=30),
@@ -155,9 +159,10 @@ def build_app_config() -> dict[str, Any]:
         "MAIL_USERNAME": mail_username,
         "MAIL_PASSWORD": env_text("MAIL_PASSWORD").replace(" ", ""),
         "MAIL_FROM": env_text("MAIL_FROM", mail_username),
+        "LOCAL_HARDWARE_ENABLED": local_hardware_enabled,
         "AUTO_START_SORTING_ON_LOGIN": env_bool(
             "AUTO_START_SORTING_ON_LOGIN", True
-        ),
+        ) and local_hardware_enabled,
         "SQLALCHEMY_DATABASE_URI": database_url,
         "SQLALCHEMY_TRACK_MODIFICATIONS": False,
     }

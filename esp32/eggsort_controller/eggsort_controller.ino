@@ -51,10 +51,10 @@ unsigned long rejectOpenedAt = 0;
 #define LOADCELL_OPEN 180
 
 // Higher = slower opening
-#define LOADCELL_OPEN_SPEED 15
+#define LOADCELL_OPEN_SPEED 10
 
 // How long load-cell gate stays open
-#define LOADCELL_OPEN_TIME 3000
+#define LOADCELL_OPEN_TIME 2500
 
 // =====================================================
 // SIZE SERVO RANGE

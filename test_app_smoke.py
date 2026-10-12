@@ -6,7 +6,8 @@ from unittest.mock import patch
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 os.environ["SUPABASE_DB_URL"] = ""
 
-from app import SORTING_RUNTIME_INSTANCE, app
+from app import CameraSessionError, SORTING_RUNTIME_INSTANCE, app, start_sorting_runtime
+from security import CSRF_SESSION_KEY
 
 
 class ApplicationSmokeTests(unittest.TestCase):
@@ -17,7 +18,7 @@ class ApplicationSmokeTests(unittest.TestCase):
     def test_health_check_and_security_headers(self) -> None:
         response = self.client.get("/health")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json(), {"status": "ok"})
+        self.assertEqual(response.get_json(), {"status": "ok", "database": "connected"})
         self.assertEqual(response.headers["X-Frame-Options"], "DENY")
 
     def test_login_page_contains_csrf_integration(self) -> None:
@@ -25,6 +26,47 @@ class ApplicationSmokeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(b'name="csrf-token"', response.data)
         self.assertIn(b"security.js", response.data)
+
+    def test_disabled_hardware_never_starts_camera_or_serial_bridge(self) -> None:
+        with (
+            patch.dict(app.config, {"LOCAL_HARDWARE_ENABLED": False}),
+            patch("app.CAMERA_SESSION.start") as camera,
+            patch("app.ESP32_BRIDGE.start") as hardware,
+        ):
+            with self.assertRaises(CameraSessionError):
+                start_sorting_runtime()
+        camera.assert_not_called()
+        hardware.assert_not_called()
+
+    def test_cloud_camera_requests_return_json_without_loading_detector(self) -> None:
+        staff = SimpleNamespace(
+            id=99, username="staff", email="staff@example.com", display_name="Staff",
+            avatar_url=None, role="staff", is_active=True, password_set=True,
+        )
+        token = "test-csrf-token"
+        with self.client.session_transaction() as session:
+            session["user_id"] = staff.id
+            session[CSRF_SESSION_KEY] = token
+        with (
+            patch.dict(app.config, {
+                "LOCAL_HARDWARE_ENABLED": False, "AUTO_START_SORTING_ON_LOGIN": True,
+            }),
+            patch("app.db.session.get", return_value=staff),
+            patch("app.start_sorting_runtime") as start_runtime,
+            patch("app.stop_sorting_runtime") as stop_runtime,
+            patch("app.detect_frame") as detector,
+        ):
+            for path in ("/api/camera/start", "/api/camera/stop", "/api/detect"):
+                with self.subTest(path=path):
+                    response = self.client.post(path, headers={"X-CSRF-Token": token})
+                    self.assertEqual(response.status_code, 409)
+                    self.assertIn("sorting computer", response.get_json()["error"])
+            page = self.client.get("/sorting-sessions")
+            self.assertIn(b'data-hardware-enabled="false"', page.data)
+            self.assertIn(b'Operate the Machine on the Sorting Computer', page.data)
+        start_runtime.assert_not_called()
+        stop_runtime.assert_not_called()
+        detector.assert_not_called()
 
     def test_unsafe_app_request_requires_csrf_token(self) -> None:
         response = self.client.post("/register")

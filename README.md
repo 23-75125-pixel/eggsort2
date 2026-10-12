@@ -67,3 +67,18 @@ arduino-cli compile --fqbn esp32:esp32:esp32 esp32/eggsort_controller
 
 See `HARDWARE_SETUP.md`, `GOOGLE_AUTH_SETUP.md`, and `SUPABASE_SETUP.md` for
 integration-specific setup.
+
+## Render and the sorting computer
+
+Render hosts the dashboard and reads records from Supabase. Run camera capture,
+YOLO inference, and the USB ESP32 bridge on the computer attached to the machine.
+Set `LOCAL_HARDWARE_ENABLED=0` and `AUTO_START_SORTING_ON_LOGIN=0` on Render.
+Hardware defaults to disabled when Render's environment is detected. The cloud
+Sorting Sessions page explains where to operate the machine, disables restart,
+and skips local hardware polling. Camera start, stop, and inspection requests
+return an explanatory JSON response before loading the detector.
+
+On the sorting computer, keep `LOCAL_HARDWARE_ENABLED=1`, the local model path,
+and the correct camera/serial settings. Configure both apps to use the same
+Supabase database so completed records appear on the online dashboard. This
+configuration does not provide remote camera streaming or machine control.
