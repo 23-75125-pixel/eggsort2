@@ -51,6 +51,27 @@ class RealtimePersistenceFlowTests(unittest.TestCase):
             )
         egg_record.assert_not_called()
 
+    def test_successful_confirmation_persists_record_and_audit_log(self) -> None:
+        with app_module.app.app_context():
+            app_module.EggRecord.query.delete()
+            app_module.AuditLog.query.delete()
+            app_module.TrayAlert.query.delete()
+            app_module.db.session.commit()
+
+        app_module.save_sorted_egg({"type": "sort_complete", "size": "Medium"})
+
+        with app_module.app.app_context():
+            records = app_module.EggRecord.query.all()
+            audits = app_module.AuditLog.query.filter_by(event_type="egg_sorted").all()
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0].size, "Medium")
+            self.assertEqual(records[0].quality, "Good")
+            self.assertEqual(len(audits), 1)
+
+        with app_module.EGG_FLOW_LOCK:
+            self.assertEqual(app_module.EGG_FLOW_STAGE, "waiting_removal")
+            self.assertIsNone(app_module.EGG_FLOW_PENDING)
+
 
 if __name__ == "__main__":
     unittest.main()

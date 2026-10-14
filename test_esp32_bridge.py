@@ -5,6 +5,14 @@ from esp32_bridge import Esp32Bridge, Esp32ProtocolParser
 
 
 class Esp32BridgeDiagnosticsTests(unittest.TestCase):
+    def test_sort_egg_sends_expected_serial_command(self) -> None:
+        bridge = Esp32Bridge()
+        bridge._connected = True
+        bridge._serial = Mock()
+        command = bridge.sort_egg("Large")
+        self.assertEqual(command, "SORT:LARGE")
+        bridge._serial.write.assert_called_once_with(b"SORT:LARGE\n")
+
     def test_reject_waits_for_controller_startup(self) -> None:
         bridge = Esp32Bridge()
         bridge._connected = True
