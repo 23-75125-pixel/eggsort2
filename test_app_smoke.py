@@ -55,10 +55,24 @@ class ApplicationSmokeTests(unittest.TestCase):
             patch("app.start_sorting_runtime") as start_runtime,
             patch("app.stop_sorting_runtime") as stop_runtime,
             patch("app.detect_frame") as detector,
+            patch("app.CAMERA_SESSION.status") as camera_status,
+            patch("app.ESP32_BRIDGE.status") as hardware_status,
         ):
-            for path in ("/api/camera/start", "/api/camera/stop", "/api/detect"):
+            for path in (
+                "/api/camera/start",
+                "/api/camera/stop",
+                "/api/detect",
+                "/api/camera/status",
+                "/api/camera/feed",
+                "/api/hardware/status",
+            ):
                 with self.subTest(path=path):
-                    response = self.client.post(path, headers={"X-CSRF-Token": token})
+                    method = self.client.post if path in {
+                        "/api/camera/start",
+                        "/api/camera/stop",
+                        "/api/detect",
+                    } else self.client.get
+                    response = method(path, headers={"X-CSRF-Token": token})
                     self.assertEqual(response.status_code, 409)
                     self.assertIn("sorting computer", response.get_json()["error"])
             page = self.client.get("/sorting-sessions")
@@ -67,6 +81,8 @@ class ApplicationSmokeTests(unittest.TestCase):
         start_runtime.assert_not_called()
         stop_runtime.assert_not_called()
         detector.assert_not_called()
+        camera_status.assert_not_called()
+        hardware_status.assert_not_called()
 
     def test_unsafe_app_request_requires_csrf_token(self) -> None:
         response = self.client.post("/register")

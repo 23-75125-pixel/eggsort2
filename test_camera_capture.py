@@ -6,6 +6,39 @@ from esp32_bridge import Esp32Bridge
 
 
 class CameraAutoCaptureTests(unittest.TestCase):
+    def test_start_initializes_running_session_with_mocked_dependencies(self) -> None:
+        session = CameraDetectionSession()
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                self._alive = False
+
+            def start(self):
+                self._alive = True
+
+            def is_alive(self):
+                return self._alive
+
+            def join(self, timeout=None):
+                self._alive = False
+
+        with (
+            patch.dict("sys.modules", {"cv2": Mock()}),
+            patch("camera_session.detector_info", return_value={
+                "path": "/tmp/model.pt",
+                "class_count": 3,
+                "classes": ["Crack", "Good", "Rotten"],
+                "confidence": 0.25,
+                "image_size": 512,
+            }),
+            patch("camera_session.Thread", FakeThread),
+        ):
+            state = session.start()
+            self.assertTrue(state["running"])
+            self.assertEqual(state["model"]["class_count"], 3)
+            stopped = session.stop()
+            self.assertFalse(stopped["running"])
+
     def test_rotten_cannot_be_overwritten_by_later_good(self) -> None:
         session = self.make_session()
         for label in ("rotten", "good", "good", "no egg", "no egg"):

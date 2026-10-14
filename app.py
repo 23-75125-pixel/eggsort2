@@ -42,6 +42,7 @@ from detection_service import (
 )
 from extensions import db, oauth
 from models import AuditLog, EggRecord, TrayAlert, TRAY_CAPACITY, User
+from models import PasswordResetAttempt
 from security import AttemptLimiter, init_web_security
 from validation import (
     ValidationError,
@@ -91,6 +92,29 @@ INITIAL_ADMIN_GOOGLE_SUB = app.config["ADMIN_GOOGLE_SUB"]
 INVITE_LIFETIME_HOURS = 24
 INVITE_LIFETIME = timedelta(hours=INVITE_LIFETIME_HOURS)
 PASSWORD_RESET_LIFETIME = timedelta(minutes=30)
+PASSWORD_RESET_WINDOW = timedelta(
+    seconds=env_int("PASSWORD_RESET_WINDOW_SECONDS", 900, minimum=60, maximum=86_400)
+)
+PASSWORD_RESET_MAX_PER_IDENTIFIER = env_int(
+    "PASSWORD_RESET_MAX_PER_IDENTIFIER",
+    3,
+    minimum=1,
+    maximum=50,
+)
+PASSWORD_RESET_MAX_PER_IP = env_int(
+    "PASSWORD_RESET_MAX_PER_IP",
+    20,
+    minimum=1,
+    maximum=500,
+)
+PASSWORD_RESET_COOLDOWN = timedelta(
+    seconds=env_int(
+        "PASSWORD_RESET_COOLDOWN_SECONDS",
+        60,
+        minimum=0,
+        maximum=3_600,
+    )
+)
 MAX_RECORD_RESULTS = 500
 MAX_ALERT_RESULTS = 200
 
@@ -350,6 +374,51 @@ def parse_date_boundary(value: str | None, end: bool = False) -> datetime | None
     parsed_date = datetime.strptime(value, "%Y-%m-%d").date()
     boundary = time.max if end else time.min
     return datetime.combine(parsed_date, boundary, tzinfo=timezone.utc)
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def password_reset_identifier_hash(identifier: str) -> str:
+    normalized = identifier.strip().lower() or "<blank>"
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def password_reset_client_ip() -> str:
+    route = list(request.access_route) if request.access_route else []
+    candidate = route[0] if route else request.remote_addr
+    return (str(candidate or "unknown").strip() or "unknown")[:64]
+
+
+def password_reset_request_is_limited(
+    identifier_hash: str,
+    ip_address: str,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    timestamp = now or datetime.now(timezone.utc)
+    window_start = timestamp - PASSWORD_RESET_WINDOW
+    identifier_count = PasswordResetAttempt.query.filter(
+        PasswordResetAttempt.identifier_hash == identifier_hash,
+        PasswordResetAttempt.created_at >= window_start,
+    ).count()
+    if identifier_count >= PASSWORD_RESET_MAX_PER_IDENTIFIER:
+        return True
+    ip_count = PasswordResetAttempt.query.filter(
+        PasswordResetAttempt.ip_address == ip_address,
+        PasswordResetAttempt.created_at >= window_start,
+    ).count()
+    if ip_count >= PASSWORD_RESET_MAX_PER_IP:
+        return True
+    latest_attempt = (
+        PasswordResetAttempt.query.filter_by(identifier_hash=identifier_hash)
+        .order_by(PasswordResetAttempt.created_at.desc())
+        .first()
+    )
+    if latest_attempt is None:
+        return False
+    return (timestamp - _as_utc(latest_attempt.created_at)) < PASSWORD_RESET_COOLDOWN
 
 
 def create_tray_alert_if_needed(
@@ -865,11 +934,26 @@ def forgot_password() -> Any:
     error = None
     if request.method == "POST":
         email = request.form.get("email", "").strip().lower()
+        now = datetime.now(timezone.utc)
+        identifier_hash = password_reset_identifier_hash(email)
+        client_ip = password_reset_client_ip()
+        limited = password_reset_request_is_limited(
+            identifier_hash,
+            client_ip,
+            now=now,
+        )
+        db.session.add(
+            PasswordResetAttempt(
+                identifier_hash=identifier_hash,
+                ip_address=client_ip,
+                created_at=now,
+            )
+        )
         user = User.query.filter(func.lower(User.email) == email).first() if email else None
-        if user is not None and user.is_active and user.password_set:
+        if not limited and user is not None and user.is_active and user.password_set:
             token = secrets.token_urlsafe(32)
             user.password_reset_token_hash = invite_token_hash(token)
-            user.password_reset_expires_at = datetime.now(timezone.utc) + PASSWORD_RESET_LIFETIME
+            user.password_reset_expires_at = now + PASSWORD_RESET_LIFETIME
             db.session.commit()
             try:
                 send_password_reset(
@@ -878,6 +962,8 @@ def forgot_password() -> Any:
                 )
             except InvitationDeliveryError:
                 app.logger.exception("Password reset email delivery failed")
+        else:
+            db.session.commit()
         session["password_reset_notice"] = (
             "If an active account uses that email, a password reset link has been sent."
         )
@@ -1353,6 +1439,8 @@ def stop_camera() -> Any:
 @app.get("/api/camera/status")
 @login_required
 def camera_status() -> Any:
+    if not app.config["LOCAL_HARDWARE_ENABLED"]:
+        return jsonify(error="Camera status is available on the sorting computer."), 409
     response = jsonify(CAMERA_SESSION.status())
     response.headers["Cache-Control"] = "no-store"
     return response
@@ -1361,6 +1449,8 @@ def camera_status() -> Any:
 @app.get("/api/camera/feed")
 @login_required
 def camera_feed() -> Any:
+    if not app.config["LOCAL_HARDWARE_ENABLED"]:
+        return jsonify(error="Live camera feed is available on the sorting computer."), 409
     if not CAMERA_SESSION.status()["running"]:
         return jsonify(error="No camera session is running."), 409
 
@@ -1397,6 +1487,8 @@ def camera_feed() -> Any:
 @app.get("/api/hardware/status")
 @login_required
 def hardware_status() -> Any:
+    if not app.config["LOCAL_HARDWARE_ENABLED"]:
+        return jsonify(error="Hardware status is available on the sorting computer."), 409
     return jsonify(ESP32_BRIDGE.status())
 
 

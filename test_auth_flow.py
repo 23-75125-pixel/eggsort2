@@ -10,6 +10,7 @@ os.environ["SUPABASE_DB_URL"] = ""
 
 from app import (
     AuditLog,
+    PasswordResetAttempt,
     User,
     app,
     create_staff_invitation,
@@ -17,7 +18,7 @@ from app import (
     invitation_is_valid,
     invite_token_hash,
 )
-from werkzeug.security import check_password_hash
+from werkzeug.security import check_password_hash, generate_password_hash
 
 
 class StaffInvitationFlowTests(unittest.TestCase):
@@ -89,6 +90,7 @@ class StaffInvitationRouteTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         with app.app_context():
+            PasswordResetAttempt.query.delete()
             AuditLog.query.filter(AuditLog.actor == self.email).delete()
             user = db.session.get(User, self.user_id)
             if user is not None:
@@ -167,6 +169,82 @@ class StaffInvitationRouteTests(unittest.TestCase):
         with app.app_context():
             user = db.session.get(User, self.user_id)
             self.assertFalse(user.password_set)
+
+
+class PasswordResetThrottlingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        suffix = secrets.token_hex(6)
+        self.email = f"reset-{suffix}@example.com"
+        app.config.update(TESTING=True, AUTO_START_SORTING_ON_LOGIN=False)
+        with app.app_context():
+            user = User(
+                username=f"reset-{suffix}",
+                ******"ResetPassword123!"),
+                email=self.email,
+                display_name="Reset User",
+                role="staff",
+                is_active=True,
+                password_set=True,
+            )
+            db.session.add(user)
+            db.session.commit()
+            self.user_id = user.id
+            PasswordResetAttempt.query.delete()
+            db.session.commit()
+        self.client = app.test_client()
+
+    def tearDown(self) -> None:
+        with app.app_context():
+            PasswordResetAttempt.query.delete()
+            user = db.session.get(User, self.user_id)
+            if user is not None:
+                db.session.delete(user)
+            db.session.commit()
+
+    @staticmethod
+    def _csrf_token(response) -> str:
+        match = re.search(rb'name="csrf-token" content="([^"]+)"', response.data)
+        if match is None:
+            raise AssertionError("CSRF token was not rendered")
+        return match.group(1).decode("ascii")
+
+    def _forgot_password(self, email: str, environ_overrides: dict | None = None):
+        page = self.client.get("/forgot-password")
+        return self.client.post(
+            "/forgot-password",
+            data={"_csrf_token": self._csrf_token(page), "email": email},
+            environ_overrides=environ_overrides or {},
+        )
+
+    def test_identifier_cooldown_blocks_repeat_reset_email(self) -> None:
+        with patch("app.send_password_reset") as send_password_reset:
+            first = self._forgot_password(self.email)
+            second = self._forgot_password(self.email)
+        self.assertEqual(first.status_code, 302)
+        self.assertEqual(second.status_code, 302)
+        self.assertEqual(send_password_reset.call_count, 1)
+        with app.app_context():
+            self.assertEqual(PasswordResetAttempt.query.count(), 2)
+
+    def test_ip_window_limit_blocks_even_with_zero_cooldown(self) -> None:
+        with (
+            patch("app.PASSWORD_RESET_COOLDOWN", timedelta(seconds=0)),
+            patch("app.PASSWORD_RESET_WINDOW", timedelta(minutes=10)),
+            patch("app.PASSWORD_RESET_MAX_PER_IDENTIFIER", 50),
+            patch("app.PASSWORD_RESET_MAX_PER_IP", 1),
+            patch("app.send_password_reset") as send_password_reset,
+        ):
+            first = self._forgot_password(
+                self.email,
+                environ_overrides={"REMOTE_ADDR": "203.0.113.10"},
+            )
+            second = self._forgot_password(
+                self.email,
+                environ_overrides={"REMOTE_ADDR": "203.0.113.10"},
+            )
+        self.assertEqual(first.status_code, 302)
+        self.assertEqual(second.status_code, 302)
+        self.assertEqual(send_password_reset.call_count, 1)
 
 
 if __name__ == "__main__":
