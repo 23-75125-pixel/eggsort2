@@ -69,6 +69,10 @@
       const response = await fetch(form.action, { method: 'POST', body: new FormData(form) });
       const destination = new URL(response.url, window.location.href);
       if (response.ok && response.redirected && destination.pathname !== path) {
+        if (loggingOut) {
+          window.location.assign(response.url);
+          return;
+        }
         // The redirect response contains the server-confirmed, one-time result.
         // Display it before navigating because rendering the response consumes it.
         const html = new DOMParser().parseFromString(await response.text(), 'text/html');

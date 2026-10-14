@@ -51,21 +51,38 @@ test('invalid login credentials produce an error without navigating', async () =
   assert.equal(form.querySelector().disabled, false);
 });
 
-test('successful logout reports the server result before navigating to login', async () => {
+test('confirmed logout navigates directly to login without a success dialog', async () => {
   const { context, listeners, dialogs } = setup();
   context.FormData = class {};
-  context.DOMParser = class {
-    parseFromString() { return { getElementById: () => ({ textContent: JSON.stringify({ message: 'You have been logged out.' }) }) }; }
+  let requests = 0;
+  context.fetch = async () => {
+    requests++;
+    return { ok: true, redirected: true, url: 'http://localhost/login' };
   };
-  context.fetch = async () => ({ ok: true, redirected: true, url: 'http://localhost/login', text: async () => '' });
   let destination;
   context.window.location.assign = (url) => {
-    assert.equal(dialogs.at(-1).icon, 'success');
     destination = url;
   };
   await listeners.submit({ target: authForm('/logout'), preventDefault() {} });
   assert.equal(destination, 'http://localhost/login');
-  assert.equal(dialogs.at(-1).text, 'You have been logged out.');
+  assert.equal(requests, 1);
+  assert.equal(dialogs.length, 1);
+  assert.equal(dialogs[0].title, 'Log out?');
+});
+
+test('failed logout shows an error and stays on the current page', async () => {
+  const { context, listeners, dialogs } = setup();
+  context.FormData = class {};
+  context.fetch = async () => { throw new Error('Offline'); };
+  let navigated = false;
+  context.window.location.assign = () => { navigated = true; };
+  const form = authForm('/logout');
+  await listeners.submit({ target: form, preventDefault() {} });
+  assert.equal(navigated, false);
+  assert.equal(dialogs.at(-1).icon, 'error');
+  assert.equal(dialogs.at(-1).text, 'Offline');
+  assert.equal(form.querySelector().disabled, false);
+  assert.equal(form.dataset.submitting, undefined);
 });
 
 test('cancel prevents the action and restores the button', async () => {

@@ -32,10 +32,6 @@
           0 20px 25px -5px rgba(0, 0, 0, 0.1),
           0 10px 10px -5px rgba(0, 0, 0, 0.04);
       }
-      .bg-illustration {
-        background:
-          radial-gradient(circle at 70% 30%, rgba(226, 233, 218, 0.9), #fff 62%);
-      }
       /*
        * Landscape split layout.
        * The card is capped at 1080px and its height is driven by the form, so
@@ -49,38 +45,13 @@
            so the card reads as one continuous white surface. */
         background-color: #fff !important;
       }
-      /*
-       * Machine render for the right-hand panel.
-       * The artwork is a wide (3:2) render on a plain white field, so:
-       * - "contain" keeps the whole machine visible; "cover" would crop the
-       *   conveyor ends off inside the panel.
-       * - "multiply" dissolves that white field into the panel gradient, so
-       *   the machine reads as sitting on the panel instead of floating in a
-       *   white rectangle. The aside sets "isolate" to keep the blend local.
-       * - "scale" trims the machine's own built-in white margin so the render
-       *   reads larger in the panel. It only ever crops blank field, and the
-       *   aside clips the overflow. Drop it if the art is ever swapped for
-       *   something that is not shot against white.
-       */
-      .eggsort-machine-image {
-        width: 100%;
-        height: 100%;
-        object-fit: contain;
-        object-position: center;
-        mix-blend-mode: multiply;
-        transform: scale(1.12);
-      }
-      /*
-       * Safety net for images/eggmachine.png: if that file is ever moved,
-       * renamed or missing from the deploy, this artwork fills the panel edge
-       * to edge the way it did before the machine swap.
-       */
-      .eggsort-machine-fallback {
+      .eggsort-background-image {
+        position: absolute;
+        inset: 0;
         width: 100%;
         height: 100%;
         object-fit: cover;
         object-position: center;
-        transform: none;
       }
 
       /*
@@ -273,36 +244,15 @@
       </main>
 
       <aside
-        class="login-art hidden lg:flex lg:w-1/2 relative isolate items-center justify-center overflow-hidden p-4 sm:p-6 lg:p-4 bg-illustration border-l border-gray-100"
+        class="login-art hidden lg:flex lg:w-1/2 relative overflow-hidden border-l border-gray-100"
       >
-        {#
-          Preferred artwork is images/eggmachine.png. If that file is missing
-          the request 404s, so onerror swaps in the original egg background and
-          re-applies "cover" sizing. Keep the fallback so a bad deploy degrades
-          to the original artwork rather than a broken-image icon.
-        #}
         <img
           id="loginArtwork"
-          src="{{ url_for('static', filename='images/eggmachine.png') }}"
-          data-fallback="{{ url_for('static', filename='images/eggbackground.png') }}"
-          alt="EggSort+ automatic egg sorting machine with green conveyor belts and grading trays"
-          class="eggsort-machine-image"
+          src="{{ url_for('static', filename='images/eggbackground.png') }}"
+          alt="Egg with a golden yolk"
+          class="eggsort-background-image"
           decoding="async"
         />
-        <script>
-          (function() {
-            var img = document.getElementById('loginArtwork');
-            if (!img) return;
-            img.addEventListener('error', function() {
-              var fallback = this.getAttribute('data-fallback');
-              if (fallback && this.src !== fallback) {
-                this.src = fallback;
-                this.alt = 'Egg with a golden yolk';
-                this.className = 'eggsort-machine-fallback';
-              }
-            }, { once: true });
-          })();
-        </script>
       </aside>
     </div>
     <script src="{{ url_for('static', filename='password-toggle.js') }}"></script>

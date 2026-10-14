@@ -38,7 +38,7 @@ bool pcaReady = false;
 #define CRACK_OPEN 80
 
 // How long the reject gate stays open
-#define CRACK_GATE_OPEN_TIME 8000
+#define CRACK_GATE_OPEN_TIME 6000
 
 bool rejectGateOpen = false;
 unsigned long rejectOpenedAt = 0;
@@ -48,13 +48,16 @@ unsigned long rejectOpenedAt = 0;
 // =====================================================
 
 #define LOADCELL_CLOSED 305
-#define LOADCELL_OPEN 180
+#define LOADCELL_OPEN 190
 
 // Higher = slower opening
 #define LOADCELL_OPEN_SPEED 10
 
 // How long load-cell gate stays open
 #define LOADCELL_OPEN_TIME 2500
+
+// Commanded position only; this servo has no physical position feedback.
+bool loadCellGateOpen = false;
 
 // =====================================================
 // SIZE SERVO RANGE
@@ -125,7 +128,7 @@ unsigned long rejectOpenedAt = 0;
 
 HX711 scale;
 
-float calibration_factor = 622.0;
+float calibration_factor = 618.0;
 
 #define EGG_THRESHOLD 30
 
@@ -235,6 +238,7 @@ void activateCrackServo() {
 // urgentOnly = false -> lahat ng commands
 //
 // REJECT:CRACK | REJECT:ROTTEN | MEASURE:GOOD | MEASURE:UNDEFINED | STATUS
+// LOADCELL_CLOSE | LOADCELL_TEST (only when no egg cycle is active)
 // =====================================================
 
 void handleSerialCommands(bool urgentOnly) {
@@ -302,9 +306,30 @@ void handleSerialCommands(bool urgentOnly) {
       Serial.println(pcaReady ? "YES" : "NO");
       Serial.println("HX711 READY: YES");
       Serial.print("LOAD CELL GATE: ");
-      Serial.println("CLOSED");
+      Serial.println(loadCellGateOpen ? "OPEN" : "CLOSED");
+      Serial.println("LOAD CELL POSITION: COMMANDED; NO POSITION SENSOR");
       Serial.print("CONTROLLER STATE: ");
       Serial.println(processingEgg ? "SORTING" : (eggDetected ? "WAITING FOR CAMERA" : "READY"));
+      continue;
+    }
+
+    if (command == "LOADCELL_CLOSE" || command == "LOADCELL_TEST") {
+      if (!pcaReady) {
+        Serial.println("LOAD CELL COMMAND REJECTED: PCA9685 NOT FOUND");
+      } else if (processingEgg || eggDetected) {
+        Serial.println("LOAD CELL COMMAND REJECTED: REMOVE EGG AND FINISH CYCLE FIRST");
+      } else if (command == "LOADCELL_CLOSE") {
+        closeLoadCellGate();
+        Serial.print("LOAD CELL CLOSE PWM: ");
+        Serial.println(LOADCELL_CLOSED);
+      } else {
+        Serial.println("LOAD CELL TEST STARTED");
+        if (openLoadCellGate()) {
+          waitWithRejectService(LOADCELL_OPEN_TIME);
+          closeLoadCellGate();
+          Serial.println("LOAD CELL TEST COMPLETE");
+        }
+      }
       continue;
     }
 
@@ -400,6 +425,8 @@ bool openLoadCellGate() {
     LOADCELL_OPEN_SPEED
   );
 
+  loadCellGateOpen = true;
+  Serial.println("LOAD CELL GATE: OPEN");
   return true;
 }
 
@@ -408,6 +435,8 @@ void closeLoadCellGate() {
 
   if (pcaReady) {
     pwm.setPWM(LOADCELL_SERVO, 0, LOADCELL_CLOSED);
+    loadCellGateOpen = false;
+    Serial.println("LOAD CELL GATE: CLOSED");
   }
 }
 
@@ -499,7 +528,7 @@ void finishSizeServo(
 
 void closeAllServos() {
 
-  pwm.setPWM(LOADCELL_SERVO, 0, LOADCELL_CLOSED);
+  closeLoadCellGate();
 
   setServoAngle(CRACK_SERVO, CRACK_CLOSED);
   rejectGateOpen = false;
@@ -706,13 +735,10 @@ void loop() {
     Serial.println();
     Serial.println("SLOW OPEN LOAD CELL GATE");
 
-    moveLoadCellServoSlow(
-      LOADCELL_CLOSED,
-      LOADCELL_OPEN,
-      LOADCELL_OPEN_SPEED
-    );
-
-    Serial.println("LOAD CELL GATE: OPEN");
+    if (!openLoadCellGate()) {
+      processingEgg = false;
+      return;
+    }
 
     // =================================================
     // START TRAVEL TIMER HERE
@@ -769,9 +795,7 @@ void loop() {
     Serial.println();
     Serial.println("CLOSE LOAD CELL GATE");
 
-    pwm.setPWM(LOADCELL_SERVO, 0, LOADCELL_CLOSED);
-
-    Serial.println("LOAD CELL GATE: CLOSED");
+    closeLoadCellGate();
 
     // =================================================
     // SELECT TRAVEL TIME (Large / XL lang)
