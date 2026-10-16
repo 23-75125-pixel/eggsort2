@@ -323,11 +323,25 @@ function setCameraState(active) {
 }
 
 async function requestJson(url, options = {}) {
-  const response = await fetch(url, {
-    credentials: 'same-origin',
-    cache: 'no-store',
-    ...options
-  });
+  const { timeoutMs = 30000, ...fetchOptions } = options;
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  let response;
+  try {
+    response = await fetch(url, {
+      credentials: 'same-origin',
+      cache: 'no-store',
+      signal: controller.signal,
+      ...fetchOptions
+    });
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error('The camera request timed out. Check the sorting computer, then refresh this page.');
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+  }
 
   if (response.redirected) {
     window.location.href = response.url;
@@ -565,11 +579,14 @@ async function stopCameraSession() {
   stopButton.classList.add('opacity-60', 'cursor-wait');
   statusText.textContent = 'Stopping camera session...';
   try {
-    const state = await requestJson('/api/camera/stop', { method: 'POST' });
+    const state = await requestJson('/api/camera/stop', { method: 'POST', timeoutMs: 30000 });
     showStoppedSession(state.camera);
     refreshHardwareState();
     await EggSortAlerts.success('Sorting session stopped successfully.');
   } catch (error) {
+    // Recover the displayed state from the server: the stop may have finished
+    // even when the browser lost the response.
+    await refreshSessionState(false);
     showCameraError(error.message);
     await EggSortAlerts.error(error.message || 'Unable to stop the sorting session.');
   } finally {

@@ -183,6 +183,8 @@ class Esp32Bridge:
         self._error: str | None = None
         self._last_command: str | None = None
         self._last_status_request_at: float | None = None
+        self._runtime_context: dict[str, Any] = {}
+        self._connection_epoch = 0
         self._diagnostics: dict[str, Any] = {
             "hx711_ready": None,
             "pca9685_ready": None,
@@ -205,10 +207,13 @@ class Esp32Bridge:
     def set_event_handler(self, handler: EventHandler) -> None:
         self._handler = handler
 
-    def start(self) -> dict[str, Any]:
+    def start(self, *, context: dict[str, Any] | None = None) -> dict[str, Any]:
         with self._lock:
             if self._running:
                 return self.status()
+            if self._thread and self._thread.is_alive():
+                raise RuntimeError("Previous ESP32 reader has not stopped.")
+            self._runtime_context = dict(context or {})
             self._stop_event.clear()
             self._running = True
             self._error = None
@@ -233,6 +238,8 @@ class Esp32Bridge:
         if thread and thread.is_alive():
             thread.join(timeout=3)
         with self._lock:
+            if thread and thread.is_alive():
+                return self.status()
             self._running = False
             self._connected = False
             self._thread = None
@@ -388,7 +395,7 @@ class Esp32Bridge:
         return candidates[0]
 
     def _read_loop(self) -> None:
-        parser = Esp32ProtocolParser()
+        context = dict(self._runtime_context)
         while not self._stop_event.is_set():
             try:
                 import serial
@@ -399,7 +406,12 @@ class Esp32Bridge:
                     self.baud_rate,
                     timeout=0.5,
                 )
+                parser = Esp32ProtocolParser()
+                # Old buffered lines must not seed a newly connected cycle.
+                connection.reset_input_buffer()
                 with self._lock:
+                    self._connection_epoch += 1
+                    epoch = self._connection_epoch
                     self._serial = connection
                     self._port = port
                     self._connected = True
@@ -407,6 +419,7 @@ class Esp32Bridge:
                     self._diagnostics["pca9685_ready"] = None
                     self._diagnostics["hx711_ready"] = None
                     self._last_status_request_at = None
+                self._publish({"type": "connection_open", "connection_epoch": epoch, **context})
 
                 # Opening a port may attach to an already running ESP32, or
                 # its reset banner may be lost. Do not depend on that banner.
@@ -425,7 +438,7 @@ class Esp32Bridge:
                         continue
                     line = raw.decode("utf-8", errors="replace").strip()
                     for event in parser.parse(line):
-                        self._publish(event)
+                        self._publish({**event, **context, "connection_epoch": epoch})
                         if event.get("type") == "ready":
                             self._request_hardware_status(force=True)
             except Exception as exc:
@@ -433,6 +446,8 @@ class Esp32Bridge:
                     self._connected = False
                     self._serial = None
                     self._error = str(exc)
+                if not self._stop_event.is_set():
+                    self._publish({"type": "connection_lost", **context})
                 if not self._stop_event.wait(2):
                     continue
             finally:

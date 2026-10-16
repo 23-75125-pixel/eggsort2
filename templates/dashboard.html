@@ -405,6 +405,7 @@
             </div>
           </div>
         </div>
+        {% if current_user_role == "admin" %}
         <!-- Audit Logs -->
         <div
           class="bg-white rounded-2xl p-6 glow-effect border border-outline-variant/20 mb-8"
@@ -421,7 +422,6 @@
                 machine sorting events
               </p>
             </div>
-            {% if current_user_role == "admin" %}
             <button
               id="clear-audit-logs"
               type="button"
@@ -430,13 +430,13 @@
               <span class="material-symbols-outlined text-base">delete_sweep</span>
               Clear Logs
             </button>
-            {% endif %}
           </div>
           <div id="dashboard-audit-logs" class="flex flex-col items-center justify-center py-12 text-center">
             <span class="material-symbols-outlined text-4xl text-secondary-fixed-dim mb-4">history</span>
             <p class="font-body-md text-body-md text-secondary">No audit log entries yet.</p>
           </div>
         </div>
+        {% endif %}
       </div>
     </main>
     <script>
@@ -661,10 +661,12 @@
           renderedSections.trend = trendKey;
         }
 
-        const auditKey = JSON.stringify(stats.audit_logs || []);
-        if (auditKey !== renderedSections.audit) {
-          renderAuditLogs(stats.audit_logs || []);
-          renderedSections.audit = auditKey;
+        if (document.getElementById('dashboard-audit-logs')) {
+          const auditKey = JSON.stringify(stats.audit_logs || []);
+          if (auditKey !== renderedSections.audit) {
+            renderAuditLogs(stats.audit_logs || []);
+            renderedSections.audit = auditKey;
+          }
         }
 
         setDashboardStatus('ok', 'Updated ' + new Date().toLocaleTimeString());

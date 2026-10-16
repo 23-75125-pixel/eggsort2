@@ -6,6 +6,15 @@ from esp32_bridge import Esp32Bridge
 
 
 class CameraAutoCaptureTests(unittest.TestCase):
+    def test_stop_releases_camera_before_waiting_for_workers(self) -> None:
+        session = CameraDetectionSession()
+        capture = Mock()
+        session._capture = capture
+
+        session.stop()
+
+        capture.release.assert_called_once_with()
+
     def test_rotten_cannot_be_overwritten_by_later_good(self) -> None:
         session = self.make_session()
         for label in ("rotten", "good", "good", "no egg", "no egg"):
@@ -195,6 +204,8 @@ class CameraAutoCaptureTests(unittest.TestCase):
                 bridge = Esp32Bridge()
                 bridge._connected = True
                 bridge._serial = Mock()
+                # End the simulated loop after the reject command, not during inference.
+                bridge._serial.write.side_effect = lambda _data: session._stop_event.set()
                 bridge._diagnostics["pca9685_ready"] = True
                 session.set_reject_handler(bridge.reject_egg)
                 frame = Mock()
@@ -204,7 +215,6 @@ class CameraAutoCaptureTests(unittest.TestCase):
                 session._raw_sequence = 1
 
                 def detect(_frame):
-                    session._stop_event.set()
                     return {"detections": [{
                         "label": defect, "confidence": 0.9,
                         "box": [40, 40, 60, 60],
