@@ -108,7 +108,11 @@ class SortingLifecycle:
 
     def accepts(self, metadata, *, saving=False):
         with self.condition:
-            states = {"running", "stopping"} if saving else {"running"}
+            # Finish writes already tied to this runtime even if hardware has
+            # failed or the operator stopped the station. This lets queued egg
+            # records drain into their original sorting session before a new
+            # session can start.
+            states = {"running", "stopping", "failed", "interrupted"} if saving else {"running"}
             return bool(self.context and self.context.matches(metadata) and self.state in states)
 
     def start(self, user_id, actor, *, automatic=False):

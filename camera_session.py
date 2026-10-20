@@ -286,21 +286,46 @@ class CameraDetectionSession:
     def wait_for_captured_quality(
         self,
         timeout: float = 1.0,
+        is_current: Callable[[], bool] | None = None,
+        allow_loaded_capture: bool = False,
     ) -> dict[str, Any] | None:
         """Return the oldest center-zone capture for the next load-cell egg."""
         deadline = monotonic() + timeout
         with self._quality_ready:
             while True:
+                if is_current is not None and not is_current():
+                    return None
                 cutoff = monotonic() - self.capture_max_age
-                while (
+                if (
                     self._captured_qualities
                     and self._captured_qualities[0]["captured_at"] < cutoff
                 ):
-                    self._captured_qualities.popleft()
+                    raise CameraSessionError("Unmatched camera capture expired; clear the station before restarting.")
                 if self._captured_qualities:
                     result = dict(self._captured_qualities.popleft())
                     result.pop("captured_at", None)
                     return result
+                # A load-cell egg may remain in the camera zone until its gate
+                # opens. Finish its inspection after the configured Good frames
+                # instead of requiring movement that authorization prevents.
+                required = self.capture_min_samples
+                if (allow_loaded_capture and self._active_capture is not None
+                        and not self._active_capture.get("claimed_on_scale")
+                        and self._passage_defect is None
+                        and self._passage_misses == 0
+                        and len(self._passage_samples) >= required
+                        and all(label == "good" for label, _ in self._passage_samples[-required:])):
+                    capture = self._active_capture
+                    capture["claimed_on_scale"] = True
+                    capture["confidence"] = round(min(
+                        confidence for _, confidence in self._passage_samples[-required:]
+                    ), 4)
+                    self._egg_count += 1
+                    self._quality_counts["good"] += 1
+                    self._last_capture = dict(capture)
+                    # Keep the passage occupied until exit, preventing another
+                    # camera identity for an already inspected, released egg.
+                    return dict(capture)
                 if not self._running or self._error:
                     return None
                 remaining = deadline - monotonic()
@@ -461,6 +486,9 @@ class CameraDetectionSession:
     ) -> dict[str, Any] | None:
         """Capture one egg per zone passage; queue Good eggs on exit."""
         if label in EGG_QUALITY_LABELS:
+            if self._active_capture is not None and self._active_capture.get("claimed_on_scale"):
+                self._passage_misses = 0
+                return None
             if self._active_capture is None:
                 self._active_capture = {
                     **self._runtime_context,
@@ -490,7 +518,9 @@ class CameraDetectionSession:
         self._active_capture = None
         self._passage_defect = None
         self._passage_reject_sent = False
-        if sample_count < self.capture_min_samples:
+        if capture.get("claimed_on_scale"):
+            return None
+        if sample_count < self.capture_min_samples and capture["label"] == "good":
             return None
 
         capture["captured_at"] = monotonic()
@@ -499,6 +529,8 @@ class CameraDetectionSession:
         self._last_capture = dict(capture)
         # Rejected eggs are counted, but never assigned to a load-cell egg.
         if capture["label"] == "good":
+            if len(self._captured_qualities) == self._captured_qualities.maxlen:
+                raise CameraSessionError("Camera capture queue is full; stop and clear the station.")
             self._captured_qualities.append(dict(capture))
         return capture
 

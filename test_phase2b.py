@@ -34,25 +34,112 @@ class BackendLifecycleTests(unittest.TestCase):
         self.lifecycle_patch.start()
         self.addCleanup(self.lifecycle_patch.stop)
         backend.EGG_FLOW_PENDING = None
+        backend.AUTOMATIC_EGG_CYCLES.clear()
+        backend.AUTOMATIC_RECORD_WORKER = None
+        backend.AUTOMATIC_LAST_CYCLE_ID = 0
         backend.reset_egg_flow()
         backend.BRIDGE_EPOCH, backend.BRIDGE_READY = 1, True
+        backend.BRIDGE_AUTO_RELEASE = False
         backend.EGG_FLOW_CONTEXT = dict(self.context)
         self.publish = patch.object(backend.ESP32_BRIDGE, "publish_status")
         self.publish.start()
         self.addCleanup(self.publish.stop)
 
     def tearDown(self):
+        backend.AUTOMATIC_EGG_CYCLES.clear()
+        backend.AUTOMATIC_RECORD_WORKER = None
         backend.EGG_FLOW_PENDING = None
         backend.reset_egg_flow()
         backend.BRIDGE_EPOCH, backend.BRIDGE_READY = None, False
+        backend.BRIDGE_AUTO_RELEASE = False
 
     def pending(self):
         backend.EGG_FLOW_STAGE = "measuring"
         backend.EGG_FLOW_QUALITY = {**self.context, "label": "Good", "confidence": 0.9}
-        backend.queue_sort_after_measurement({"weight_grams": 52})
+        backend.queue_sort_after_measurement({"weight_grams": 52, "size": "Medium"})
+
+    def automatic_cycle(self, cycle_id=1):
+        with patch.object(backend, "Thread"):
+            for kind, fields in (
+                ("egg_detected", {}),
+                ("egg_complete", {"weight_grams": 59, "size": "Large"}),
+                ("sort_complete", {"size": "Large"}),
+                ("egg_left", {}),
+            ):
+                backend.handle_esp32_event(self.event(kind=kind, cycle_id=cycle_id, **fields))
+
+    def test_automatic_release_records_later_without_measure_authorization(self):
+        self.automatic_cycle()
+        capture = {**self.context, "capture_id": 7, "label": "good", "confidence": 0.9}
+        with patch.object(backend.CAMERA_SESSION, "wait_for_captured_quality", return_value=capture), \
+             patch.object(backend, "persist_capture", return_value=101) as save, \
+             patch.object(backend.ESP32_BRIDGE, "measure_egg") as authorize:
+            backend._save_automatic_egg_cycles()
+        authorize.assert_not_called()
+        save.assert_called_once()
+        self.assertEqual(save.call_args.args[0]["capture_id"], 7)
+        self.assertEqual(save.call_args.args[1]["weight_grams"], 59)
+        self.assertFalse(backend.AUTOMATIC_EGG_CYCLES)
+        with patch.object(backend, "Thread") as thread:
+            self.automatic_cycle()
+        self.assertFalse(backend.AUTOMATIC_EGG_CYCLES)
+
+    def test_automatic_weight_without_camera_is_retained_without_invented_quality(self):
+        self.automatic_cycle()
+        with patch.object(backend.CAMERA_SESSION, "wait_for_captured_quality", return_value=None), \
+             patch.object(backend.AUTOMATIC_RECORD_WAKE, "wait",
+                          side_effect=lambda _: setattr(self.lifecycle, "state", "interrupted")), \
+             patch.object(backend, "persist_capture") as save:
+            backend._save_automatic_egg_cycles()
+        save.assert_not_called()
+        self.assertEqual(backend.AUTOMATIC_EGG_CYCLES[(1, 1)]["egg_complete"]["weight_grams"], 59)
+
+    def test_stable_weight_is_not_recorded_before_size_sort_confirmation(self):
+        with patch.object(backend, "Thread"):
+            backend.handle_esp32_event(self.event(kind="egg_detected", cycle_id=1))
+            backend.handle_esp32_event(self.event(kind="egg_complete", cycle_id=1, weight_grams=59, size="Large"))
+        capture = {**self.context, "capture_id": 7, "label": "good", "confidence": 0.9}
+        def wait_for_sort(_):
+            save.assert_not_called()
+            with patch.object(backend, "Thread"):
+                backend.handle_esp32_event(self.event(kind="sort_complete", cycle_id=1, size="Large"))
+        with patch.object(backend.CAMERA_SESSION, "wait_for_captured_quality", return_value=capture), \
+             patch.object(backend.AUTOMATIC_RECORD_WAKE, "wait", side_effect=wait_for_sort), \
+             patch.object(backend, "persist_capture", return_value=101) as save:
+            backend._save_automatic_egg_cycles()
+        save.assert_called_once()
+        self.assertEqual(save.call_args.args[1]["weight_grams"], 59)
+
+    def test_automatic_cycles_match_camera_captures_in_arrival_order(self):
+        self.automatic_cycle(1)
+        self.automatic_cycle(2)
+        captures = [{**self.context, "capture_id": i, "label": "good", "confidence": 0.9}
+                    for i in (7, 9)]
+        with patch.object(backend.CAMERA_SESSION, "wait_for_captured_quality", side_effect=captures), \
+             patch.object(backend, "persist_capture", return_value=101) as save:
+            backend._save_automatic_egg_cycles()
+        self.assertEqual([call.args[0]["capture_id"] for call in save.call_args_list], [7, 9])
+        self.assertEqual([call.args[0]["cycle_id"] for call in save.call_args_list], [1, 2])
 
     def event(self, kind="sort_complete", **fields):
         return {**self.context, "type": kind, "size": "Medium", **fields}
+
+    def test_automatic_handshake_disables_obsolete_camera_authorization(self):
+        with patch.object(backend, "Thread") as worker:
+            backend.handle_esp32_event(self.event(kind="controller_protocol", protocol="EGGSORT_AUTO_V1"))
+            backend.handle_esp32_event(self.event(kind="controller_state", state="WAITING FOR CAMERA"))
+        self.assertTrue(backend.BRIDGE_AUTO_RELEASE)
+        worker.assert_not_called()
+
+    def test_measurement_failure_displays_exact_controller_reason(self):
+        for tagged in (False, True):
+            with self.subTest(tagged=tagged):
+                self.lifecycle.state = "running"
+                fields = {"cycle_id": 1} if tagged else {}
+                backend.handle_esp32_event(self.event(kind="measurement_failed",
+                    reason="LOAD CELL GATE UNAVAILABLE; PCA9685 NOT FOUND AT 0x40", **fields))
+                self.assertEqual(self.lifecycle.state, "failed")
+                self.assertIn("PCA9685 NOT FOUND AT 0x40", backend.ESP32_BRIDGE.publish_status.call_args.args[0])
 
     def test_default_write_gate_remains_closed(self):
         with self.assertRaises(backend.CameraSessionError):
@@ -179,21 +266,153 @@ class BackendLifecycleTests(unittest.TestCase):
     def test_rejected_capture_keeps_original_context(self):
         capture = {**self.context, "label": "crack", "confidence": 0.8}
         with patch.object(backend, "persist_capture", return_value=101) as persist, \
-             patch.object(backend.ESP32_BRIDGE, "publish_camera_capture"):
+             patch.object(backend.ESP32_BRIDGE, "publish_camera_capture"), \
+             patch.object(backend, "Thread"):
             backend.save_camera_capture(capture)
+            backend._save_rejected_captures()
         self.assertEqual(persist.call_args.args[1]["session_ref"], self.context["session_ref"])
         self.assertTrue(persist.call_args.kwargs["rejected"])
+
+    def test_removal_before_confirmation_allows_next_egg_after_save(self):
+        self.pending()
+        backend.handle_esp32_event(self.event(kind="egg_left"))
+        self.assertIsNotNone(backend.EGG_FLOW_PENDING)
+        with patch.object(backend, "persist_capture", return_value=101) as persist:
+            backend.handle_esp32_event(self.event())
+        persist.assert_called_once()
+        self.assertEqual(backend.EGG_FLOW_STAGE, "idle")
+        self.assertIsNone(backend.EGG_FLOW_CONTEXT)
+
+    def test_early_removal_stops_capture_matching(self):
+        backend.EGG_FLOW_STAGE = "inspecting"
+        backend.handle_esp32_event(self.event(kind="egg_left"))
+        self.assertEqual(self.lifecycle.state, "failed")
+        self.assertFalse(backend._flow_is_current(backend.EGG_FLOW_SEQUENCE))
+
+    def test_invalid_weight_or_size_never_creates_pending_record(self):
+        for weight, size in ((-1, "Small"), (0, "Small"), (True, "Small"),
+                             (float("nan"), "Jumbo"), (52, "Large"), (52, None)):
+            with self.subTest(weight=weight, size=size):
+                backend.EGG_FLOW_STAGE = "measuring"
+                backend.EGG_FLOW_QUALITY = {**self.context, "label": "Good", "confidence": 0.9}
+                backend.queue_sort_after_measurement({"weight_grams": weight, "size": size})
+                self.assertIsNone(backend.EGG_FLOW_PENDING)
+
+    def test_rejected_save_failure_retries_same_capture_without_duplicate(self):
+        capture = {**self.context, "label": "crack", "confidence": 0.8}
+        with patch.object(backend, "Thread"), \
+             patch.object(backend, "persist_capture", side_effect=[RuntimeError("offline"), 101]) as persist, \
+             patch.object(backend, "sleep"), \
+             patch.object(backend.app.logger, "exception"):
+            backend.save_camera_capture(capture)
+            backend.save_camera_capture(capture)
+            backend._save_rejected_captures()
+        self.assertEqual(persist.call_count, 2)
+        self.assertEqual(persist.call_args_list[0], persist.call_args_list[1])
+        self.assertFalse(backend.REJECTED_CAPTURES)
+
+    def test_good_camera_capture_does_not_write_before_sort(self):
+        with patch.object(backend, "persist_capture") as persist:
+            backend.save_camera_capture({**self.context, "label": "good", "confidence": 0.8})
+        persist.assert_not_called()
 
     def test_measurement_stage_is_set_before_fast_response(self):
         backend.EGG_FLOW_STAGE = "inspecting"
         capture = {**self.context, "label": "good", "confidence": 0.8}
         def measure(*args, **kwargs):
             self.assertEqual(backend.EGG_FLOW_STAGE, "measuring")
-            backend.queue_sort_after_measurement({"weight_grams": 52})
+            backend.queue_sort_after_measurement({"weight_grams": 52, "size": "Medium", "capture_id": 1})
         with patch.object(backend.CAMERA_SESSION, "wait_for_captured_quality", return_value=capture), \
              patch.object(backend.ESP32_BRIDGE, "measure_egg", side_effect=measure):
             backend._inspect_then_measure(backend.EGG_FLOW_SEQUENCE)
         self.assertEqual(backend.EGG_FLOW_STAGE, "sorting")
+
+    def test_already_loaded_controller_status_recovers_missed_arrival(self):
+        backend.BRIDGE_READY = False
+        backend.EGG_FLOW_STAGE = "idle"
+        with patch.object(backend, "Thread") as worker:
+            backend.handle_esp32_event(self.event(kind="controller_state", state="WAITING FOR CAMERA"))
+            backend.handle_esp32_event(self.event(kind="controller_state", state="WAITING FOR CAMERA"))
+        self.assertTrue(backend.BRIDGE_READY)
+        self.assertEqual(backend.EGG_FLOW_STAGE, "inspecting")
+        worker.assert_called_once()
+
+    def test_visible_good_egg_sends_measure_and_records_only_after_sort(self):
+        from camera_session import CameraDetectionSession
+        from esp32_bridge import Esp32Bridge
+        camera = CameraDetectionSession()
+        camera._runtime_context = dict(self.context)
+        camera._running = True
+        camera.capture_min_samples = 1
+        camera._process_auto_capture("good", 0.9)
+        bridge = Esp32Bridge()
+        bridge._connected = True
+        bridge._serial = Mock()
+        bridge._serial.write.side_effect = lambda _: backend.queue_sort_after_measurement(
+            {"weight_grams": 52, "size": "Medium", "capture_id": 1})
+        backend.EGG_FLOW_STAGE = "inspecting"
+        with patch.object(backend, "CAMERA_SESSION", camera), \
+             patch.object(backend, "ESP32_BRIDGE", bridge), \
+             patch.object(backend, "persist_capture", return_value=101) as persist:
+            backend._inspect_then_measure(backend.EGG_FLOW_SEQUENCE)
+            bridge._serial.write.assert_called_once_with(b"MEASURE:GOOD:1\n")
+            persist.assert_not_called()
+            self.assertEqual(backend.EGG_FLOW_STAGE, "sorting")
+            backend.handle_esp32_event(self.event(capture_id=1))
+            backend.handle_esp32_event(self.event(capture_id=1))
+        persist.assert_called_once()
+        self.assertEqual(persist.call_args.args[1]["quality"], "Good")
+        self.assertEqual(persist.call_args.args[1]["weight_grams"], 52)
+        self.assertEqual(camera.status()["egg_count"], 1)
+
+    def test_stopped_inspection_worker_retries_same_locked_capture(self):
+        backend.EGG_FLOW_STAGE = "inspecting"
+        backend.EGG_FLOW_QUALITY = {**self.context, "label": "Good", "confidence": 0.9}
+        worker = Mock()
+        worker.is_alive.return_value = False
+        backend.EGG_FLOW_INSPECTION_THREAD = worker
+        sequence = backend.EGG_FLOW_SEQUENCE
+        with patch.object(backend, "Thread") as thread:
+            backend.handle_esp32_event(self.event(kind="controller_state", state="WAITING FOR CAMERA"))
+        thread.assert_called_once()
+        self.assertEqual(backend.EGG_FLOW_SEQUENCE, sequence)
+        self.assertEqual(backend.EGG_FLOW_QUALITY["capture_id"], 1)
+
+    def test_retry_uses_locked_capture_instead_of_consuming_next_camera_egg(self):
+        backend.EGG_FLOW_STAGE = "inspecting"
+        backend.EGG_FLOW_QUALITY = {**self.context, "label": "Good", "confidence": 0.9}
+        with patch.object(backend.CAMERA_SESSION, "wait_for_captured_quality") as camera, \
+             patch.object(backend.ESP32_BRIDGE, "measure_egg") as measure:
+            backend._inspect_then_measure(backend.EGG_FLOW_SEQUENCE)
+        camera.assert_not_called()
+        measure.assert_called_once_with("Good", capture_id=1)
+
+    def test_authorization_exception_keeps_capture_available_for_retry(self):
+        backend.EGG_FLOW_STAGE = "measuring"
+        backend.EGG_FLOW_QUALITY = {**self.context, "label": "Good", "confidence": 0.9}
+        with patch.object(backend, "_inspect_then_measure", side_effect=ValueError("failed")), \
+             patch.object(backend.app.logger, "exception"):
+            backend._run_egg_inspection(backend.EGG_FLOW_SEQUENCE)
+        self.assertEqual(backend.EGG_FLOW_STAGE, "inspecting")
+        self.assertEqual(backend.EGG_FLOW_QUALITY["capture_id"], 1)
+
+    def test_other_eggs_weight_and_sort_cannot_complete_pending_capture(self):
+        backend.EGG_FLOW_STAGE = "measuring"
+        backend.EGG_FLOW_QUALITY = {**self.context, "label": "Good", "confidence": 0.9,
+                                    "_requires_capture_id": True}
+        for capture_id in (None, 2):
+            backend.queue_sort_after_measurement({"weight_grams": 52, "size": "Medium",
+                                                 "capture_id": capture_id})
+            self.assertIsNone(backend.EGG_FLOW_PENDING)
+        backend.queue_sort_after_measurement({"weight_grams": 52, "size": "Medium", "capture_id": 1})
+        with patch.object(backend, "persist_capture", return_value=101) as persist:
+            backend.handle_esp32_event(self.event(capture_id=2))
+            persist.assert_not_called()
+            self.assertEqual(backend.EGG_FLOW_PENDING["_capture_id"], 1)
+            backend.handle_esp32_event(self.event(capture_id=1))
+            backend.handle_esp32_event(self.event(capture_id=1))
+        persist.assert_called_once()
+
 
     def test_explicit_unknown_audit_does_not_inherit_request_user(self):
         session = Mock()

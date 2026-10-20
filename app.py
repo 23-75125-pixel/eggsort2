@@ -4,8 +4,8 @@ import smtplib
 from datetime import datetime, time, timedelta, timezone
 from email.message import EmailMessage
 from functools import wraps
-from threading import RLock, Thread
-from time import sleep
+from threading import Event, RLock, Thread
+from time import monotonic, sleep
 from typing import Callable, Any
 from authlib.integrations.base_client.errors import OAuthError
 from joserfc.errors import JoseError
@@ -543,21 +543,33 @@ EGG_FLOW_SEQUENCE = 0
 EGG_FLOW_STAGE = "idle"
 EGG_FLOW_QUALITY: dict[str, Any] | None = None
 EGG_FLOW_PENDING: dict[str, Any] | None = None
+EGG_FLOW_SAVE_WORKER: Thread | None = None
 EGG_FLOW_CONTEXT: dict[str, Any] | None = None
+EGG_FLOW_REMOVED = False
+EGG_FLOW_INSPECTION_THREAD: Thread | None = None
+REJECTED_CAPTURES: dict[tuple[str, int], dict[str, Any]] = {}
+REJECT_SAVE_WORKER: Thread | None = None
+AUTOMATIC_EGG_CYCLES: dict[tuple[int, int], dict[str, Any]] = {}
+AUTOMATIC_RECORD_WORKER: Thread | None = None
+AUTOMATIC_RECORD_WAKE = Event()
+AUTOMATIC_LAST_CYCLE_ID = 0
 BRIDGE_EPOCH: int | None = None
 BRIDGE_READY = False
+BRIDGE_AUTO_RELEASE = False
 
 
 def prepare_station_generation():
-    global BRIDGE_EPOCH, BRIDGE_READY
+    global BRIDGE_EPOCH, BRIDGE_READY, BRIDGE_AUTO_RELEASE, AUTOMATIC_LAST_CYCLE_ID
     with EGG_FLOW_LOCK:
         BRIDGE_EPOCH, BRIDGE_READY = None, False
+        BRIDGE_AUTO_RELEASE = False
+        AUTOMATIC_LAST_CYCLE_ID = 0
         reset_egg_flow()
 
 
 LIFECYCLE = SortingLifecycle(SQLAlchemySessionStore(app, assert_lifecycle_writes_allowed),
     CAMERA_SESSION, ESP32_BRIDGE,
-    incomplete=lambda: bool(EGG_FLOW_PENDING) or EGG_FLOW_STAGE not in {"idle", "waiting_removal"},
+    incomplete=lambda: bool(AUTOMATIC_EGG_CYCLES) or bool(REJECTED_CAPTURES) or bool(EGG_FLOW_PENDING) or EGG_FLOW_STAGE not in {"idle", "waiting_removal"},
     prepare=prepare_station_generation)
 
 
@@ -574,7 +586,7 @@ CAMERA_SESSION.set_lifecycle_handler(camera_lifecycle_event)
 def reset_egg_flow() -> None:
     global EGG_FLOW_SEQUENCE, EGG_FLOW_STAGE
     global EGG_FLOW_QUALITY, EGG_FLOW_PENDING
-    global EGG_FLOW_CONTEXT
+    global EGG_FLOW_CONTEXT, EGG_FLOW_REMOVED, EGG_FLOW_INSPECTION_THREAD
     with EGG_FLOW_LOCK:
         if EGG_FLOW_PENDING is not None:
             # A measured/confirmed egg cannot be discarded by EGG LEFT or stop.
@@ -584,6 +596,8 @@ def reset_egg_flow() -> None:
         EGG_FLOW_QUALITY = None
         EGG_FLOW_PENDING = None
         EGG_FLOW_CONTEXT = None
+        EGG_FLOW_REMOVED = False
+        EGG_FLOW_INSPECTION_THREAD = None
 
 
 def _flow_is_current(
@@ -593,6 +607,7 @@ def _flow_is_current(
     with EGG_FLOW_LOCK:
         return (
             sequence == EGG_FLOW_SEQUENCE
+            and not BRIDGE_AUTO_RELEASE
             and EGG_FLOW_CONTEXT is not None
             and LIFECYCLE.accepts(EGG_FLOW_CONTEXT)
             and (
@@ -603,11 +618,21 @@ def _flow_is_current(
 
 
 def _inspect_then_measure(sequence: int) -> None:
-    """Match the scale egg to the oldest one-shot zone exit capture."""
+    """Match the scale egg to a queued or completed in-place inspection."""
     global EGG_FLOW_STAGE, EGG_FLOW_QUALITY
     context = dict(EGG_FLOW_CONTEXT or {})
     while _flow_is_current(sequence, {"inspecting"}):
-        quality_result = CAMERA_SESSION.wait_for_captured_quality(timeout=1.0)
+        try:
+            with EGG_FLOW_LOCK:
+                locked_quality = dict(EGG_FLOW_QUALITY) if EGG_FLOW_QUALITY else None
+            quality_result = locked_quality or CAMERA_SESSION.wait_for_captured_quality(
+                timeout=1.0, is_current=lambda: _flow_is_current(sequence, {"inspecting"}),
+                allow_loaded_capture=True,
+            )
+        except CameraSessionError as exc:
+            ESP32_BRIDGE.publish_status(str(exc), "flow_error")
+            LIFECYCLE.fail(context)
+            return
         if quality_result is None:
             camera_state = CAMERA_SESSION.status()
             if not camera_state["running"] or camera_state.get("error"):
@@ -627,12 +652,14 @@ def _inspect_then_measure(sequence: int) -> None:
             for key in ("session_ref", "runtime_generation")
         ):
             ESP32_BRIDGE.publish_status("Capture/session mismatch; recovery required.", "flow_error")
+            LIFECYCLE.fail(context)
             return
         captured = {
             **context,
             "label": quality,
             "confidence": float(quality_result["confidence"]),
             "capture_id": quality_result["capture_id"],
+            "_requires_capture_id": True,
         }
         with EGG_FLOW_LOCK:
             if (
@@ -641,6 +668,8 @@ def _inspect_then_measure(sequence: int) -> None:
             ):
                 return
             EGG_FLOW_QUALITY = captured
+        if quality_result.get("claimed_on_scale"):
+            ESP32_BRIDGE.publish_camera_capture(quality_result)
         ESP32_BRIDGE.publish_status(
             f"Egg #{captured['capture_id']} matched: {quality}. "
             "Starting weight measurement."
@@ -650,6 +679,8 @@ def _inspect_then_measure(sequence: int) -> None:
         while _flow_is_current(sequence, {"inspecting"}):
             try:
                 with EGG_FLOW_LOCK:
+                    if BRIDGE_AUTO_RELEASE:
+                        return
                     if (
                         sequence == EGG_FLOW_SEQUENCE
                         and EGG_FLOW_STAGE == "inspecting"
@@ -672,35 +703,60 @@ def _inspect_then_measure(sequence: int) -> None:
                 sleep(1)
 
 
+def _run_egg_inspection(sequence: int) -> None:
+    global EGG_FLOW_STAGE
+    try:
+        _inspect_then_measure(sequence)
+    except Exception:
+        app.logger.exception("Camera-to-load-cell authorization failed")
+        with EGG_FLOW_LOCK:
+            if sequence != EGG_FLOW_SEQUENCE:
+                return
+            if EGG_FLOW_STAGE == "measuring" and EGG_FLOW_PENDING is None:
+                EGG_FLOW_STAGE = "inspecting"
+        ESP32_BRIDGE.publish_status(
+            "Camera authorization failed; the pending egg is retained and controller status will retry.",
+            "flow_error",
+        )
+
+
 def begin_egg_flow() -> None:
     """Match a scale arrival to its already captured rolling inspection."""
     global EGG_FLOW_SEQUENCE, EGG_FLOW_STAGE
     global EGG_FLOW_QUALITY, EGG_FLOW_PENDING
-    global EGG_FLOW_CONTEXT
+    global EGG_FLOW_CONTEXT, EGG_FLOW_REMOVED, EGG_FLOW_INSPECTION_THREAD
     with EGG_FLOW_LOCK:
         context = LIFECYCLE.snapshot()
-        if EGG_FLOW_STAGE != "idle" or not BRIDGE_READY or not LIFECYCLE.accepts(context):
+        if BRIDGE_AUTO_RELEASE or not BRIDGE_READY or not LIFECYCLE.accepts(context):
             return
-        EGG_FLOW_CONTEXT = {**context, "connection_epoch": BRIDGE_EPOCH}
-        EGG_FLOW_SEQUENCE += 1
+        if EGG_FLOW_STAGE == "inspecting":
+            if EGG_FLOW_INSPECTION_THREAD and EGG_FLOW_INSPECTION_THREAD.is_alive():
+                return
+            if not EGG_FLOW_CONTEXT or EGG_FLOW_CONTEXT.get("connection_epoch") != BRIDGE_EPOCH:
+                return
+        elif EGG_FLOW_STAGE == "idle":
+            EGG_FLOW_CONTEXT = {**context, "connection_epoch": BRIDGE_EPOCH}
+            EGG_FLOW_REMOVED = False
+            EGG_FLOW_SEQUENCE += 1
+            EGG_FLOW_STAGE = "inspecting"
+            EGG_FLOW_QUALITY = None
+            EGG_FLOW_PENDING = None
+        else:
+            return
         sequence = EGG_FLOW_SEQUENCE
-        EGG_FLOW_STAGE = "inspecting"
-        EGG_FLOW_QUALITY = None
-        EGG_FLOW_PENDING = None
-    ESP32_BRIDGE.publish_status(
-        "Egg on load cell. Waiting for its one-shot zone exit capture."
-    )
-    Thread(
-        target=_inspect_then_measure,
-        args=(sequence,),
-        name=f"eggsort-inspection-{sequence}",
-        daemon=True,
-    ).start()
+        EGG_FLOW_INSPECTION_THREAD = Thread(
+            target=_run_egg_inspection, args=(sequence,),
+            name=f"eggsort-inspection-{sequence}", daemon=True,
+        )
+        ESP32_BRIDGE.publish_status(
+            "Egg on load cell. Matching its pending Good camera capture."
+        )
+        EGG_FLOW_INSPECTION_THREAD.start()
 
 
 def queue_sort_after_measurement(event: dict[str, Any]) -> None:
-    """Remember the result before the controller confirms its automatic route."""
-    global EGG_FLOW_STAGE, EGG_FLOW_PENDING
+    """Queue a measured egg for persistence as soon as its final weight arrives."""
+    global EGG_FLOW_STAGE, EGG_FLOW_PENDING, EGG_FLOW_SAVE_WORKER
     weight = event.get("weight_grams")
     if weight is None:
         ESP32_BRIDGE.publish_status(
@@ -721,7 +777,20 @@ def queue_sort_after_measurement(event: dict[str, Any]) -> None:
         )
         return
 
+    # This station permits only one legacy measurement at a time, so the
+    # locked camera quality belongs to this physical load-cell cycle. Keep the
+    # final measured weight even if older firmware omits or mis-tags IDs.
+    if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not 30 <= weight <= 1000:
+        ESP32_BRIDGE.publish_status("Invalid final egg weight; recovery required.", "flow_error")
+        return
     size = classify_egg_size(int(weight))
+    if quality_result["label"] != "Good":
+        ESP32_BRIDGE.publish_status("A non-Good camera result reached the load cell; holding for recovery.", "flow_error")
+        return
+    if event.get("size") != size:
+        ESP32_BRIDGE.publish_status(
+            f"Controller size {event.get('size')} differs from the measured {size}; recording measured weight.",
+        )
     pending = {
         "_context": dict(quality_result),
         "_capture_id": quality_result["capture_id"],
@@ -742,8 +811,49 @@ def queue_sort_after_measurement(event: dict[str, Any]) -> None:
 
     ESP32_BRIDGE.publish_status(
         f"Egg #{quality_result['capture_id']}: {weight} g ({size}). "
-        "ESP32 is routing automatically."
+        "Weight confirmed; saving egg record while ESP32 routes it."
     )
+    with EGG_FLOW_LOCK:
+        if EGG_FLOW_SAVE_WORKER is None or not EGG_FLOW_SAVE_WORKER.is_alive():
+            EGG_FLOW_SAVE_WORKER = Thread(
+                target=_retry_measured_egg_save,
+                name=f"eggsort-weight-record-{quality_result['capture_id']}",
+                daemon=True,
+            )
+            EGG_FLOW_SAVE_WORKER.start()
+
+
+def _retry_measured_egg_save() -> None:
+    """Retry a measured Good egg until its idempotent database write succeeds."""
+    global EGG_FLOW_SAVE_WORKER
+    while True:
+        with EGG_FLOW_LOCK:
+            pending = dict(EGG_FLOW_PENDING) if EGG_FLOW_PENDING else None
+            stage = EGG_FLOW_STAGE
+        if pending is None or stage not in {"sorting", "saving"}:
+            with EGG_FLOW_LOCK:
+                EGG_FLOW_SAVE_WORKER = None
+            return
+        context = pending.get("_context", {})
+        lifecycle = LIFECYCLE.snapshot()
+        if (not LIFECYCLE.accepts(context, saving=True)
+                and lifecycle.get("status") != "starting"):
+            # Keep the pending record intact for explicit station recovery.
+            with EGG_FLOW_LOCK:
+                EGG_FLOW_SAVE_WORKER = None
+            return
+        save_sorted_egg({
+            "type": "weight_confirmed",
+            "size": pending["size"],
+            "capture_id": pending.get("_capture_id"),
+        })
+        with EGG_FLOW_LOCK:
+            saved = EGG_FLOW_PENDING is None
+        if saved:
+            with EGG_FLOW_LOCK:
+                EGG_FLOW_SAVE_WORKER = None
+            return
+        sleep(1)
 
 
 def persist_capture(context, payload, *, rejected=False):
@@ -777,7 +887,7 @@ def persist_capture(context, payload, *, rejected=False):
 
 
 def save_sorted_egg(event: dict[str, Any]) -> None:
-    """Persist only after the ESP32 confirms that its servo route completed."""
+    """Persist the pending measured egg; duplicate route events stay idempotent."""
     global EGG_FLOW_STAGE, EGG_FLOW_PENDING
     with EGG_FLOW_LOCK:
         # Moving to "saving" before touching the database makes repeated
@@ -797,7 +907,9 @@ def save_sorted_egg(event: dict[str, Any]) -> None:
         return
 
     confirmed_size = event.get("size")
-    if confirmed_size and confirmed_size != pending["size"]:
+    if (confirmed_size != pending["size"] or
+            (pending.get("_context", {}).get("_requires_capture_id")
+             and event.get("capture_id") != pending["_capture_id"])):
         ESP32_BRIDGE.publish_status(
             "ESP32 route confirmation did not match the measured size; "
             "holding the pending record for recovery.",
@@ -830,13 +942,128 @@ def save_sorted_egg(event: dict[str, Any]) -> None:
         if sequence == EGG_FLOW_SEQUENCE and EGG_FLOW_STAGE == "saving":
             EGG_FLOW_PENDING = None
             EGG_FLOW_STAGE = "waiting_removal"
+            if EGG_FLOW_REMOVED:
+                reset_egg_flow()
     ESP32_BRIDGE.publish_status(
         f"Egg #{capture_id} saved as EGG-{egg_id:06d}." if egg_id is not None else f"Egg #{capture_id} was already recorded."
     )
 
 
+def _save_automatic_egg_cycles() -> None:
+    """FIFO recording is independent of the controller's immediate release."""
+    global AUTOMATIC_RECORD_WORKER
+    while True:
+        with EGG_FLOW_LOCK:
+            if not AUTOMATIC_EGG_CYCLES:
+                AUTOMATIC_RECORD_WORKER = None
+                return
+            key, cycle = next(iter(AUTOMATIC_EGG_CYCLES.items()))
+            context = dict(cycle["context"])
+            capture = cycle.get("capture")
+            measured = cycle.get("egg_complete")
+            sorted_egg = cycle.get("sort_complete")
+            allow_loaded = not cycle.get("egg_left") and key == next(reversed(AUTOMATIC_EGG_CYCLES))
+        if not LIFECYCLE.accepts(context, saving=True):
+            if LIFECYCLE.context and LIFECYCLE.context.matches(context) and LIFECYCLE.snapshot()["status"] == "starting":
+                AUTOMATIC_RECORD_WAKE.wait(0.1)
+                AUTOMATIC_RECORD_WAKE.clear()
+                continue
+            with EGG_FLOW_LOCK:
+                AUTOMATIC_RECORD_WORKER = None
+            return
+        try:
+            if capture is None:
+                capture = CAMERA_SESSION.wait_for_captured_quality(
+                    timeout=0.25, allow_loaded_capture=allow_loaded,
+                    is_current=lambda: LIFECYCLE.accepts(context, saving=True),
+                )
+                if capture is not None:
+                    if (not LIFECYCLE.context.matches(capture)
+                            or str(capture.get("label", "")).lower() != "good"):
+                        raise CameraSessionError("Automatic cycle camera context mismatch; record retained.")
+                    with EGG_FLOW_LOCK:
+                        cycle["capture"] = dict(capture)
+            if capture is None and measured is not None and (
+                    sorted_egg is not None
+                    or monotonic() - cycle.get("detected_at", monotonic()) >= 12.0):
+                # The controller has already weighed and released this egg.
+                # A missed camera callback must not erase that measurement.
+                # Cycle IDs occupy a separate namespace from camera IDs.
+                capture = {
+                    "capture_id": 1_000_000_000_000
+                    + key[0] * 1_000_000 + key[1],
+                    "confidence": 0.0,
+                    "label": "good",
+                }
+                with EGG_FLOW_LOCK:
+                    cycle["capture"] = dict(capture)
+                ESP32_BRIDGE.publish_status(
+                    f"Load-cell cycle #{key[1]} has no camera capture; recording its measured weight."
+                )
+            if capture is None or measured is None:
+                AUTOMATIC_RECORD_WAKE.wait(0.1)
+                AUTOMATIC_RECORD_WAKE.clear()
+                continue
+            weight = measured.get("weight_grams")
+            if (isinstance(weight, bool) or not isinstance(weight, (int, float))
+                    or not 30 <= weight <= 1000):
+                raise CameraSessionError("Automatic cycle has an invalid final load-cell weight; record retained.")
+            measured_size = classify_egg_size(weight)
+            if measured.get("size") != measured_size or (
+                    sorted_egg is not None
+                    and sorted_egg.get("size") != measured_size):
+                ESP32_BRIDGE.publish_status(
+                    f"Load-cell cycle #{key[1]} route size differs; recording size from measured weight."
+                )
+            record_context = {**context, "capture_id": capture["capture_id"]}
+            with LIFECYCLE.persistence(record_context):
+                persist_capture(record_context, dict(
+                    weight_grams=int(weight), size=measured_size, quality="Good",
+                    confidence=float(capture["confidence"]), session_ref=context["session_ref"],
+                ))
+        except CameraSessionError as exc:
+            ESP32_BRIDGE.publish_status(str(exc), "flow_error")
+            LIFECYCLE.fail(context)
+        except Exception:
+            app.logger.exception("Unable to save automatic load-cell cycle")
+            ESP32_BRIDGE.publish_status("Automatic egg record retained; database save will retry.", "flow_error")
+            AUTOMATIC_RECORD_WAKE.wait(1)
+            AUTOMATIC_RECORD_WAKE.clear()
+        else:
+            with EGG_FLOW_LOCK:
+                AUTOMATIC_EGG_CYCLES.pop(key, None)
+            ESP32_BRIDGE.publish_status(
+                f"Camera egg #{capture['capture_id']} recorded for automatic scale cycle #{key[1]}."
+            )
+
+
+def _handle_automatic_egg_event(event: dict[str, Any]) -> None:
+    global AUTOMATIC_RECORD_WORKER, AUTOMATIC_LAST_CYCLE_ID
+    kind = event["type"]
+    if kind not in {"egg_detected", "egg_complete", "sort_complete", "egg_left"}:
+        return
+    key = (event["connection_epoch"], event["cycle_id"])
+    with EGG_FLOW_LOCK:
+        cycle = AUTOMATIC_EGG_CYCLES.get(key)
+        if cycle is None:
+            # Only an arrival can introduce a physical cycle. Delayed duplicate
+            # completion lines cannot create a second camera assignment.
+            if kind != "egg_detected" or event["cycle_id"] <= AUTOMATIC_LAST_CYCLE_ID:
+                return
+            AUTOMATIC_LAST_CYCLE_ID = event["cycle_id"]
+            cycle = {"context": dict(event), "detected_at": monotonic()}
+            AUTOMATIC_EGG_CYCLES[key] = cycle
+        if kind != "egg_detected":
+            cycle.setdefault(kind, dict(event))
+        AUTOMATIC_RECORD_WAKE.set()
+        if AUTOMATIC_RECORD_WORKER is None or not AUTOMATIC_RECORD_WORKER.is_alive():
+            AUTOMATIC_RECORD_WORKER = Thread(target=_save_automatic_egg_cycles,
+                name="eggsort-automatic-records", daemon=True)
+            AUTOMATIC_RECORD_WORKER.start()
+
+
 def handle_esp32_event(event: dict[str, Any]) -> None:
-    global BRIDGE_EPOCH, BRIDGE_READY
+    global BRIDGE_EPOCH, BRIDGE_READY, BRIDGE_AUTO_RELEASE, EGG_FLOW_REMOVED
     if not LIFECYCLE.context or not LIFECYCLE.context.matches(event):
         return
     event_type = event.get("type")
@@ -844,6 +1071,7 @@ def handle_esp32_event(event: dict[str, Any]) -> None:
         with EGG_FLOW_LOCK:
             reconnecting = BRIDGE_EPOCH is not None
             BRIDGE_EPOCH, BRIDGE_READY = event["connection_epoch"], False
+            BRIDGE_AUTO_RELEASE = False
             if reconnecting:
                 # Untagged firmware replies cannot safely resume an interrupted cycle.
                 LIFECYCLE.fail(event)
@@ -853,6 +1081,24 @@ def handle_esp32_event(event: dict[str, Any]) -> None:
         LIFECYCLE.fail(event)
         return
     if event.get("connection_epoch") != BRIDGE_EPOCH:
+        return
+    if event_type == "controller_protocol":
+        BRIDGE_AUTO_RELEASE = event.get("protocol") == "EGGSORT_AUTO_V1"
+        return
+    if event_type == "measurement_failed":
+        reason = str(event.get("reason") or "Unknown controller error")
+        ESP32_BRIDGE.publish_status(f"ESP32 measurement failed: {reason}", "flow_error")
+        LIFECYCLE.fail(event)
+        return
+    if event.get("cycle_id") is not None:
+        if (LIFECYCLE.accepts(event, saving=True)
+                or LIFECYCLE.snapshot()["status"] == "starting"):
+            BRIDGE_READY = True
+            _handle_automatic_egg_event(event)
+        return
+    if event_type == "controller_state" and event.get("state") == "WAITING FOR CAMERA":
+        BRIDGE_READY = True
+        begin_egg_flow()
         return
     if event_type == "ready" or (event_type == "controller_state" and event.get("state") == "READY"):
         BRIDGE_READY = True
@@ -869,27 +1115,68 @@ def handle_esp32_event(event: dict[str, Any]) -> None:
     elif event_type == "sort_complete":
         save_sorted_egg(event)
     elif event_type == "egg_left":
-        reset_egg_flow()
+        with EGG_FLOW_LOCK:
+            EGG_FLOW_REMOVED = True
+            if EGG_FLOW_STAGE in {"inspecting", "measuring"}:
+                ESP32_BRIDGE.publish_status("Egg left before its measurement completed; clear the station before restarting.", "flow_error")
+                LIFECYCLE.fail(event)
+                return
+            reset_egg_flow()
 
 
 ESP32_BRIDGE.set_event_handler(handle_esp32_event)
 CAMERA_SESSION.set_reject_handler(ESP32_BRIDGE.reject_egg)
 
 
-def save_camera_capture(capture: dict[str, Any]) -> None:
-    """Save camera-rejected eggs too; they leave through the reject gate."""
-    quality = str(capture.get("label", "")).strip().lower()
-    if quality in {"crack", "rotten"}:
+def _save_rejected_captures() -> None:
+    """Keep database latency off inference; retain failed writes for retry."""
+    global REJECT_SAVE_WORKER
+    while True:
+        with EGG_FLOW_LOCK:
+            if not REJECTED_CAPTURES:
+                REJECT_SAVE_WORKER = None
+                return
+            key, capture = next(iter(REJECTED_CAPTURES.items()))
+        if not LIFECYCLE.accepts(capture, saving=True):
+            # Captures can finish while the station is still starting. Keep
+            # their durable-in-process queue alive until the same session is
+            # ready, just as the automatic Good-egg recorder does.
+            lifecycle = LIFECYCLE.snapshot()
+            if (LIFECYCLE.context and LIFECYCLE.context.matches(capture)
+                    and lifecycle["status"] == "starting"):
+                sleep(0.1)
+                continue
+            with EGG_FLOW_LOCK:
+                REJECT_SAVE_WORKER = None
+            return
         try:
             with LIFECYCLE.persistence(capture):
-                persist_capture(capture, dict(weight_grams=0, size="N/A", quality=quality.title(),
+                persist_capture(capture, dict(weight_grams=0, size="N/A", quality=capture["label"].title(),
                     confidence=float(capture.get("confidence", 0.0)), session_ref=capture["session_ref"]), rejected=True)
         except Exception:
             app.logger.exception("Unable to persist a camera-rejected egg")
             ESP32_BRIDGE.publish_status(
-                "Camera-rejected egg completed, but saving its record failed.",
+                "Rejected egg record retained; database save will retry.",
                 "flow_error",
             )
+            sleep(1)
+        else:
+            with EGG_FLOW_LOCK:
+                REJECTED_CAPTURES.pop(key, None)
+
+
+def save_camera_capture(capture: dict[str, Any]) -> None:
+    """Immediately enqueue rejected eggs; Good eggs wait for scale and sort."""
+    global REJECT_SAVE_WORKER
+    quality = str(capture.get("label", "")).strip().lower()
+    if quality in {"crack", "rotten"}:
+        with EGG_FLOW_LOCK:
+            key = (capture["session_ref"], capture["capture_id"])
+            REJECTED_CAPTURES.setdefault(key, {**capture, "label": quality})
+            if REJECT_SAVE_WORKER is None:
+                REJECT_SAVE_WORKER = Thread(target=_save_rejected_captures,
+                    name="eggsort-rejected-records", daemon=True)
+                REJECT_SAVE_WORKER.start()
     ESP32_BRIDGE.publish_camera_capture(capture)
 
 

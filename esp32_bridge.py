@@ -33,19 +33,39 @@ class Esp32ProtocolParser:
         r"CAMERA QUALITY\s*:\s*(CRACK|GOOD|ROTTEN)", re.I
     )
     MEASUREMENT_FAILED = re.compile(r"MEASURE FAILED\s*:\s*(.+)", re.I)
+    PROTOCOL = re.compile(r"PROTOCOL\s*:\s*(EGGSORT_AUTO_V1)", re.I)
+    WEIGHT_STABILITY = re.compile(r"WEIGHT STABILITY\s*:\s*(\d+)/(\d+)\s*ms", re.I)
+    CAPTURE_TAG = re.compile(r"^(.*?)\s*;\s*(CAPTURE|CYCLE)\s*:\s*(\d+)$", re.I)
 
     def __init__(self) -> None:
         self.final_weight: int | None = None
+        self.final_capture_id: int | None = None
+        self.final_cycle_id: int | None = None
         self.readings: list[int] = []
 
     def parse(self, line: str) -> list[dict[str, Any]]:
         clean = line.strip()
+        tag = self.CAPTURE_TAG.fullmatch(clean)
+        capture_id = int(tag.group(3)) if tag and tag.group(2).upper() == "CAPTURE" else None
+        cycle_id = int(tag.group(3)) if tag and tag.group(2).upper() == "CYCLE" else None
+        if tag:
+            clean = tag.group(1).strip()
+        identity = {"capture_id": capture_id} if capture_id is not None else {}
+        if cycle_id is not None:
+            identity["cycle_id"] = cycle_id
         if not clean or set(clean) == {"="}:
             return []
 
         lowered = clean.lower()
-        if lowered == "egg sorting ready":
+        protocol = self.PROTOCOL.fullmatch(clean)
+        if protocol:
+            return [{"type": "controller_protocol", "protocol": protocol.group(1).upper(), "message": clean}]
+        if lowered in {"egg sorting ready", "ready for egg", "ready for next egg"}:
             return [{"type": "ready", "message": clean}]
+        stability = self.WEIGHT_STABILITY.fullmatch(clean)
+        if stability:
+            return [{**identity, "type": "weight_stability", "elapsed_ms": int(stability.group(1)),
+                     "required_ms": int(stability.group(2)), "message": clean}]
         hx711_ready = self.HX711_READY.fullmatch(clean)
         if hx711_ready:
             return [{
@@ -103,21 +123,26 @@ class Esp32ProtocolParser:
         measurement_failed = self.MEASUREMENT_FAILED.fullmatch(clean)
         if measurement_failed:
             return [{
+                **identity,
                 "type": "measurement_failed",
                 "reason": measurement_failed.group(1).strip(),
                 "message": clean,
             }]
         if lowered == "egg detected":
             self.final_weight = None
+            self.final_capture_id = None
+            self.final_cycle_id = None
             self.readings = []
-            return [{"type": "egg_detected", "message": clean}]
+            return [{**identity, "type": "egg_detected", "message": clean}]
         if lowered == "egg left":
             # Removal is never treated as a completed measurement. Only the
             # controller's explicit FINAL WEIGHT + SIZE pair may advance an
             # egg to sorting and persistence.
             self.final_weight = None
+            self.final_capture_id = None
+            self.final_cycle_id = None
             self.readings = []
-            return [{"type": "egg_left", "message": clean}]
+            return [{**identity, "type": "egg_left", "message": clean}]
 
         reading = self.READING.fullmatch(clean)
         if reading:
@@ -133,7 +158,10 @@ class Esp32ProtocolParser:
         final_weight = self.FINAL_WEIGHT.fullmatch(clean)
         if final_weight:
             self.final_weight = int(final_weight.group(1))
+            self.final_capture_id = capture_id
+            self.final_cycle_id = cycle_id
             return [{
+                **identity,
                 "type": "final_weight",
                 "weight_grams": self.final_weight,
                 "message": clean,
@@ -142,19 +170,24 @@ class Esp32ProtocolParser:
         size = self.SIZE.fullmatch(clean)
         if size:
             event = {
+                **identity,
                 "type": "egg_complete",
-                "weight_grams": self.final_weight,
+                "weight_grams": self.final_weight if (self.final_capture_id == capture_id
+                                                      and self.final_cycle_id == cycle_id) else None,
                 "size": size.group(1).strip().replace("_", " ").title(),
                 "readings": self.readings.copy(),
                 "message": clean,
             }
             self.final_weight = None
+            self.final_capture_id = None
+            self.final_cycle_id = None
             self.readings = []
             return [event]
 
         sorted_size = self.SORTED.fullmatch(clean)
         if sorted_size:
             return [{
+                **identity,
                 "type": "sort_complete",
                 "size": sorted_size.group(1).strip().replace("_", " ").title(),
                 "message": clean,
@@ -199,6 +232,8 @@ class Esp32Bridge:
             "load_cell_gate_state": None,
             "last_gate_event": None,
             "latest_sensor_event": None,
+            "flow_error": None,
+            "controller_protocol": None,
         }
         self.baud_rate = env_int(
             "ESP32_BAUD_RATE", 115200, minimum=1200, maximum=2_000_000
@@ -285,16 +320,15 @@ class Esp32Bridge:
                 raise RuntimeError(
                     "ESP32 reports PCA9685 not found. Check its power and I2C wiring."
                 )
-            if readiness is None:
-                self._request_hardware_status()
-                raise RuntimeError(
-                    "Requesting ESP32 hardware status; retrying while egg is "
-                    "visible."
-                )
+            # STATUS is ignored by the firmware while its sorting cycle is
+            # busy, but REJECT is explicitly accepted during that cycle. Do
+            # not block an urgent reject on a status reply that may never
+            # arrive until sorting finishes; firmware validates pcaReady for
+            # each reject command itself.
             self._send_command(command)
         self._publish({
             "type": "reject_command", "quality": quality_code.title(),
-            "message": f"{command} sent: channel 0, 10-second hold; skip weighing.",
+            "message": f"{command} sent: channel 0 reject; skip weighing.",
         })
         return command
 
@@ -303,6 +337,10 @@ class Esp32Bridge:
         if quality_code != "GOOD":
             raise ValueError(f"Unsupported egg quality: {quality}")
         command = f"MEASURE:{quality_code}"
+        if capture_id is not None:
+            if isinstance(capture_id, bool) or not isinstance(capture_id, int) or not 1 <= capture_id <= 999999999:
+                raise ValueError("A positive camera capture ID is required.")
+            command += f":{capture_id}"
         self._send_command(command)
         self._publish({
             "type": "measurement_command",
@@ -318,7 +356,9 @@ class Esp32Bridge:
             "type": "camera_capture",
             "capture_id": capture["capture_id"],
             "quality": str(capture["label"]).title(),
-            "message": f"Egg #{capture['capture_id']} exited auto capture zone.",
+            "message": (f"Egg #{capture['capture_id']} inspection completed on load cell."
+                        if capture.get("claimed_on_scale") else
+                        f"Egg #{capture['capture_id']} exited auto capture zone."),
         })
 
     def publish_status(self, message: str, event_type: str = "flow_status") -> None:
@@ -418,6 +458,8 @@ class Esp32Bridge:
                     self._error = None
                     self._diagnostics["pca9685_ready"] = None
                     self._diagnostics["hx711_ready"] = None
+                    self._diagnostics["controller_protocol"] = None
+                    self._diagnostics["automatic_release"] = False
                     self._last_status_request_at = None
                 self._publish({"type": "connection_open", "connection_epoch": epoch, **context})
 
@@ -471,8 +513,18 @@ class Esp32Bridge:
         }
         with self._lock:
             event_type = event.get("type")
+            if event_type == "flow_error":
+                self._diagnostics["flow_error"] = event.get("message")
+                self._diagnostics["latest_sensor_event"] = event.get("message")
+            elif event_type in {"measurement_command", "flow_status"}:
+                self._diagnostics["flow_error"] = None
+                if event_type == "flow_status":
+                    self._diagnostics["latest_sensor_event"] = event.get("message")
             if event_type == "hx711_status":
                 self._diagnostics["hx711_ready"] = event.get("ready")
+            elif event_type == "controller_protocol":
+                self._diagnostics["controller_protocol"] = event.get("protocol")
+                self._diagnostics["automatic_release"] = event.get("protocol") == "EGGSORT_AUTO_V1"
             elif event_type == "pca9685_status":
                 self._diagnostics["pca9685_ready"] = event.get("ready")
             elif event_type == "camera_capture":
@@ -497,11 +549,12 @@ class Esp32Bridge:
                 self._diagnostics["final_weight_grams"] = None
                 self._diagnostics["measurement_quality"] = None
                 self._diagnostics["capture_id"] = None
+                self._diagnostics["automatic_release"] = event.get("cycle_id") is not None
                 self._diagnostics["awaiting_egg"] = False
                 self._diagnostics["load_cell_gate_state"] = None
                 self._diagnostics["last_gate_event"] = None
                 self._diagnostics["latest_sensor_event"] = (
-                    "Egg on load cell; waiting for its zone exit capture"
+                    "Egg on load cell; waiting for a completed camera inspection"
                 )
             elif event_type == "egg_left":
                 self._diagnostics["live_weight_grams"] = None
@@ -528,8 +581,13 @@ class Esp32Bridge:
                         f"{label} - {event.get('quality')} - weighing on load cell"
                     )
             elif event_type == "measurement_failed":
+                self._diagnostics["flow_error"] = f"ESP32: {event.get('reason', 'Unknown measurement failure')}"
                 self._diagnostics["latest_sensor_event"] = (
                     f"ESP32 measurement rejected: {event.get('reason')}"
+                )
+            elif event_type == "weight_stability":
+                self._diagnostics["latest_sensor_event"] = (
+                    f"Stabilizing weight: {event['elapsed_ms'] / 1000:.1f}/{event['required_ms'] / 1000:.1f} s; gate closed"
                 )
             elif event_type == "weight_reading":
                 weight = event.get("weight_grams")
@@ -539,8 +597,10 @@ class Esp32Bridge:
                 # present it as an authorized measurement or open the gate.
                 if self._diagnostics["measurement_quality"] is None:
                     self._diagnostics["latest_sensor_event"] = (
+                        f"Egg on load cell: {weight} g - stabilizing for 1.5 s before gate release"
+                        if self._diagnostics.get("automatic_release") else
                         f"Egg on load cell: {weight} g - waiting for a "
-                        "validated Good auto-capture; gate is locked"
+                        "validated Good camera capture before stable-weight release"
                     )
                 else:
                     self._diagnostics["measurement_weight_grams"] = weight
@@ -554,7 +614,7 @@ class Esp32Bridge:
                     self._diagnostics["latest_sensor_event"] = (
                         f"{label} - {self._diagnostics['measurement_quality']} - "
                         f"reading {event.get('reading_number')}: {weight} g - "
-                        "waiting for 2 consecutive readings"
+                        "waiting for stable weight before release"
                     )
             elif event_type == "final_weight":
                 self._diagnostics["measurement_weight_grams"] = event.get(
@@ -623,6 +683,7 @@ class Esp32Bridge:
             with self._lock:
                 self._events.append(failure)
                 self._diagnostics["latest_sensor_event"] = failure["message"]
+                self._diagnostics["flow_error"] = failure["message"]
 
 
 ESP32_BRIDGE = Esp32Bridge()

@@ -36,6 +36,25 @@ can reset or damage the controller. Use the external servo supply on PCA9685
 Connect the load cell to `E+`, `E-`, `A+`, and `A-` on the HX711 according to
 the load-cell manufacturer's diagram. Wire colors are not standardized.
 
+### ESP32 buzzer for defective eggs
+
+The firmware sounds the buzzer for one second whenever it receives
+`REJECT:CRACK` or `REJECT:ROTTEN` from the camera application.
+
+| ESP32 | Buzzer / driver | Purpose |
+|---|---|---|
+| GPIO `16` | Buzzer positive/input | Buzzer control |
+| `GND` | Buzzer negative/driver ground | Common ground |
+
+GPIO 16 outputs a 2 kHz tone for one second, which supports passive piezo
+buzzers and most active buzzer modules. Connect the buzzer positive/input to
+GPIO 16 and negative/ground to ESP32 GND only if it is rated for direct GPIO
+drive. If it is a bare buzzer or its current rating is unknown, use a
+transistor driver and suitable external buzzer supply; do not draw excessive
+current directly from the GPIO.
+This output is currently reserved for reject alerts; bin-full detection needs
+a separate bin sensor input.
+
 ### ESP32 to PCA9685 logic
 
 | ESP32 | PCA9685 | Purpose |
@@ -78,13 +97,13 @@ power, and orange/yellow/white is signal. Confirm the markings for each servo.
 5. Select **ESP32 Dev Module** (or the exact ESP32 board being used).
 6. Select its COM port and upload.
 7. Open Serial Monitor at **115200 baud**. With the scale empty, reset the
-   ESP32 and confirm that `Egg Sorting Ready` appears.
+   ESP32 and confirm that `TARE COMPLETE` and `READY FOR EGG` appear.
 8. Close Serial Monitor before starting Flask. Only one program can own the
    COM port at a time.
 
-To test every servo without an egg, open Serial Monitor at 115200 baud, set
-the line ending to newline, and send `SERVO_TEST`. The controller moves channel
-1, then channels 0, 5, 2, 4, and 3 in sequence and returns every gate to closed.
+To test the load-cell gate without an egg, open Serial Monitor at 115200 baud,
+set the line ending to newline, and send `LOADCELL_TEST`. Use `CRACK_TEST` for
+the reject gate and `STATUS` for controller diagnostics.
 Stop Flask first so Serial Monitor can open the COM port.
 
 If no port appears, use a known USB data cable and install the driver for the
@@ -125,9 +144,11 @@ From the project folder:
 
 1. Open `http://127.0.0.1:5000` and sign in. A successful login starts the
    camera, YOLO detector, and ESP32 serial bridge automatically. Camera startup
-   loads the file configured by `YOLO_MODEL_PATH` and rejects the session unless
-   its embedded classes are exactly `Crack`, `Good`, and `Rotten` in that
-   order. A frame with no detection is treated as no egg.
+   loads the file configured by `YOLO_MODEL_PATH` and reads its embedded class
+   names directly. The live camera status shows the model's class list. The
+   sorter maps recognized `Crack`, `Good`, and `Rotten` labels to actions;
+   `NoEgg` and other labels remain visible as detections but do not authorize
+   weighing or sorting as Good.
 2. Open **Sorting Sessions** and confirm that **ESP32 link** shows
    `Connected on COM... @ 115200`.
 3. Each egg is captured once when its detection center enters the marked
@@ -135,47 +156,66 @@ From the project folder:
    the zone and increments the session egg count once. The first accepted
    Crack or Rotten detection immediately sends `REJECT:CRACK` or
    `REJECT:ROTTEN`. Channel 0 opens at the camera, before the load cell, holds
-   for 10 seconds, and closes. Repeated frames of the same egg do not restart
-   the timer. A separate rejected egg starts a new 10-second hold.
+   for 6 seconds, and closes. Repeated frames of the same egg do not restart
+   the timer. A separate rejected egg starts a new 6-second hold.
 4. Rejected eggs are counted at zone exit but excluded from the weighing queue,
    even if later frames say Good. They receive no weight or size and do not
-   create a weighed Egg Record. Only an egg whose YOLO bounding-box center is
+   create a weighed Egg Record. Instead, each gets a rejected Egg Record with
+   its camera quality, weight `0` (not weighed), and size `N/A`. Database writes
+   run separately from inference and retry on failure while the session is active.
+   Only an egg whose YOLO bounding-box center is
    inside the centered, egg-sized auto-capture zone can trigger this flow.
    Good passages are queued once after leaving
    the zone. A frame with no detection is never counted as an egg.
-5. When an accepted egg reaches the load cell, its gate stays closed and the ESP32
-   sends `Egg Detected`. Flask matches it to the oldest queued zone exit capture
-   and sends `MEASURE:<QUALITY>` with that capture number retained in diagnostics.
-6. After Flask sends `MEASURE:GOOD`, the ESP32 takes two consecutive identical rounded gram readings and calculates their
-   average as the final weight and size. Each reading averages five HX711
-   conversions for quicker response. The second matching reading automatically
-   triggers sorting; no separate route command is required.
+5. When an egg reaches the load cell at 30 g or above, the ESP32 holds the gate
+   closed until fresh HX711 readings stay within a total 2 g band for 1.5 seconds.
+   A larger change or a sample gap over 500 ms restarts the timer. Removing the
+   egg resets the window. It does not wait for Flask or `MEASURE:GOOD`.
+   Each arrival receives an independent `CYCLE` number for its physical route.
+   Flask matches that cycle to the oldest pending Good camera capture for recording.
+   If the loaded egg remains in the camera zone and there is no older queued
+   egg, `CAMERA_QUALITY_SAMPLES` Good observations complete its inspection in
+   place (default: one observation). The same setting applies to moving and
+   loaded eggs; there is no hidden three-frame requirement.
+   Any defect observed before completion blocks assignment as a Good record.
+   Quality is locked when inspection completes; the same passage cannot be
+   captured again until it exits the zone.
+6. The controller rounds the average of all readings in the stable window to determine size and
+   sort automatically. It samples every available HX711 conversion throughout
+   servo movement and travel waits, including after the load-cell gate closes.
+   `LIVE WEIGHT` telemetry is limited to one message per 100 ms.
 7. The ESP32 opens servo channel 1 (the load-cell gate), waits for the egg's
    travel time, then moves exactly one correct size gate: channel 5 for Small,
    channel 2 for Medium, channel 4 for Large, or channel 3 for Extra Large.
    It then sends `SERVO SORTED : <SIZE>` with
    the measured size so the PC retains the egg's weight, size, and quality.
-8. Only after that hardware confirmation does Flask save one row in Egg
+8. Only after a matching size-route confirmation does Flask save one Good row in Egg
    Records. Dashboard totals update automatically on their next poll.
-9. Duplicate controller messages are ignored until `Egg Left` resets the
-    cycle, so one physical egg cannot create multiple records.
+   Arrival, final-weight, size, sort and removal replies include `; CYCLE:<id>`.
+   Weight and route must belong to the same physical cycle. Good eggs
+   leave the camera queue in arrival order; Crack/Rotten eggs never enter it.
+   If the camera result arrives later, the completed cycle remains pending;
+   recording never invents a Good label from weight alone. Update Flask and
+   upload this firmware together to enable automatic release and cycle matching.
+9. Duplicate cycle events are ignored. Camera captures are assigned once in
+   FIFO order and are saved through the original capture's deduplication key.
 
 Logging out stops both the ESP32 serial bridge and camera session. If an
 operator manually stops the session, **Restart Camera & ESP32** starts it again.
 
-The load-cell gate opens automatically after a stable weight is measured and
-the egg is classified. Every sensor and servo is controlled through this one
+The load-cell gate opens automatically after 1.5 seconds of stable weight,
+independently of camera authorization. Every sensor and servo is controlled through this one
 ESP32.
 
 ## Weight sizes and physical routes
 
 | Saved size | Weight | Physical route |
 |---|---:|---|
-| Small | below 45 g | Small chute, channel 5 |
-| Medium | 45-54 g | Medium chute, channel 2 |
-| Large | 55-62 g | Large chute, channel 4 |
-| Extra Large | 63-69 g | Extra Large chute, channel 3 |
-| Jumbo | 70 g and above | Straight/final chute |
+| Small | below 50 g | Small chute, channel 5 |
+| Medium | 50-55 g | Medium chute, channel 2 |
+| Large | 56-61 g | Large chute, channel 4 |
+| Extra Large | 62-66 g | Extra Large chute, channel 3 |
+| Jumbo | 67 g and above | Straight/final chute |
 
 ## Calibration and mechanical tuning
 
@@ -183,47 +223,51 @@ The crack gate starts closed at `CRACK_CLOSED = 0` degrees. On the camera's
 `REJECT:CRACK` or `REJECT:ROTTEN` command, channel 0 opens immediately to
 `CRACK_OPEN = 80` degrees without waiting for load-cell detection or weighing.
 For both camera qualities, the crack gate stays open for
-`CRACK_GATE_OPEN_TIME = 10000` ms (10 seconds), then receives a direct command
+`CRACK_GATE_OPEN_TIME = 6000` ms (6 seconds), then receives a direct command
 to close to 0 degrees, matching the reference code's closing motion.
 These are starting values: tune the angles and timing to the actual crack
-chute. `SERVO_TEST` also exercises channel 0 without an egg.
+chute. `CRACK_TEST` also exercises channel 0 without an egg.
 
 Upload the updated firmware and restart Flask together: older firmware does
 not understand `REJECT:`. With Flask stopped, send `REJECT:CRACK` or
 `REJECT:ROTTEN` in Serial Monitor (115200 baud, newline) to test channel 0
 without putting an egg on the scale. Expect `CAMERA REJECT`, then
-`REJECT SERVO: OPEN; HOLD 10000 MS`, and `REJECT SERVO: CLOSED` after 10 seconds.
+`REJECT SERVO: OPEN; HOLD 6000 MS`, and `REJECT SERVO: CLOSED` after 6 seconds.
 The timer and reject commands are serviced during normal weighing and size
 gate travel. Camera send failures appear on the sorting page and retry while
 the same egg is visible; rejected eggs are never queued for weighing.
 
-The firmware starts with an HX711 calibration factor of `622.0` until you
-calibrate it for your own load cell. With the scale empty, send `TARE` in
-Serial Monitor and wait for `TARE COMPLETE`. Place a known mass on the scale,
-then send `CALIBRATE:<grams>` (for example, `CALIBRATE:100` for a 100 g mass).
-Wait for `CALIBRATION COMPLETE` and check `LIVE WEIGHT`. The new scale factor
-is saved on the ESP32 and reused after a restart. Remove the mass before
-sorting. Stop Flask while using Serial Monitor so the COM port is available.
+The firmware uses `calibration_factor = 618.0`. Adjust that value in the sketch
+against a known mass and upload again when calibration is needed. On reset it
+tares 25 samples with the scale empty. This sketch has no serial `TARE` or
+`CALIBRATE` commands and does not save calibration in flash. Stop Flask while
+using Serial Monitor so the COM port is available.
 
 All mechanism-specific values are near the top of the firmware:
 
-- `DEFAULT_CALIBRATION_FACTOR` (used only until the first calibration)
+- `calibration_factor`
 - `LOADCELL_CLOSED` and `LOADCELL_OPEN`
-- `LOADCELL_OPEN_SPEED`, `LOADCELL_CLOSE_SPEED`, and
-  `LOADCELL_CLOSE_SETTLE_TIME`
+- `LOADCELL_OPEN_SETTLE_TIME` (250 ms after a direct open command) and `LOADCELL_OPEN_TIME`
 - each size gate's `*_CLOSED` and `*_OPEN` angles
-- `SIZE_GATE_OPEN_TIME`, `SIZE_GATE_CLOSE_DELAY`,
-  `LARGE_SIZE_GATE_CLOSE_DELAY`, `SIZE_CLOSE_SPEED`,
-  `LARGE_SIZE_OPEN_SPEED`, and `LARGE_SIZE_CLOSE_SPEED`
-- `SM_TRAVEL_TIME`, `LARGE_TRAVEL_TIME`, and `EXTRA_LARGE_TRAVEL_TIME`
+- `SIZE_GATE_OPEN_TIME` and `SIZE_CLOSE_SPEED`
+- `SM_TRAVEL_TIME`, `LARGE_TRAVEL_TIME`, and `XL_TRAVEL_TIME`
 
 Disconnect servo power before changing linkages. Tune one gate at a time with
 small angle changes so a servo is not driven against a mechanical stop.
-Channel 1 remains energized at `LOADCELL_CLOSED` after its settling delay so
+Channel 1 remains energized at `LOADCELL_CLOSED` after closing so
 it can hold the next egg. Its available holding torque comes from the external
 5-6 V servo supply; software cannot increase torque beyond the supplied power.
 
 ## Troubleshooting
+
+The controller reports `PROTOCOL: EGGSORT_AUTO_V1` at boot and in every `STATUS`
+reply. Flask uses this handshake to disable obsolete camera authorization
+commands. A late `MEASURE:` command is ignored by automatic firmware.
+The sorting page preserves the exact `MEASURE FAILED` reason, including its
+cycle ID in the serial event, rather than replacing it with a generic failure.
+`SERVO SORTED` is emitted only after the route finishes and scale clearance is
+observed. A clearance timeout retains the incomplete record and keeps servicing
+readings and diagnostics while waiting for the egg to be removed.
 
 - **Access denied on COM port:** close the IDE Serial Monitor and any other
   serial program, then restart the sorting session.

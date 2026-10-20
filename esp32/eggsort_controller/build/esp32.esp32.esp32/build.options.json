@@ -1,0 +1,9 @@
+{
+  "additionalFiles": "..\\..,..\\..",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "",
+  "fqbn": "esp32:esp32:esp32",
+  "hardwareFolders": "C:\\Users\\Lira Angela Ata\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.12,C:\\Users\\Lira Angela Ata\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.12",
+  "otherLibrariesFolders": "C:\\Users\\Lira Angela Ata\\Documents\\Arduino\\libraries",
+  "sketchLocation": "C:\\Users\\Lira Angela Ata\\eggsort2\\eggsortcapstone\\esp32\\eggsort_controller"
+}
