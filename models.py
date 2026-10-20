@@ -129,3 +129,15 @@ class AuditLog(db.Model):
             "description": self.description,
             "created_at": _as_utc(self.created_at).isoformat(),
         }
+
+
+class PasswordResetAttempt(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    identifier_hash = db.Column(db.String(64), nullable=False, index=True)
+    ip_address = db.Column(db.String(64), nullable=False, index=True)
+    created_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        index=True,
+    )

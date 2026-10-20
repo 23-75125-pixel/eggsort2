@@ -12,7 +12,13 @@ from sqlalchemy import inspect, text
 from app import app, db
 
 
-TABLES = ("user", "egg_record", "tray_alert", "audit_log")
+TABLES = (
+    "user",
+    "egg_record",
+    "tray_alert",
+    "audit_log",
+    "password_reset_attempt",
+)
 LOCAL_DATABASE = Path("instance/database.db")
 
 
