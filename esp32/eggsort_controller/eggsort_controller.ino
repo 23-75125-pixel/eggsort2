@@ -60,10 +60,11 @@ unsigned long rejectClosedAt = 0;
 // =====================================================
 
 #define LOADCELL_CLOSED 305
-#define LOADCELL_OPEN 190
+#define LOADCELL_OPEN 175
 
 // Direct movement, then allow the linkage to reach its commanded position.
 #define LOADCELL_OPEN_SETTLE_TIME 250
+#define LOADCELL_OPEN_DELAY_AFTER_WEIGHT 600
 
 // How long load-cell gate stays open
 #define LOADCELL_OPEN_TIME 2500
@@ -154,13 +155,9 @@ float calibration_factor = 618.0;
 bool processingEgg = false;
 bool zeroPrinted = false;
 bool eggDetected = false;
-bool measurementAuthorized = false;
-unsigned long measurementCaptureId = 0;
 unsigned long automaticCycleId = 0;
 const char* controllerFault = nullptr;
 bool scaleInitialized = false;
-bool releasedEggCleared = false;
-bool watchingReleasedEgg = false;
 int latestWeight = 0;
 float latestRawWeight = 0;
 StableWeightWindow stableWeight;
@@ -170,6 +167,42 @@ unsigned long consumedWeightSequence = 0;
 unsigned long lastLiveWeightAt = 0;
 unsigned long lastScaleSampleAt = 0;
 bool scaleFaultReported = false;
+
+// Each measured egg keeps its own release time and cycle ID while the scale
+// starts measuring the next egg. This lets sorter gates run concurrently with
+// weighing instead of blocking the load-cell cycle.
+#define ROUTE_QUEUE_CAPACITY 32
+struct RouteJob {
+  unsigned long cycleId;
+  unsigned long releasedAt;
+  uint8_t size;
+  bool active;
+};
+RouteJob routeJobs[ROUTE_QUEUE_CAPACITY] = {};
+
+struct SizeGateRuntime {
+  uint8_t channel;
+  int openAngle;
+  int closedAngle;
+  const char* name;
+  bool closing;
+  int currentAngle;
+  unsigned long closeAt;
+  unsigned long lastStepAt;
+};
+SizeGateRuntime sizeGates[] = {
+  {SMALL_SERVO, SMALL_OPEN, SMALL_CLOSED, "SMALL", false, SMALL_CLOSED, 0, 0},
+  {MEDIUM_SERVO, MEDIUM_OPEN, MEDIUM_CLOSED, "MEDIUM", false, MEDIUM_CLOSED, 0, 0},
+  {LARGE_SERVO, LARGE_OPEN, LARGE_CLOSED, "LARGE", false, LARGE_CLOSED, 0, 0},
+  {XL_SERVO, XL_OPEN, XL_CLOSED, "EXTRA LARGE", false, XL_CLOSED, 0, 0},
+};
+const size_t SIZE_GATE_COUNT = sizeof(sizeGates) / sizeof(sizeGates[0]);
+bool cycleMeasurementFinalized = false;
+bool loadCellReleasePending = false;
+unsigned long loadCellReleaseDueAt = 0;
+unsigned long loadCellGateCloseAt = 0;
+unsigned long loadCellReleaseCycleId = 0;
+bool cycleHasBeenReleased = false;
 
 // =====================================================
 // FUNCTION PROTOTYPE
@@ -182,10 +215,30 @@ void closeLoadCellGate();
 void updateBuzzer();
 void soundAlertBuzzer();
 void serviceScale();
+void serviceLoadCellCycle();
+void serviceRouteJobs();
+bool sortingWorkPending() {
+  if (processingEgg || loadCellGateOpen || loadCellReleasePending) return true;
+  for (size_t i = 0; i < ROUTE_QUEUE_CAPACITY; ++i) {
+    if (routeJobs[i].active) return true;
+  }
+  for (size_t i = 0; i < SIZE_GATE_COUNT; ++i) {
+    if (sizeGates[i].closing) return true;
+  }
+  return false;
+}
 void printCaptureTag() {
   if (automaticCycleId > 0) {
     Serial.print("; CYCLE:");
     Serial.print(automaticCycleId);
+  }
+  Serial.println();
+}
+
+void printCaptureTagFor(unsigned long cycleId) {
+  if (cycleId > 0) {
+    Serial.print("; CYCLE:");
+    Serial.print(cycleId);
   }
   Serial.println();
 }
@@ -398,7 +451,7 @@ void handleSerialCommands(bool urgentOnly) {
       Serial.println(loadCellGateOpen ? "OPEN" : "CLOSED");
       Serial.println("LOAD CELL POSITION: COMMANDED; NO POSITION SENSOR");
       Serial.print("CONTROLLER STATE: ");
-      Serial.println(controllerFault ? "FAULT" : (processingEgg ? "SORTING" : "READY"));
+      Serial.println(controllerFault ? "FAULT" : (sortingWorkPending() ? "SORTING" : "READY"));
       if (controllerFault) reportMeasurementFailure(controllerFault);
       continue;
     }
@@ -406,7 +459,7 @@ void handleSerialCommands(bool urgentOnly) {
     if (command == "LOADCELL_CLOSE" || command == "LOADCELL_TEST") {
       if (!pcaReady) {
         Serial.println("LOAD CELL COMMAND REJECTED: PCA9685 NOT FOUND");
-      } else if (processingEgg || eggDetected) {
+      } else if (sortingWorkPending() || eggDetected) {
         Serial.println("LOAD CELL COMMAND REJECTED: REMOVE EGG AND FINISH CYCLE FIRST");
       } else if (command == "LOADCELL_CLOSE") {
         closeLoadCellGate();
@@ -575,7 +628,7 @@ void serviceScale() {
     Serial.println("HX711 READY: YES");
     scaleFaultReported = false;
   }
-  if (watchingReleasedEgg && latestWeight < EGG_THRESHOLD) releasedEggCleared = true;
+
   if (millis() - lastLiveWeightAt >= 100) {
     Serial.print("LIVE WEIGHT: ");
     Serial.print(latestWeight);
@@ -758,350 +811,201 @@ void setup() {
 // LOOP
 // =====================================================
 
-void loop() {
+int routeTravelTime(uint8_t eggSize) {
+  if (eggSize == 1 || eggSize == 2) return SM_TRAVEL_TIME;
+  if (eggSize == 3) return LARGE_TRAVEL_TIME;
+  if (eggSize == 4) return XL_TRAVEL_TIME;
+  return 0;
+}
 
-  // Laging i-check ang serial at reject timer
+bool queueRoute(unsigned long cycleId, uint8_t eggSize) {
+  for (size_t i = 0; i < ROUTE_QUEUE_CAPACITY; ++i) {
+    if (!routeJobs[i].active) {
+      routeJobs[i] = {cycleId, 0, eggSize, true};
+      return true;
+    }
+  }
+  controllerFault = "SORT QUEUE FULL; STOP FEEDING EGGS AND RESTART";
+  Serial.print("MEASURE FAILED: ");
+  Serial.print(controllerFault);
+  printCaptureTagFor(cycleId);
+  return false;
+}
+
+void serviceSizeGateClosures() {
+  const unsigned long now = millis();
+  for (size_t i = 0; i < SIZE_GATE_COUNT; ++i) {
+    SizeGateRuntime& gate = sizeGates[i];
+    if (!gate.closing || now - gate.closeAt < SIZE_GATE_OPEN_TIME ||
+        now - gate.lastStepAt < SIZE_CLOSE_SPEED) continue;
+    gate.lastStepAt = now;
+    if (gate.currentAngle < gate.closedAngle) gate.currentAngle++;
+    else if (gate.currentAngle > gate.closedAngle) gate.currentAngle--;
+    setServoAngle(gate.channel, gate.currentAngle);
+    if (gate.currentAngle == gate.closedAngle) {
+      gate.closing = false;
+      Serial.print(gate.name);
+      Serial.println(" SERVO: CLOSED");
+    }
+  }
+}
+
+void serviceRouteJobs() {
+  const unsigned long now = millis();
+  for (size_t i = 0; i < ROUTE_QUEUE_CAPACITY; ++i) {
+    RouteJob& job = routeJobs[i];
+    if (!job.active || job.releasedAt == 0 ||
+        (long)(now - job.releasedAt) < routeTravelTime(job.size)) continue;
+
+    const char* sizeName = job.size == 1 ? "SMALL" : job.size == 2 ? "MEDIUM" :
+      job.size == 3 ? "LARGE" : job.size == 4 ? "EXTRA LARGE" : "JUMBO";
+    if (job.size >= 1 && job.size <= 4) {
+      SizeGateRuntime& gate = sizeGates[job.size - 1];
+      if (!gate.closing && gate.currentAngle != gate.openAngle) {
+        Serial.print("OPENING ");
+        Serial.print(gate.name);
+        Serial.println(" SERVO");
+      }
+      setServoAngle(gate.channel, gate.openAngle);
+      gate.currentAngle = gate.openAngle;
+      gate.closing = true;
+      gate.closeAt = now;
+      gate.lastStepAt = now;
+      Serial.print(gate.name);
+      Serial.println(" EGG ARRIVING");
+    } else {
+      Serial.println("JUMBO GOES STRAIGHT");
+    }
+    Serial.print("SERVO SORTED: ");
+    Serial.print(sizeName);
+    printCaptureTagFor(job.cycleId);
+    job.active = false;
+  }
+  serviceSizeGateClosures();
+}
+
+void serviceLoadCellCycle() {
+  const unsigned long now = millis();
+  if (loadCellReleasePending && (long)(now - loadCellReleaseDueAt) >= 0) {
+    if (!pcaReady) {
+      controllerFault = "LOAD CELL GATE UNAVAILABLE; PCA9685 NOT FOUND AT 0x40";
+      Serial.print("MEASURE FAILED: ");
+      Serial.print(controllerFault);
+      printCaptureTagFor(loadCellReleaseCycleId);
+      loadCellReleasePending = false;
+      return;
+    }
+    pwm.setPWM(LOADCELL_SERVO, 0, LOADCELL_OPEN);
+    loadCellGateOpen = true;
+    cycleHasBeenReleased = true;
+    loadCellGateCloseAt = now + LOADCELL_OPEN_TIME;
+    for (size_t i = 0; i < ROUTE_QUEUE_CAPACITY; ++i) {
+      if (routeJobs[i].active && routeJobs[i].cycleId == loadCellReleaseCycleId) {
+        routeJobs[i].releasedAt = now + LOADCELL_OPEN_SETTLE_TIME;
+        break;
+      }
+    }
+    Serial.println("LOAD CELL GATE: OPEN");
+    Serial.println("EGG RELEASED");
+    Serial.println("TRAVEL TIMER STARTED");
+    loadCellReleasePending = false;
+  }
+  if (loadCellGateOpen && (long)(now - loadCellGateCloseAt) >= 0) {
+    const unsigned long releasedCycleId = loadCellReleaseCycleId;
+    closeLoadCellGate();
+    // The load-cell gate has physically released this egg. Re-arm the scale
+    // now instead of waiting for a zero sample that back-to-back eggs may hide.
+    if (eggDetected && automaticCycleId == releasedCycleId) {
+      Serial.print("EGG LEFT");
+      printCaptureTagFor(releasedCycleId);
+      eggDetected = false;
+      processingEgg = false;
+      cycleMeasurementFinalized = false;
+      cycleHasBeenReleased = false;
+      stableWeight.reset();
+    }
+  }
+}
+
+void loop() {
   handleSerialCommands(false);
   updateRejectServo();
   updateBuzzer();
-
   serviceScale();
-  if (!scaleInitialized || consumedWeightSequence == weightSequence) {
-    delay(1);
-    return;
-  }
-  consumedWeightSequence = weightSequence;
-  int currentWeight = latestWeight;
-
-  // ===================================================
-  // NO EGG
-  // ===================================================
-
-  if (currentWeight < EGG_THRESHOLD) {
-    stableWeight.reset();
-
-    if (!zeroPrinted) {
-      Serial.println("WEIGHT: 0 g");
-      zeroPrinted = true;
-    }
-
-    if (eggDetected) {
-      Serial.print("EGG LEFT");
-      printCaptureTag();
-      eggDetected = false;
-      measurementAuthorized = false;
-      measurementCaptureId = 0;
-    }
-
-    delay(1);
-
-    return;
-  }
-
-  // ===================================================
-  // EGG DETECTED
-  // ===================================================
-
-  zeroPrinted = false;
-
-  if (!eggDetected) {
-    eggDetected = true;
-    measurementAuthorized = false;
-    measurementCaptureId = 0;
-    automaticCycleId++;
-    Serial.print("EGG DETECTED");
-    printCaptureTag();
-  }
-
-  Serial.print("WEIGHT: ");
-  Serial.print(currentWeight);
-  Serial.println(" g");
-
-  // ===================================================
-  // STABLE WEIGHT FOR 1.5 SECONDS
-  // ===================================================
-
-  // Restart the hold if weight changes or ADC samples stop. Final weight is
-  // the average of the complete stable window, not a transient first reading.
-  const bool weightReady = stableWeight.add(latestRawWeight, millis());
-  if (!weightReady && millis() - lastStabilityReportAt >= 250) {
-    Serial.print("WEIGHT STABILITY: ");
-    Serial.print(stableWeight.elapsed(millis()));
-    Serial.print("/1500 ms");
-    printCaptureTag();
-    lastStabilityReportAt = millis();
-  }
-  if (weightReady && !processingEgg && !controllerFault) {
-
-    processingEgg = true;
-
-    int finalWeight = round(stableWeight.average());
-    int eggSize = 0;
-
-    Serial.println();
-    Serial.println("================================");
-
-    Serial.print("FINAL WEIGHT: ");
-    Serial.print(finalWeight);
-    Serial.print(" g");
-    printCaptureTag();
-
-    // =================================================
-    // CLASSIFICATION
-    // =================================================
-
-    if (finalWeight < 50) {
-
-      eggSize = 1;
-      Serial.print("SIZE: SMALL");
-      printCaptureTag();
-
-    } else if (finalWeight <= 55) {
-
-      eggSize = 2;
-      Serial.print("SIZE: MEDIUM");
-      printCaptureTag();
-
-    } else if (finalWeight <= 61) {
-
-      eggSize = 3;
-      Serial.print("SIZE: LARGE");
-      printCaptureTag();
-
-    } else if (finalWeight <= 66) {
-
-      eggSize = 4;
-      Serial.print("SIZE: EXTRA LARGE");
-      printCaptureTag();
-
-    } else {
-
-      eggSize = 5;
-      Serial.print("SIZE: JUMBO");
-      printCaptureTag();
-    }
-
-    Serial.println("================================");
-
-    // =================================================
-    // OPEN LOAD-CELL GATE IMMEDIATELY
-    // =================================================
-
-    Serial.println();
-    Serial.println("OPEN LOAD CELL GATE");
-
-    releasedEggCleared = false;
-    watchingReleasedEgg = true;
-    if (!openLoadCellGate()) {
-      watchingReleasedEgg = false;
-      measurementAuthorized = false;
-      reportMeasurementFailure("LOAD CELL GATE UNAVAILABLE; PCA9685 NOT FOUND AT 0x40");
-      // Latch the failed cycle until reset; do not repeatedly release/count it.
-      return;
-    }
-
-    // =================================================
-    // START TRAVEL TIMER HERE
-    // =================================================
-
-    unsigned long travelStart = millis();
-    unsigned long sizeOpenedAt = 0;
-
-    Serial.println("EGG RELEASED");
-    Serial.println("TRAVEL TIMER STARTED");
-
-    // =================================================
-    // KEEP LOAD-CELL GATE OPEN
-    // Para sa Small/Medium: bubuksan ang size servo
-    // habang bukas pa ang load-cell gate
-    // =================================================
-
-    if (eggSize == 1 || eggSize == 2) {
-
-      // Hintayin ang S/M travel time (2 seconds)
-      while (millis() - travelStart < SM_TRAVEL_TIME) {
-        waitWithRejectService(10);
-      }
-
-      // Buksan agad ang size servo
-      Serial.println();
-
-      if (eggSize == 1) {
-        Serial.println("SMALL EGG ARRIVING");
-        Serial.println("OPENING SMALL SERVO");
-        setServoAngle(SMALL_SERVO, SMALL_OPEN);
-      } else {
-        Serial.println("MEDIUM EGG ARRIVING");
-        Serial.println("OPENING MEDIUM SERVO");
-        setServoAngle(MEDIUM_SERVO, MEDIUM_OPEN);
-      }
-
-      sizeOpenedAt = millis();
-
-      // Tapusin ang natitirang load-cell open time
-      while (millis() - travelStart < LOADCELL_OPEN_TIME) {
-        waitWithRejectService(10);
-      }
-
-    } else {
-
-      waitWithRejectService(LOADCELL_OPEN_TIME);
-    }
-
-    // =================================================
-    // FAST CLOSE LOAD-CELL GATE
-    // =================================================
-
-    Serial.println();
-    Serial.println("CLOSE LOAD CELL GATE");
-
-    closeLoadCellGate();
-
-    // =================================================
-    // SELECT TRAVEL TIME (Large / XL lang)
-    // =================================================
-
-    unsigned long selectedTravelTime = 0;
-
-    if (eggSize == 3) {
-
-      // LARGE
-      selectedTravelTime = LARGE_TRAVEL_TIME;
-
-      Serial.println();
-      Serial.println("LARGE TRAVEL TIME: 8.7 SECONDS");
-
-    } else if (eggSize == 4) {
-
-      // EXTRA LARGE
-      selectedTravelTime = XL_TRAVEL_TIME;
-
-      Serial.println();
-      Serial.println("XL TRAVEL TIME: 8.5 SECONDS");
-    }
-
-    // =================================================
-    // WAIT UNTIL TRAVEL TIME IS REACHED
-    // =================================================
-
-    if (selectedTravelTime > 0) {
-
-      Serial.println("EGG TRAVELLING...");
-
-      while (millis() - travelStart < selectedTravelTime) {
-        waitWithRejectService(10);
-      }
-
-      Serial.println("TRAVEL TIME REACHED");
-    }
-
-    // =================================================
-    // SMALL
-    // =================================================
-
-    if (eggSize == 1) {
-
-      finishSizeServo(SMALL_SERVO, SMALL_OPEN, SMALL_CLOSED, "SMALL", sizeOpenedAt);
-    }
-
-    // =================================================
-    // MEDIUM
-    // =================================================
-
-    else if (eggSize == 2) {
-
-      finishSizeServo(MEDIUM_SERVO, MEDIUM_OPEN, MEDIUM_CLOSED, "MEDIUM", sizeOpenedAt);
-    }
-
-    // =================================================
-    // LARGE
-    // =================================================
-
-    else if (eggSize == 3) {
-
-      activateSizeServo(LARGE_SERVO, LARGE_OPEN, LARGE_CLOSED, "LARGE");
-    }
-
-    // =================================================
-    // EXTRA LARGE
-    // =================================================
-
-    else if (eggSize == 4) {
-
-      activateSizeServo(XL_SERVO, XL_OPEN, XL_CLOSED, "EXTRA LARGE");
-    }
-
-    // =================================================
-    // JUMBO
-    // =================================================
-
-    else if (eggSize == 5) {
-
-      Serial.println();
-      Serial.println("JUMBO EGG");
-      Serial.println("NO SIZE SERVO ACTION");
-      Serial.println("JUMBO GOES STRAIGHT");
-    }
-
-    const char* completedSize = eggSize == 1 ? "SMALL" :
-      eggSize == 2 ? "MEDIUM" : eggSize == 3 ? "LARGE" :
-      eggSize == 4 ? "EXTRA LARGE" : "JUMBO";
-
-    // =================================================
-    // CHECK LOAD CELL
-    // =================================================
-
-    Serial.println();
-    Serial.println("CHECKING LOAD CELL...");
-
-    unsigned long clearWaitStarted = millis();
-    bool releaseTimedOut = false;
-    while (!releasedEggCleared) {
-      waitWithRejectService(1);
-      if (!releaseTimedOut && millis() - clearWaitStarted >= 10000) {
-        reportMeasurementFailure("RELEASE NOT CLEARED; CHECK SCALE OR BLOCKED EGG");
-        releaseTimedOut = true;
-      }
-    }
-    watchingReleasedEgg = false;
-    if (!releaseTimedOut) {
-      Serial.print("SERVO SORTED: ");
-      Serial.print(completedSize);
-      printCaptureTag();
-    }
-
-    // =================================================
-    // RESET
-    // =================================================
-
-    Serial.println();
-    Serial.println("NO EGG DETECTED");
-    Serial.println("LOAD CELL IS CLEAR");
-
-    // Emit the cycle boundary here, while the cleared scale reading is known.
-    // The next egg may arrive before loop() gets another below-threshold read.
-    if (eggDetected) {
-      Serial.print("EGG LEFT");
-      printCaptureTag();
-      eggDetected = false;
-    }
-    measurementAuthorized = false;
-    measurementCaptureId = 0;
-
-    processingEgg = false;
-    stableWeight.reset();
-
-    zeroPrinted = false;
-
-    Serial.println();
-    Serial.println("--------------------------------");
-    Serial.println("READY FOR NEXT EGG");
-    Serial.println("--------------------------------");
-
-    // Resume the next load-cell detection immediately. A long cooldown here
-    // can skip the brief clear interval between consecutive roller-fed eggs.
+  if (scaleInitialized && consumedWeightSequence != weightSequence) {
     consumedWeightSequence = weightSequence;
+    const int currentWeight = latestWeight;
+    const unsigned long now = millis();
+
+    if (currentWeight < EGG_THRESHOLD) {
+      stableWeight.reset();
+      if (!zeroPrinted) {
+        Serial.println("WEIGHT: 0 g");
+        zeroPrinted = true;
+      }
+      if (eggDetected && cycleHasBeenReleased) {
+        Serial.print("EGG LEFT");
+        printCaptureTag();
+        eggDetected = false;
+        processingEgg = false;
+        cycleMeasurementFinalized = false;
+        cycleHasBeenReleased = false;
+      }
+    } else {
+      zeroPrinted = false;
+      if (!eggDetected) {
+        eggDetected = true;
+        processingEgg = true;
+        cycleMeasurementFinalized = false;
+        cycleHasBeenReleased = false;
+        automaticCycleId++;
+        Serial.print("EGG DETECTED");
+        printCaptureTag();
+      }
+      Serial.print("WEIGHT: ");
+      Serial.print(currentWeight);
+      Serial.println(" g");
+
+      if (!cycleMeasurementFinalized) {
+        const bool weightReady = stableWeight.add(latestRawWeight, now);
+        if (!weightReady && now - lastStabilityReportAt >= 250) {
+          Serial.print("WEIGHT STABILITY: ");
+          Serial.print(stableWeight.elapsed(now));
+          Serial.print("/1000 ms");
+          printCaptureTag();
+          lastStabilityReportAt = now;
+        }
+        if (weightReady && !controllerFault) {
+          const unsigned long cycleId = automaticCycleId;
+          const int finalWeight = round(stableWeight.average());
+          const uint8_t eggSize = finalWeight < 50 ? 1 : finalWeight <= 55 ? 2 :
+            finalWeight <= 61 ? 3 : finalWeight <= 66 ? 4 : 5;
+          const char* sizeName = eggSize == 1 ? "SMALL" : eggSize == 2 ? "MEDIUM" :
+            eggSize == 3 ? "LARGE" : eggSize == 4 ? "EXTRA LARGE" : "JUMBO";
+
+          if (!queueRoute(cycleId, eggSize)) {
+            cycleMeasurementFinalized = true;
+            return;
+          }
+
+          Serial.print("FINAL WEIGHT: ");
+          Serial.print(finalWeight);
+          Serial.print(" g");
+          printCaptureTagFor(cycleId);
+          Serial.print("SIZE: ");
+          Serial.print(sizeName);
+          printCaptureTagFor(cycleId);
+          cycleMeasurementFinalized = true;
+          loadCellReleaseCycleId = cycleId;
+          loadCellReleaseDueAt = now + LOADCELL_OPEN_DELAY_AFTER_WEIGHT;
+          loadCellReleasePending = true;
+          Serial.println("LOAD CELL WEIGHT CONFIRMED; GATE OPENS IN 1 SECOND");
+        }
+      }
+    }
   }
 
+  serviceLoadCellCycle();
+  serviceRouteJobs();
   delay(1);
 }

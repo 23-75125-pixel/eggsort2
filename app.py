@@ -535,30 +535,10 @@ def backfill_completed_tray_alerts() -> None:
         db.session.commit()
 
 
-def backfill_sorting_audit_logs() -> None:
-    created = False
-    for record in EggRecord.query.order_by(EggRecord.id.asc()).all():
-        log = write_audit_log(
-            "egg_sorted",
-            (
-                f"{record.to_dict()['egg_id']} sorted at {record.weight_grams} g "
-                f"as {record.size}, quality {record.quality}."
-            ),
-            event_key=f"egg-sorted:{record.id}",
-            user_id=None,
-            created_at=record.sorted_at,
-            commit=False,
-        )
-        created = created or log is not None
-    if created:
-        db.session.commit()
-
-
 with app.app_context():
     if not (app.config["LOCAL_TEST_MODE"] or app.config["PHASE2B_WRITE_TEST_MODE"]
             or app.config["EGGSOR_PRODUCTION_DB_MODE"]):
         backfill_completed_tray_alerts()
-        backfill_sorting_audit_logs()
 
 
 EGG_FLOW_LOCK = RLock()
@@ -1966,14 +1946,73 @@ def egg_records_data() -> Any:
 @app.get("/api/dashboard/stats")
 @login_required
 def dashboard_stats() -> Any:
-    total_sorted = EggRecord.query.count()
+    manila_timezone = timezone(timedelta(hours=8))
+    today = datetime.now(manila_timezone).date()
+    start_date_value = request.args.get("start_date", "").strip()
+    end_date_value = request.args.get("end_date", "").strip()
+    single_date_value = request.args.get("date", "").strip()
+    all_dates = request.args.get("all_dates") == "true"
+    try:
+        start_date = datetime.strptime(start_date_value, "%Y-%m-%d").date() if start_date_value else None
+        end_date = datetime.strptime(end_date_value, "%Y-%m-%d").date() if end_date_value else None
+        single_date = datetime.strptime(single_date_value, "%Y-%m-%d").date() if single_date_value else None
+    except ValueError:
+        return jsonify(error="Dates must use YYYY-MM-DD format."), 400
+
+    if start_date is None and end_date is None and single_date is not None:
+        start_date = end_date = single_date
+    if start_date is None and end_date is None:
+        if all_dates:
+            end_date = today
+            earliest_sorted_at = db.session.query(func.min(EggRecord.sorted_at)).scalar()
+            if earliest_sorted_at is None:
+                start_date = end_date
+            else:
+                if earliest_sorted_at.tzinfo is None:
+                    earliest_sorted_at = earliest_sorted_at.replace(tzinfo=timezone.utc)
+                start_date = min(
+                    earliest_sorted_at.astimezone(manila_timezone).date(), end_date
+                )
+        else:
+            end_date = today
+            start_date = today - timedelta(days=6)
+    elif start_date is None:
+        end_date = end_date or today
+        earliest_sorted_at = db.session.query(func.min(EggRecord.sorted_at)).scalar()
+        if earliest_sorted_at is None:
+            start_date = end_date
+        else:
+            if earliest_sorted_at.tzinfo is None:
+                earliest_sorted_at = earliest_sorted_at.replace(tzinfo=timezone.utc)
+            start_date = min(
+                earliest_sorted_at.astimezone(manila_timezone).date(), end_date
+            )
+    elif end_date is None:
+        end_date = max(today, start_date)
+
+    if start_date > end_date:
+        return jsonify(error="From date cannot be after To date."), 400
+
+    selected_start = datetime.combine(
+        start_date, time.min, tzinfo=manila_timezone
+    ).astimezone(timezone.utc)
+    selected_end = datetime.combine(
+        end_date + timedelta(days=1), time.min, tzinfo=manila_timezone
+    ).astimezone(timezone.utc)
+    selected_records = EggRecord.query.filter(
+        EggRecord.sorted_at >= selected_start,
+        EggRecord.sorted_at < selected_end,
+    )
+    total_sorted = selected_records.count()
     size_rows = (
         db.session.query(EggRecord.size, func.count(EggRecord.id))
+        .filter(EggRecord.sorted_at >= selected_start, EggRecord.sorted_at < selected_end)
         .group_by(EggRecord.size)
         .all()
     )
     quality_rows = (
         db.session.query(EggRecord.quality, func.count(EggRecord.id))
+        .filter(EggRecord.sorted_at >= selected_start, EggRecord.sorted_at < selected_end)
         .group_by(EggRecord.quality)
         .all()
     )
@@ -1981,30 +2020,28 @@ def dashboard_stats() -> Any:
     size_counts.update({size: count for size, count in size_rows})
     quality_counts = {quality: count for quality, count in quality_rows}
     good_count = quality_counts.get("Good", 0)
-    latest_record = EggRecord.query.order_by(EggRecord.id.desc()).first()
-    selected_date_value = request.args.get("date")
-    try:
-        selected_date = (
-            datetime.strptime(selected_date_value, "%Y-%m-%d").date()
-            if selected_date_value
-            else datetime.now(timezone.utc).date()
-        )
-    except ValueError:
-        return jsonify(error="Date must use YYYY-MM-DD format."), 400
-    trend_days = [selected_date - timedelta(days=offset) for offset in range(6, -1, -1)]
-    trend_counts = {day.isoformat(): 0 for day in trend_days}
-    trend_start = datetime.combine(trend_days[0], time.min, tzinfo=timezone.utc)
-    recent_records = EggRecord.query.filter(EggRecord.sorted_at >= trend_start).all()
+    latest_record = selected_records.order_by(EggRecord.id.desc()).first()
+    trays_completed = good_count // TRAY_CAPACITY
+
+    # Keep exactly seven weekday columns, always Sunday through Saturday.
+    # Aggregate only records inside the selected From-To range into weekdays.
+    trend_start_date = end_date - timedelta(days=(end_date.weekday() + 1) % 7)
+    trend_days = [trend_start_date + timedelta(days=offset) for offset in range(7)]
+    trend_counts = {weekday: 0 for weekday in range(7)}
+    recent_records = selected_records.all()
     for record in recent_records:
         sorted_at = record.sorted_at
         if sorted_at.tzinfo is None:
             sorted_at = sorted_at.replace(tzinfo=timezone.utc)
-        day_key = sorted_at.date().isoformat()
-        if day_key in trend_counts:
-            trend_counts[day_key] += 1
+        sorted_date = sorted_at.astimezone(manila_timezone).date()
+        weekday_index = (sorted_date.weekday() + 1) % 7
+        trend_counts[weekday_index] += 1
     stats = dict(
+        selected_start_date=start_date.isoformat(),
+        selected_end_date=end_date.isoformat(),
         total_sorted=total_sorted,
-        trays_completed=EggRecord.query.filter_by(quality="Good").count() // TRAY_CAPACITY,
+        trays_completed=trays_completed,
+        good_count=good_count,
         quality_rate=round(
             (good_count / total_sorted * 100) if total_sorted else 0,
             1,
@@ -2019,7 +2056,7 @@ def dashboard_stats() -> Any:
             {
                 "date": day.isoformat(),
                 "label": day.strftime("%a"),
-                "count": trend_counts[day.isoformat()],
+                "count": trend_counts[(day.weekday() + 1) % 7],
             }
             for day in trend_days
         ],
@@ -2027,6 +2064,7 @@ def dashboard_stats() -> Any:
     if session.get("role") == "admin":
         recent_audits = (
             AuditLog.query
+            .filter(AuditLog.event_type.notin_(("egg_sorted", "egg_rejected")))
             .order_by(AuditLog.id.desc())
             .limit(12)
             .all()

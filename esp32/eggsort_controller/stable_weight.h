@@ -4,7 +4,7 @@
 // Each call represents one fresh HX711 conversion, never a cached reading.
 class StableWeightWindow {
  public:
-  static constexpr uint32_t HOLD_MS = 1500;
+  static constexpr uint32_t HOLD_MS = 1000;
   static constexpr uint32_t MAX_SAMPLE_GAP_MS = 500;
   static constexpr float MAX_SPREAD_GRAMS = 2.0f;
 

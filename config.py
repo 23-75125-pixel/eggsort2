@@ -234,7 +234,7 @@ def build_app_config() -> dict[str, Any]:
         "MAIL_FROM": env_text("MAIL_FROM", mail_username),
         "LOCAL_HARDWARE_ENABLED": local_hardware_enabled,
         "AUTO_START_SORTING_ON_LOGIN": env_bool(
-            "AUTO_START_SORTING_ON_LOGIN", True
+            "AUTO_START_SORTING_ON_LOGIN", False
         ) and local_hardware_enabled,
         "SQLALCHEMY_DATABASE_URI": database_url,
         "SQLALCHEMY_TRACK_MODIFICATIONS": False,
