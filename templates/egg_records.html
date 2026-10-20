@@ -250,7 +250,7 @@
         </header>
         <!-- Search and Filter Bar -->
         <div
-          class="bg-surface-container-lowest rounded-xl p-4 shadow-[0_4px_20px_rgba(0,0,0,0.04)] mb-6 flex flex-col md:flex-row gap-4 items-stretch md:items-center border border-surface-variant/50"
+          class="bg-surface-container-lowest rounded-xl p-4 shadow-[0_4px_20px_rgba(0,0,0,0.04)] mb-6 flex flex-col md:flex-row md:flex-wrap gap-4 items-stretch md:items-center border border-surface-variant/50"
         >
           <div class="flex-1 relative">
             <span
@@ -272,7 +272,7 @@
             Search
           </button>
           <div class="h-8 w-px bg-surface-variant mx-2"></div>
-          <div class="flex gap-3">
+          <div class="flex flex-wrap gap-3">
             <select
               id="size-filter"
               class="bg-[#faf9f4] border border-surface-variant/50 rounded-lg py-3 px-4 pr-10 text-body-md text-secondary focus:outline-none focus:border-primary appearance-none cursor-pointer bg-[url('data:image/svg+xml;charset=US-ASCII,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2224%22%20height%3D%2224%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22%235a6b5f%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpolyline%20points%3D%226%209%2012%2015%2018%209%22%3E%3C%2Fpolyline%3E%3C%2Fsvg%3E')] bg-no-repeat bg-[position:right_12px_center] bg-[length:16px]"
@@ -294,6 +294,16 @@
               <option>Crack</option>
               <option>Rotten</option>
             </select>
+            <label class="flex items-center gap-2 text-body-md text-secondary">
+              From
+              <input id="start-date-filter" type="date" aria-label="From date sorted"
+                class="bg-[#faf9f4] border border-surface-variant/50 rounded-lg py-3 px-3 text-body-md text-secondary focus:outline-none focus:border-primary" />
+            </label>
+            <label class="flex items-center gap-2 text-body-md text-secondary">
+              To
+              <input id="end-date-filter" type="date" aria-label="To date sorted"
+                class="bg-[#faf9f4] border border-surface-variant/50 rounded-lg py-3 px-3 text-body-md text-secondary focus:outline-none focus:border-primary" />
+            </label>
             <button
               id="reset-record-filters"
               type="button"
@@ -317,7 +327,7 @@
                 <th
                   class="py-4 px-6 text-label-caps font-label-caps text-tertiary tracking-wider font-semibold"
                 >
-                  EGG ID
+                  EGG NO.
                 </th>
                 <th
                   class="py-4 px-6 text-label-caps font-label-caps text-tertiary tracking-wider font-semibold"
@@ -405,6 +415,8 @@
     const recordSearch = document.getElementById('record-search');
     const sizeFilter = document.getElementById('size-filter');
     const qualityFilter = document.getElementById('quality-filter');
+    const startDateFilter = document.getElementById('start-date-filter');
+    const endDateFilter = document.getElementById('end-date-filter');
     const recordsStatusDot = document.getElementById('records-status-dot');
     const recordsStatusText = document.getElementById('records-status-text');
     let currentRecords = [];
@@ -414,6 +426,13 @@
 
     function formatRefreshTimestamp(date = new Date()) {
       return date.toLocaleString([], { dateStyle: 'medium', timeStyle: 'medium' });
+    }
+
+    function formatRecordDate(value) {
+      return new Intl.DateTimeFormat('en-PH', {
+        dateStyle: 'medium',
+        timeStyle: 'medium'
+      }).format(new Date(value));
     }
 
     function setRecordsStatus(message, failed = false) {
@@ -442,7 +461,7 @@
         record.weight_grams == null ? 'N/A' : `${record.weight_grams} g`,
         record.size,
         record.quality,
-        new Date(record.sorted_at).toLocaleString(),
+        formatRecordDate(record.sorted_at),
         record.session_ref
       ];
 
@@ -482,12 +501,24 @@
       if (recordsRequestPending) return;
       recordsRequestPending = true;
       try {
+        if (startDateFilter.value && endDateFilter.value && startDateFilter.value > endDateFilter.value) {
+          setRecordsStatus('From date cannot be after To date.', true);
+          return;
+        }
         const params = new URLSearchParams({
           q: recordSearch.value.trim(),
           size: sizeFilter.value,
           quality: qualityFilter.value,
           limit: '500'
         });
+        if (startDateFilter.value) {
+          params.set('start_at', new Date(`${startDateFilter.value}T00:00:00`).toISOString());
+        }
+        if (endDateFilter.value) {
+          const dayAfter = new Date(`${endDateFilter.value}T00:00:00`);
+          dayAfter.setDate(dayAfter.getDate() + 1);
+          params.set('end_before', dayAfter.toISOString());
+        }
         const response = await fetch(`/api/egg-records?${params}`, {
           credentials: 'same-origin',
           cache: 'no-store'
@@ -528,10 +559,14 @@
     });
     sizeFilter.addEventListener('change', refreshEggRecords);
     qualityFilter.addEventListener('change', refreshEggRecords);
+    startDateFilter.addEventListener('change', refreshEggRecords);
+    endDateFilter.addEventListener('change', refreshEggRecords);
     document.getElementById('reset-record-filters').addEventListener('click', () => {
       recordSearch.value = '';
       sizeFilter.value = 'All Sizes';
       qualityFilter.value = 'All Qualities';
+      startDateFilter.value = '';
+      endDateFilter.value = '';
       refreshEggRecords();
     });
     document.getElementById('print-records').addEventListener('click', () => window.print());
@@ -542,7 +577,7 @@
         record.weight_grams,
         record.size,
         record.quality,
-        new Date(record.sorted_at).toLocaleString(),
+        formatRecordDate(record.sorted_at),
         record.session_ref
       ]);
       const csv = [headings, ...rows].map(

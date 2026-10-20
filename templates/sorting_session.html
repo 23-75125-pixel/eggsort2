@@ -323,11 +323,25 @@ function setCameraState(active) {
 }
 
 async function requestJson(url, options = {}) {
-  const response = await fetch(url, {
-    credentials: 'same-origin',
-    cache: 'no-store',
-    ...options
-  });
+  const { timeoutMs = 30000, ...fetchOptions } = options;
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  let response;
+  try {
+    response = await fetch(url, {
+      credentials: 'same-origin',
+      cache: 'no-store',
+      signal: controller.signal,
+      ...fetchOptions
+    });
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error('The camera request timed out. Check the sorting computer, then refresh this page.');
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+  }
 
   if (response.redirected) {
     window.location.href = response.url;
@@ -397,7 +411,7 @@ function showRunningSession(state, reconnectFeed = false) {
   if (state.reject_error) showCameraError(state.reject_error);
   updateCounts(state);
   const modelNote = state.model
-    ? ` • ${state.model.class_count} classes from ${state.model.path.split(/[\\/]/).pop()}`
+    ? ` • ${state.model.class_count} classes [${(state.model.classes || []).join(', ')}] from ${state.model.path.split(/[\\/]/).pop()}`
     : '';
   if (!state.frame_ready) {
     statusText.textContent = `Camera active. Waiting for the first video frame...${modelNote}`;
@@ -466,14 +480,22 @@ async function refreshHardwareState() {
       ? ` • Quality: ${diagnostics.measurement_quality}`
       : '';
     const hasFinalWeight = diagnostics.final_weight_grams != null;
-    if (hardware.connected && diagnostics.awaiting_egg) {
+    if (diagnostics.flow_error) {
+      hardwareEvent.textContent = diagnostics.flow_error;
+    } else if (hardware.connected && diagnostics.automatic_release) {
+      const weight = diagnostics.final_weight_grams ?? diagnostics.live_weight_grams;
+      const gate = diagnostics.load_cell_gate_state;
+      hardwareEvent.textContent = diagnostics.pca9685_ready === false
+        ? 'Load-cell servo unavailable: PCA9685 not found'
+        : `Automatic release: ${weight == null ? 'weight pending' : `${weight} g`} • Gate ${gate ? gate.toLowerCase() : 'command pending'} • ${sensorEvent || 'camera record pending'}`;
+    } else if (hardware.connected && diagnostics.awaiting_egg) {
       hardwareEvent.textContent = sensorEvent || 'Waiting for load cell...';
     } else if (hardware.connected && !diagnostics.measurement_quality) {
       const weightText = diagnostics.live_weight_grams != null
         ? `${diagnostics.live_weight_grams} g`
         : 'weight pending';
-      hardwareEvent.textContent =
-        `Egg on load cell: ${weightText} - waiting for validated Good auto-capture - gate locked`;
+      hardwareEvent.textContent = sensorEvent
+        || `Egg on load cell: ${weightText} - waiting for its matching Good camera inspection`;
     } else if (hardware.connected && hasFinalWeight) {
       const gateStatus = diagnostics.pca9685_ready === false
         ? 'PCA9685 not found; load-cell gate cannot open'
@@ -483,7 +505,7 @@ async function refreshHardwareState() {
     } else if (hardware.connected && diagnostics.measurement_weight_grams != null) {
       const readingNumber = diagnostics.measurement_reading_number ?? 1;
       hardwareEvent.textContent =
-        `${captureLabel} • Scale reading ${readingNumber}: ${diagnostics.measurement_weight_grams} g${qualityText} • waiting for 2 identical readings`;
+        `${captureLabel} • Scale reading ${readingNumber}: ${diagnostics.measurement_weight_grams} g${qualityText} • waiting for 1.5 s of stable weight`;
     } else if (hardware.connected && !diagnostics.awaiting_egg) {
       const weightText = diagnostics.live_weight_grams != null
         ? `${diagnostics.live_weight_grams} g`
@@ -492,7 +514,7 @@ async function refreshHardwareState() {
         ? 'Egg detected, but scale now reads 0 g; check placement or tare.'
         : diagnostics.measurement_quality
           ? `${captureLabel} on load cell: ${weightText}${qualityText} • starting measurement`
-          : `Egg on load cell: ${weightText} • waiting for Good zone exit capture`;
+          : `Egg on load cell: ${weightText} • waiting for its pending Good inspection`;
     } else if (hardware.connected && diagnostics.live_weight_grams !== null) {
       const hxStatus = diagnostics.hx711_ready === false ? 'HX711 not ready' : 'HX711 ready';
       const servoStatus = diagnostics.pca9685_ready === false ? 'PCA9685 not found' : 'PCA9685 ready';
@@ -565,11 +587,14 @@ async function stopCameraSession() {
   stopButton.classList.add('opacity-60', 'cursor-wait');
   statusText.textContent = 'Stopping camera session...';
   try {
-    const state = await requestJson('/api/camera/stop', { method: 'POST' });
+    const state = await requestJson('/api/camera/stop', { method: 'POST', timeoutMs: 30000 });
     showStoppedSession(state.camera);
     refreshHardwareState();
     await EggSortAlerts.success('Sorting session stopped successfully.');
   } catch (error) {
+    // Recover the displayed state from the server: the stop may have finished
+    // even when the browser lost the response.
+    await refreshSessionState(false);
     showCameraError(error.message);
     await EggSortAlerts.error(error.message || 'Unable to stop the sorting session.');
   } finally {

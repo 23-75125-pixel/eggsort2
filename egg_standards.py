@@ -27,13 +27,13 @@ SIZE_CODES: Final[dict[str, str]] = {
 def classify_egg_size(weight_grams: int | float) -> str:
     """Classify with the boundaries from the proven ESP32 sorting sketch."""
     weight = float(weight_grams)
-    if weight < 45:
+    if weight < 50:
         return "Small"
-    if weight <= 54:
+    if weight <= 55:
         return "Medium"
-    if weight <= 62:
+    if weight <= 61:
         return "Large"
-    if weight <= 69:
+    if weight <= 66:
         return "Extra Large"
     return "Jumbo"
 

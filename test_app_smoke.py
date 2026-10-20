@@ -112,7 +112,7 @@ class ApplicationSmokeTests(unittest.TestCase):
         ):
             response = self.client.get("/health")
         self.assertEqual(response.status_code, 200)
-        start_runtime.assert_called_once_with()
+        start_runtime.assert_called_once_with(1, automatic=True)
 
     def test_manual_runtime_stop_suppresses_auto_restart(self) -> None:
         with self.client.session_transaction() as session:

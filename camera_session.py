@@ -75,6 +75,8 @@ class CameraDetectionSession:
         self._error: str | None = None
         self._started_at: str | None = None
         self._session_ref: str | None = None
+        self._runtime_context: dict[str, Any] = {}
+        self._lifecycle_handler: Callable[[str, dict[str, Any]], Any] | None = None
         self._stream_fps = 0.0
         self._detection_fps = 0.0
         self._inference_ms = 0.0
@@ -122,10 +124,15 @@ class CameraDetectionSession:
             "CAMERA_CAPTURE_MAX_AGE_SECONDS", 60.0, minimum=1.0, maximum=3600.0
         )
 
-    def start(self) -> dict[str, Any]:
+    def set_lifecycle_handler(self, handler):
+        self._lifecycle_handler = handler
+
+    def start(self, *, context: dict[str, Any] | None = None) -> dict[str, Any]:
         with self._lock:
             if self._running:
                 return self.status()
+            if any(t and t.is_alive() for t in (self._capture_thread, self._inference_thread)):
+                raise CameraSessionError("Previous camera workers have not finished.")
 
         try:
             import cv2
@@ -175,7 +182,11 @@ class CameraDetectionSession:
             self._inference_ms = 0.0
             self._model_info = model_info
             self._started_at = datetime.now(timezone.utc).isoformat()
-            self._session_ref = datetime.now().strftime("SES-%Y%m%d-%H%M%S")
+            if not context or not context.get("session_ref") or not context.get("runtime_generation"):
+                self._running = False
+                raise CameraSessionError("A committed sorting-session context is required.")
+            self._runtime_context = dict(context)
+            self._session_ref = context["session_ref"]
             self._capture_thread = Thread(
                 target=self._capture_loop,
                 name="eggsort-camera-capture",
@@ -194,10 +205,24 @@ class CameraDetectionSession:
         with self._lock:
             capture_thread = self._capture_thread
             inference_thread = self._inference_thread
+            capture = self._capture
             self._stop_event.set()
             self._frame_ready.notify_all()
             self._raw_frame_ready.notify_all()
             self._quality_ready.notify_all()
+
+        # ``VideoCapture.read()`` can block while a USB webcam is waiting for
+        # its next frame.  Releasing the handle first makes that read return,
+        # so a manual Stop Session does not wait for the camera thread timeout.
+        # The capture loop may release it again during its own cleanup; OpenCV
+        # accepts that safely.
+        if capture is not None:
+            try:
+                capture.release()
+            except Exception:
+                # The shutdown state still depends on the worker threads, not
+                # on whether a driver accepts a second/late release call.
+                pass
 
         if capture_thread and capture_thread.is_alive():
             capture_thread.join(timeout=5)
@@ -261,21 +286,46 @@ class CameraDetectionSession:
     def wait_for_captured_quality(
         self,
         timeout: float = 1.0,
+        is_current: Callable[[], bool] | None = None,
+        allow_loaded_capture: bool = False,
     ) -> dict[str, Any] | None:
         """Return the oldest center-zone capture for the next load-cell egg."""
         deadline = monotonic() + timeout
         with self._quality_ready:
             while True:
+                if is_current is not None and not is_current():
+                    return None
                 cutoff = monotonic() - self.capture_max_age
-                while (
+                if (
                     self._captured_qualities
                     and self._captured_qualities[0]["captured_at"] < cutoff
                 ):
-                    self._captured_qualities.popleft()
+                    raise CameraSessionError("Unmatched camera capture expired; clear the station before restarting.")
                 if self._captured_qualities:
                     result = dict(self._captured_qualities.popleft())
                     result.pop("captured_at", None)
                     return result
+                # A load-cell egg may remain in the camera zone until its gate
+                # opens. Finish its inspection after the configured Good frames
+                # instead of requiring movement that authorization prevents.
+                required = self.capture_min_samples
+                if (allow_loaded_capture and self._active_capture is not None
+                        and not self._active_capture.get("claimed_on_scale")
+                        and self._passage_defect is None
+                        and self._passage_misses == 0
+                        and len(self._passage_samples) >= required
+                        and all(label == "good" for label, _ in self._passage_samples[-required:])):
+                    capture = self._active_capture
+                    capture["claimed_on_scale"] = True
+                    capture["confidence"] = round(min(
+                        confidence for _, confidence in self._passage_samples[-required:]
+                    ), 4)
+                    self._egg_count += 1
+                    self._quality_counts["good"] += 1
+                    self._last_capture = dict(capture)
+                    # Keep the passage occupied until exit, preventing another
+                    # camera identity for an already inspected, released egg.
+                    return dict(capture)
                 if not self._running or self._error:
                     return None
                 remaining = deadline - monotonic()
@@ -436,8 +486,12 @@ class CameraDetectionSession:
     ) -> dict[str, Any] | None:
         """Capture one egg per zone passage; queue Good eggs on exit."""
         if label in EGG_QUALITY_LABELS:
+            if self._active_capture is not None and self._active_capture.get("claimed_on_scale"):
+                self._passage_misses = 0
+                return None
             if self._active_capture is None:
                 self._active_capture = {
+                    **self._runtime_context,
                     "capture_id": self._egg_count + 1,
                     "label": label,
                     "confidence": round(confidence, 4),
@@ -464,7 +518,9 @@ class CameraDetectionSession:
         self._active_capture = None
         self._passage_defect = None
         self._passage_reject_sent = False
-        if sample_count < self.capture_min_samples:
+        if capture.get("claimed_on_scale"):
+            return None
+        if sample_count < self.capture_min_samples and capture["label"] == "good":
             return None
 
         capture["captured_at"] = monotonic()
@@ -473,6 +529,8 @@ class CameraDetectionSession:
         self._last_capture = dict(capture)
         # Rejected eggs are counted, but never assigned to a load-cell egg.
         if capture["label"] == "good":
+            if len(self._captured_qualities) == self._captured_qualities.maxlen:
+                raise CameraSessionError("Camera capture queue is full; stop and clear the station.")
             self._captured_qualities.append(dict(capture))
         return capture
 
@@ -498,6 +556,7 @@ class CameraDetectionSession:
 
         fps_started = monotonic()
         fps_frames = 0
+        readiness_sent = False
         try:
             backend_codes = {
                 "auto": cv2.CAP_ANY,
@@ -541,10 +600,15 @@ class CameraDetectionSession:
                     break
 
                 success, frame = capture.read()
+                if self._stop_event.is_set():
+                    break
                 if not success:
                     raise CameraSessionError(
                         "The camera stopped returning frames."
                     )
+                if not readiness_sent and self._lifecycle_handler:
+                    self._lifecycle_handler("ready", dict(self._runtime_context))
+                    readiness_sent = True
 
                 # Give inference only the newest frame. No queue means no
                 # increasing detection delay when the model is slower than video.
@@ -619,6 +683,8 @@ class CameraDetectionSession:
                 result = detect_image(frame)
                 elapsed = monotonic() - started
                 with self._quality_ready:
+                    if self._stop_event.is_set():
+                        break
                     width = float(result.get("image_width", frame.shape[1]))
                     height = float(result.get("image_height", frame.shape[0]))
                     inspection_zone = (
@@ -656,6 +722,8 @@ class CameraDetectionSession:
             self._frame_ready.notify_all()
             self._raw_frame_ready.notify_all()
             self._quality_ready.notify_all()
+        if self._lifecycle_handler:
+            self._lifecycle_handler("failed", dict(self._runtime_context))
 
 
 CAMERA_SESSION = CameraDetectionSession()

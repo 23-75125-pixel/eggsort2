@@ -1,6 +1,7 @@
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 #include "HX711.h"
+#include "stable_weight.h"
 
 // =====================================================
 // PCA9685
@@ -12,6 +13,14 @@ Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 #define SCL_PIN 22
 
 bool pcaReady = false;
+
+// Active buzzer output. Drive a small buzzer through a transistor if its
+// current exceeds the ESP32 GPIO rating; share ground with the ESP32.
+#define BUZZER_PIN 16
+#define BUZZER_DURATION 1000
+#define BUZZER_FREQUENCY 2000
+bool buzzerActive = false;
+unsigned long buzzerStartedAt = 0;
 
 // =====================================================
 // SERVO CHANNELS
@@ -39,9 +48,12 @@ bool pcaReady = false;
 
 // How long the reject gate stays open
 #define CRACK_GATE_OPEN_TIME 6000
+#define CRACK_RETRIGGER_CLOSE_TIME 150
 
 bool rejectGateOpen = false;
+bool rejectRestartPending = false;
 unsigned long rejectOpenedAt = 0;
+unsigned long rejectClosedAt = 0;
 
 // =====================================================
 // LOAD-CELL SERVO
@@ -50,8 +62,8 @@ unsigned long rejectOpenedAt = 0;
 #define LOADCELL_CLOSED 305
 #define LOADCELL_OPEN 190
 
-// Higher = slower opening
-#define LOADCELL_OPEN_SPEED 10
+// Direct movement, then allow the linkage to reach its commanded position.
+#define LOADCELL_OPEN_SETTLE_TIME 250
 
 // How long load-cell gate stays open
 #define LOADCELL_OPEN_TIME 2500
@@ -114,7 +126,7 @@ bool loadCellGateOpen = false;
 #define SM_TRAVEL_TIME 1000
 
 // Large
-#define LARGE_TRAVEL_TIME 8700
+#define LARGE_TRAVEL_TIME 8500
 
 // Extra Large
 #define XL_TRAVEL_TIME 8500
@@ -135,23 +147,29 @@ float calibration_factor = 618.0;
 // Ilang samples ang i-average sa bawat basa (mas mababa = mas mabilis)
 #define WEIGHT_SAMPLES 3
 
-// Pinapayagang pagkakaiba (g) para ituring na "same reading"
-#define WEIGHT_TOLERANCE 1
-
-// Ilang stable readings bago i-release ang itlog
-#define STABLE_COUNT_NEEDED 3
-
 // =====================================================
 // VARIABLES
 // =====================================================
-
-int lastWeight = -1;
-int sameCount = 0;
 
 bool processingEgg = false;
 bool zeroPrinted = false;
 bool eggDetected = false;
 bool measurementAuthorized = false;
+unsigned long measurementCaptureId = 0;
+unsigned long automaticCycleId = 0;
+const char* controllerFault = nullptr;
+bool scaleInitialized = false;
+bool releasedEggCleared = false;
+bool watchingReleasedEgg = false;
+int latestWeight = 0;
+float latestRawWeight = 0;
+StableWeightWindow stableWeight;
+unsigned long lastStabilityReportAt = 0;
+unsigned long weightSequence = 0;
+unsigned long consumedWeightSequence = 0;
+unsigned long lastLiveWeightAt = 0;
+unsigned long lastScaleSampleAt = 0;
+bool scaleFaultReported = false;
 
 // =====================================================
 // FUNCTION PROTOTYPE
@@ -161,6 +179,38 @@ bool measurementAuthorized = false;
 void handleSerialCommands(bool urgentOnly);
 bool openLoadCellGate();
 void closeLoadCellGate();
+void updateBuzzer();
+void soundAlertBuzzer();
+void serviceScale();
+void printCaptureTag() {
+  if (automaticCycleId > 0) {
+    Serial.print("; CYCLE:");
+    Serial.print(automaticCycleId);
+  }
+  Serial.println();
+}
+
+void reportMeasurementFailure(const char* reason) {
+  controllerFault = reason;
+  Serial.print("MEASURE FAILED: ");
+  Serial.print(reason);
+  printCaptureTag();
+}
+
+void soundAlertBuzzer() {
+  // tone() drives passive buzzers too; a steady HIGH only works with active
+  // buzzer modules and was silent with common passive piezo buzzers.
+  tone(BUZZER_PIN, BUZZER_FREQUENCY);
+  buzzerStartedAt = millis();
+  buzzerActive = true;
+}
+
+void updateBuzzer() {
+  if (buzzerActive && millis() - buzzerStartedAt >= BUZZER_DURATION) {
+    noTone(BUZZER_PIN);
+    buzzerActive = false;
+  }
+}
 
 // =====================================================
 // SET SERVO ANGLE
@@ -182,7 +232,18 @@ void setServoAngle(uint8_t channel, int angle) {
 // Isasara ang reject gate kapag lumipas na ang oras
 void updateRejectServo() {
 
-  if (rejectGateOpen &&
+  // A second defect arriving while the gate is open starts a fresh cycle:
+  // briefly command CLOSED so the linkage registers the change, then reopen.
+  if (rejectRestartPending &&
+      millis() - rejectClosedAt >= CRACK_RETRIGGER_CLOSE_TIME) {
+    setServoAngle(CRACK_SERVO, CRACK_OPEN);
+    rejectRestartPending = false;
+    rejectGateOpen = true;
+    rejectOpenedAt = millis();
+    Serial.println("REJECT SERVO: REOPENED FOR NEXT EGG");
+  }
+
+  if (rejectGateOpen && !rejectRestartPending &&
       millis() - rejectOpenedAt >= CRACK_GATE_OPEN_TIME) {
 
     setServoAngle(CRACK_SERVO, CRACK_CLOSED);
@@ -195,12 +256,28 @@ void updateRejectServo() {
 // Bubuksan ang reject gate at sisimulan ang timer
 void startRejectServo() {
 
+  if (rejectGateOpen && !rejectRestartPending) {
+    setServoAngle(CRACK_SERVO, CRACK_CLOSED);
+    rejectGateOpen = false;
+    rejectRestartPending = true;
+    rejectClosedAt = millis();
+    Serial.println("REJECT SERVO: CLOSED FOR NEXT EGG");
+    return;
+  }
+
+  // If another defect arrives during the short close interval, keep the
+  // pending restart; the gate will reopen once the close pulse is registered.
+  if (rejectRestartPending) return;
+
   setServoAngle(CRACK_SERVO, CRACK_OPEN);
 
   rejectOpenedAt = millis();
   rejectGateOpen = true;
+  rejectRestartPending = false;
 
-  Serial.println("REJECT SERVO: OPEN; HOLD 8000 MS");
+  Serial.print("REJECT SERVO: OPEN; HOLD ");
+  Serial.print(CRACK_GATE_OPEN_TIME);
+  Serial.println(" MS");
 }
 
 // =====================================================
@@ -217,6 +294,8 @@ void waitWithRejectService(unsigned long duration) {
   do {
     handleSerialCommands(true);
     updateRejectServo();
+    updateBuzzer();
+    serviceScale();
     delay(1);
   } while (millis() - startedAt < duration);
 }
@@ -243,9 +322,25 @@ void activateCrackServo() {
 
 void handleSerialCommands(bool urgentOnly) {
 
+  // Consume only complete lines. readStringUntil can block all servo timers
+  // for the serial timeout when a USB command arrives in separate packets.
+  static String commandBuffer;
+  static bool commandOverflow = false;
   while (Serial.available() > 0) {
-
-    String command = Serial.readStringUntil('\n');
+    char incoming = Serial.read();
+    if (incoming == '\r') continue;
+    if (incoming != '\n') {
+      if (commandBuffer.length() < 80 && !commandOverflow) commandBuffer += incoming;
+      else commandOverflow = true;
+      continue;
+    }
+    String command = commandBuffer;
+    commandBuffer = "";
+    if (commandOverflow) {
+      commandOverflow = false;
+      Serial.println("COMMAND REJECTED: TOO LONG");
+      continue;
+    }
     command.trim();
     command.toUpperCase();
 
@@ -269,6 +364,8 @@ void handleSerialCommands(bool urgentOnly) {
 
       } else {
 
+        soundAlertBuzzer();
+
         Serial.print("CAMERA REJECT : ");
         Serial.println(quality);
 
@@ -278,38 +375,31 @@ void handleSerialCommands(bool urgentOnly) {
       continue;
     }
 
-    // Habang busy, REJECT lang ang pwede
-    if (urgentOnly) {
+    // Old application instances may still send camera authorization. Automatic
+    // release has no authorization state; never turn a late command into a fault.
+    if (command.startsWith("MEASURE:")) {
+      Serial.println("COMMAND IGNORED: AUTOMATIC RELEASE ACTIVE");
+      continue;
+    }
+
+    // Habang busy, REJECT at STATUS lang ang pwede
+    if (urgentOnly && command != "STATUS") {
       Serial.println("COMMAND IGNORED: BUSY");
       continue;
     }
 
-    // Flask only authorizes a non-defective egg to leave the load cell after
-    // its camera result is matched to this physical egg.
-    if (command.startsWith("MEASURE:")) {
-      String quality = command.substring(8);
-      quality.trim();
-      if (!eggDetected || processingEgg) {
-        Serial.println("MEASURE FAILED: NO EGG WAITING");
-      } else if (quality != "GOOD" && quality != "UNDEFINED") {
-        Serial.println("MEASURE FAILED: INVALID QUALITY");
-      } else {
-        measurementAuthorized = true;
-        Serial.print("CAMERA QUALITY: ");
-        Serial.println(quality);
-      }
-      continue;
-    }
-
     if (command == "STATUS") {
+      Serial.println("PROTOCOL: EGGSORT_AUTO_V1");
       Serial.print("PCA9685 READY: ");
       Serial.println(pcaReady ? "YES" : "NO");
-      Serial.println("HX711 READY: YES");
+      Serial.print("HX711 READY: ");
+      Serial.println(scaleInitialized && millis() - lastScaleSampleAt < 1500 ? "YES" : "NO");
       Serial.print("LOAD CELL GATE: ");
       Serial.println(loadCellGateOpen ? "OPEN" : "CLOSED");
       Serial.println("LOAD CELL POSITION: COMMANDED; NO POSITION SENSOR");
       Serial.print("CONTROLLER STATE: ");
-      Serial.println(processingEgg ? "SORTING" : (eggDetected ? "WAITING FOR CAMERA" : "READY"));
+      Serial.println(controllerFault ? "FAULT" : (processingEgg ? "SORTING" : "READY"));
+      if (controllerFault) reportMeasurementFailure(controllerFault);
       continue;
     }
 
@@ -419,11 +509,8 @@ bool openLoadCellGate() {
     return false;
   }
 
-  moveLoadCellServoSlow(
-    LOADCELL_CLOSED,
-    LOADCELL_OPEN,
-    LOADCELL_OPEN_SPEED
-  );
+  pwm.setPWM(LOADCELL_SERVO, 0, LOADCELL_OPEN);
+  waitWithRejectService(LOADCELL_OPEN_SETTLE_TIME);
 
   loadCellGateOpen = true;
   Serial.println("LOAD CELL GATE: OPEN");
@@ -454,6 +541,47 @@ int readWeight() {
   }
 
   return round(weight);
+}
+
+// Use one HX711 sample while waiting for the released egg to clear. Averaging
+// three samples here can hide the short gap before the next roller-fed egg.
+int readWeightFast() {
+
+  float weight = scale.get_units(1);
+
+  if (weight > -10 && weight < 10) {
+    weight = 0;
+  }
+  latestRawWeight = weight;
+
+  return round(weight);
+}
+
+// A ready HX711 conversion is consumed exactly once, including during travel,
+// servo motion and gate holds. Never wait inside get_units for a missing ADC.
+void serviceScale() {
+  if (!scaleInitialized) return;
+  if (!scale.is_ready()) {
+    if (!scaleFaultReported && millis() - lastScaleSampleAt >= 1500) {
+      Serial.println("HX711 READY: NO");
+      scaleFaultReported = true;
+    }
+    return;
+  }
+  latestWeight = readWeightFast();
+  lastScaleSampleAt = millis();
+  weightSequence++;
+  if (scaleFaultReported) {
+    Serial.println("HX711 READY: YES");
+    scaleFaultReported = false;
+  }
+  if (watchingReleasedEgg && latestWeight < EGG_THRESHOLD) releasedEggCleared = true;
+  if (millis() - lastLiveWeightAt >= 100) {
+    Serial.print("LIVE WEIGHT: ");
+    Serial.print(latestWeight);
+    Serial.println(" g");
+    lastLiveWeightAt = millis();
+  }
 }
 
 // =====================================================
@@ -532,6 +660,7 @@ void closeAllServos() {
 
   setServoAngle(CRACK_SERVO, CRACK_CLOSED);
   rejectGateOpen = false;
+  rejectRestartPending = false;
 
   setServoAngle(SMALL_SERVO, SMALL_CLOSED);
   setServoAngle(MEDIUM_SERVO, MEDIUM_CLOSED);
@@ -546,7 +675,11 @@ void closeAllServos() {
 void setup() {
 
   Serial.begin(115200);
+  Serial.println("PROTOCOL: EGGSORT_AUTO_V1");
   Serial.setTimeout(100);   // para hindi mag-antay ng matagal sa serial
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  noTone(BUZZER_PIN);
 
   Wire.begin(SDA_PIN, SCL_PIN);
 
@@ -593,7 +726,24 @@ void setup() {
 
   delay(2500);
 
-  scale.tare(25);
+  if (!scale.wait_ready_timeout(2000)) {
+    Serial.println("HX711 READY: NO");
+    reportMeasurementFailure("HX711 STARTUP TIMEOUT; RESTART AFTER CHECKING WIRING");
+    return;
+  }
+  long tareTotal = 0;
+  for (int sample = 0; sample < 25; sample++) {
+    if (!scale.wait_ready_timeout(500)) {
+      Serial.println("HX711 READY: NO");
+      reportMeasurementFailure("HX711 TARE TIMEOUT; RESTART AFTER CHECKING WIRING");
+      return;
+    }
+    tareTotal += scale.read();
+  }
+  scale.set_offset(tareTotal / 25);
+  scaleInitialized = true;
+  lastScaleSampleAt = millis();
+  Serial.println("HX711 READY: YES");
 
   Serial.println("TARE COMPLETE");
 
@@ -613,17 +763,22 @@ void loop() {
   // Laging i-check ang serial at reject timer
   handleSerialCommands(false);
   updateRejectServo();
+  updateBuzzer();
 
-  int currentWeight = readWeight();
+  serviceScale();
+  if (!scaleInitialized || consumedWeightSequence == weightSequence) {
+    delay(1);
+    return;
+  }
+  consumedWeightSequence = weightSequence;
+  int currentWeight = latestWeight;
 
   // ===================================================
   // NO EGG
   // ===================================================
 
   if (currentWeight < EGG_THRESHOLD) {
-
-    sameCount = 0;
-    lastWeight = -1;
+    stableWeight.reset();
 
     if (!zeroPrinted) {
       Serial.println("WEIGHT: 0 g");
@@ -631,12 +786,14 @@ void loop() {
     }
 
     if (eggDetected) {
-      Serial.println("EGG LEFT");
+      Serial.print("EGG LEFT");
+      printCaptureTag();
       eggDetected = false;
       measurementAuthorized = false;
+      measurementCaptureId = 0;
     }
 
-    waitWithRejectService(100);
+    delay(1);
 
     return;
   }
@@ -650,7 +807,10 @@ void loop() {
   if (!eggDetected) {
     eggDetected = true;
     measurementAuthorized = false;
-    Serial.println("EGG DETECTED");
+    measurementCaptureId = 0;
+    automaticCycleId++;
+    Serial.print("EGG DETECTED");
+    printCaptureTag();
   }
 
   Serial.print("WEIGHT: ");
@@ -658,35 +818,24 @@ void loop() {
   Serial.println(" g");
 
   // ===================================================
-  // SAME READING CHECK (may tolerance na +/- 1 g)
+  // STABLE WEIGHT FOR 1.5 SECONDS
   // ===================================================
 
-  if (lastWeight != -1 && abs(currentWeight - lastWeight) <= WEIGHT_TOLERANCE) {
-
-    sameCount++;
-
-  } else {
-
-    lastWeight = currentWeight;
-    sameCount = 1;
+  // Restart the hold if weight changes or ADC samples stop. Final weight is
+  // the average of the complete stable window, not a transient first reading.
+  const bool weightReady = stableWeight.add(latestRawWeight, millis());
+  if (!weightReady && millis() - lastStabilityReportAt >= 250) {
+    Serial.print("WEIGHT STABILITY: ");
+    Serial.print(stableWeight.elapsed(millis()));
+    Serial.print("/1500 ms");
+    printCaptureTag();
+    lastStabilityReportAt = millis();
   }
-
-  Serial.print("SAME READING COUNT: ");
-  Serial.println(sameCount);
-
-  // ===================================================
-  // STABLE READINGS REACHED
-  // ===================================================
-
-  // Do not keep a physically detected egg locked on the load cell while
-  // waiting for a serial MEASURE command.  Camera rejection happens at the
-  // upstream reject gate; a non-rejected egg is released once its weight has
-  // been stable for the needed number of readings.
-  if (sameCount >= STABLE_COUNT_NEEDED && !processingEgg) {
+  if (weightReady && !processingEgg && !controllerFault) {
 
     processingEgg = true;
 
-    int finalWeight = currentWeight;
+    int finalWeight = round(stableWeight.average());
     int eggSize = 0;
 
     Serial.println();
@@ -694,49 +843,60 @@ void loop() {
 
     Serial.print("FINAL WEIGHT: ");
     Serial.print(finalWeight);
-    Serial.println(" g");
+    Serial.print(" g");
+    printCaptureTag();
 
     // =================================================
     // CLASSIFICATION
     // =================================================
 
-    if (finalWeight < 45) {
+    if (finalWeight < 50) {
 
       eggSize = 1;
-      Serial.println("SIZE: SMALL");
+      Serial.print("SIZE: SMALL");
+      printCaptureTag();
 
-    } else if (finalWeight <= 54) {
+    } else if (finalWeight <= 55) {
 
       eggSize = 2;
-      Serial.println("SIZE: MEDIUM");
+      Serial.print("SIZE: MEDIUM");
+      printCaptureTag();
 
-    } else if (finalWeight <= 62) {
+    } else if (finalWeight <= 61) {
 
       eggSize = 3;
-      Serial.println("SIZE: LARGE");
+      Serial.print("SIZE: LARGE");
+      printCaptureTag();
 
-    } else if (finalWeight <= 69) {
+    } else if (finalWeight <= 66) {
 
       eggSize = 4;
-      Serial.println("SIZE: EXTRA LARGE");
+      Serial.print("SIZE: EXTRA LARGE");
+      printCaptureTag();
 
     } else {
 
       eggSize = 5;
-      Serial.println("SIZE: JUMBO");
+      Serial.print("SIZE: JUMBO");
+      printCaptureTag();
     }
 
     Serial.println("================================");
 
     // =================================================
-    // SLOW OPEN LOAD-CELL GATE
+    // OPEN LOAD-CELL GATE IMMEDIATELY
     // =================================================
 
     Serial.println();
-    Serial.println("SLOW OPEN LOAD CELL GATE");
+    Serial.println("OPEN LOAD CELL GATE");
 
+    releasedEggCleared = false;
+    watchingReleasedEgg = true;
     if (!openLoadCellGate()) {
-      processingEgg = false;
+      watchingReleasedEgg = false;
+      measurementAuthorized = false;
+      reportMeasurementFailure("LOAD CELL GATE UNAVAILABLE; PCA9685 NOT FOUND AT 0x40");
+      // Latch the failed cycle until reset; do not repeatedly release/count it.
       return;
     }
 
@@ -886,8 +1046,6 @@ void loop() {
     const char* completedSize = eggSize == 1 ? "SMALL" :
       eggSize == 2 ? "MEDIUM" : eggSize == 3 ? "LARGE" :
       eggSize == 4 ? "EXTRA LARGE" : "JUMBO";
-    Serial.print("SERVO SORTED: ");
-    Serial.println(completedSize);
 
     // =================================================
     // CHECK LOAD CELL
@@ -896,19 +1054,20 @@ void loop() {
     Serial.println();
     Serial.println("CHECKING LOAD CELL...");
 
-    int remainingWeight = readWeight();
-
-    while (remainingWeight >= EGG_THRESHOLD) {
-
-      Serial.print("EGG STILL DETECTED: ");
-      Serial.print(remainingWeight);
-      Serial.println(" g");
-
-      Serial.println("WAITING FOR EGG TO LEAVE...");
-
-      waitWithRejectService(500);
-
-      remainingWeight = readWeight();
+    unsigned long clearWaitStarted = millis();
+    bool releaseTimedOut = false;
+    while (!releasedEggCleared) {
+      waitWithRejectService(1);
+      if (!releaseTimedOut && millis() - clearWaitStarted >= 10000) {
+        reportMeasurementFailure("RELEASE NOT CLEARED; CHECK SCALE OR BLOCKED EGG");
+        releaseTimedOut = true;
+      }
+    }
+    watchingReleasedEgg = false;
+    if (!releaseTimedOut) {
+      Serial.print("SERVO SORTED: ");
+      Serial.print(completedSize);
+      printCaptureTag();
     }
 
     // =================================================
@@ -919,9 +1078,18 @@ void loop() {
     Serial.println("NO EGG DETECTED");
     Serial.println("LOAD CELL IS CLEAR");
 
-    sameCount = 0;
-    lastWeight = -1;
+    // Emit the cycle boundary here, while the cleared scale reading is known.
+    // The next egg may arrive before loop() gets another below-threshold read.
+    if (eggDetected) {
+      Serial.print("EGG LEFT");
+      printCaptureTag();
+      eggDetected = false;
+    }
+    measurementAuthorized = false;
+    measurementCaptureId = 0;
+
     processingEgg = false;
+    stableWeight.reset();
 
     zeroPrinted = false;
 
@@ -930,8 +1098,10 @@ void loop() {
     Serial.println("READY FOR NEXT EGG");
     Serial.println("--------------------------------");
 
-    waitWithRejectService(600);
+    // Resume the next load-cell detection immediately. A long cooldown here
+    // can skip the brief clear interval between consecutive roller-fed eggs.
+    consumedWeightSequence = weightSequence;
   }
 
-  waitWithRejectService(100);
+  delay(1);
 }

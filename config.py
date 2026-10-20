@@ -13,6 +13,7 @@ import warnings
 from datetime import timedelta
 from typing import Any
 from urllib.parse import urlsplit
+from sqlalchemy.engine import make_url
 
 
 TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
@@ -101,8 +102,71 @@ def normalize_database_url(value: str) -> str:
     return database_url.rstrip("?&")
 
 
+def local_test_database_url(value: str) -> Any:
+    """Fail closed before engine creation; never include credentials in errors."""
+    try:
+        url = make_url(value)
+        if (url.drivername not in {"postgresql", "postgresql+psycopg"}
+                or url.host != "127.0.0.1" or url.port != 55432
+                or url.database != "eggsor_restore_test" or url.query):
+            raise ValueError()
+    except Exception:
+        raise ConfigurationError(
+            "LOCAL_TEST_DATABASE_URL must target PostgreSQL at "
+            "127.0.0.1:55432/eggsor_restore_test without query parameters."
+        ) from None
+    return url.set(drivername="postgresql+psycopg")
+
+
+def disposable_write_database_url(value: str) -> Any:
+    """Accept only the dedicated Phase 2B database and login, without leaking a URL."""
+    try:
+        url = make_url(value)
+        if (url.drivername not in {"postgresql", "postgresql+psycopg"}
+                or url.host != "127.0.0.1" or url.port != 55432
+                or url.database != "eggsor_p2b_disposable"
+                or url.username != "eggsor_phase2b_runner"
+                or not url.password or url.query):
+            raise ValueError()
+    except Exception:
+        raise ConfigurationError(
+            "PHASE2B_WRITE_TEST_DATABASE_URL must use the dedicated runner at "
+            "127.0.0.1:55432/eggsor_p2b_disposable without query parameters."
+        ) from None
+    return url.set(drivername="postgresql+psycopg")
+
+
+def production_database_url(value: str) -> Any:
+    """Pin the only Supabase project permitted by this feature branch."""
+    try:
+        url = make_url(value)
+        if (url.drivername not in {"postgresql", "postgresql+psycopg"}
+                or url.host != "aws-0-ap-northeast-2.pooler.supabase.com"
+                or url.port != 5432 or url.database != "postgres"
+                or url.username != "postgres.gtsymkfcoslnobitdheu"
+                or not url.password or url.query):
+            raise ValueError()
+    except Exception:
+        raise ConfigurationError(
+            "Production mode requires the configured EGGSor+ Supabase project "
+            "gtsymkfcoslnobitdheu; check the database target privately."
+        ) from None
+    return url.set(drivername="postgresql+psycopg")
+
+
 def build_app_config() -> dict[str, Any]:
     """Build Flask configuration from validated environment values."""
+    local_test_mode = env_bool("LOCAL_TEST_MODE", False)
+    write_test_mode = env_bool("PHASE2B_WRITE_TEST_MODE", False)
+    production_mode = env_bool("EGGSOR_PRODUCTION_DB_MODE", False)
+    if sum((local_test_mode, write_test_mode, production_mode)) > 1:
+        raise ConfigurationError("Database runtime modes cannot be combined.")
+    # Validate the dedicated target before reading unrelated application settings.
+    test_url = local_test_database_url(env_text("LOCAL_TEST_DATABASE_URL")) if local_test_mode else None
+    write_url = disposable_write_database_url(env_text("PHASE2B_WRITE_TEST_DATABASE_URL")) if write_test_mode else None
+    production_url = production_database_url(
+        env_text("SUPABASE_DB_URL") or env_text("DATABASE_URL")
+    ) if production_mode else None
     public_base_url = (
         env_text("PUBLIC_BASE_URL") or env_text("RENDER_EXTERNAL_URL")
     ).rstrip("/")
@@ -126,14 +190,23 @@ def build_app_config() -> dict[str, Any]:
             "MAIL_USE_TLS and MAIL_USE_SSL cannot both be enabled."
         )
 
-    database_url = normalize_database_url(
+    database_url = production_url if production_mode else write_url if write_test_mode else test_url if local_test_mode else normalize_database_url(
         env_text("SUPABASE_DB_URL") or env_text("DATABASE_URL")
     )
+    if not (local_test_mode or write_test_mode or production_mode) and database_url.startswith("postgresql"):
+        raise ConfigurationError(
+            "Phase 2A PostgreSQL startup requires LOCAL_TEST_MODE and the "
+            "dedicated local test target. Production startup is not enabled on this branch."
+        )
     local_hardware_enabled = env_bool(
         "LOCAL_HARDWARE_ENABLED",
         not bool(env_text("RENDER") or env_text("RENDER_SERVICE_ID")),
     )
     config = {
+        "LOCAL_TEST_MODE": local_test_mode,
+        "PHASE2B_WRITE_TEST_MODE": write_test_mode,
+        "EGGSOR_PRODUCTION_DB_MODE": production_mode,
+        "LIFECYCLE_WRITES_ENABLED": False,
         "SECRET_KEY": secret_key,
         "PERMANENT_SESSION_LIFETIME": timedelta(days=30),
         "SESSION_COOKIE_HTTPONLY": True,
@@ -166,6 +239,42 @@ def build_app_config() -> dict[str, Any]:
         "SQLALCHEMY_DATABASE_URI": database_url,
         "SQLALCHEMY_TRACK_MODIFICATIONS": False,
     }
+    if local_test_mode:
+        config.update(
+            LOCAL_HARDWARE_ENABLED=False,
+            AUTO_START_SORTING_ON_LOGIN=False,
+            GOOGLE_CLIENT_ID="", GOOGLE_CLIENT_SECRET="",
+            MAIL_SERVER="", MAIL_PASSWORD="",
+            SQLALCHEMY_ENGINE_OPTIONS={"connect_args": {
+                "host": "127.0.0.1", "hostaddr": "127.0.0.1", "port": 55432,
+                "dbname": "eggsor_restore_test", "sslmode": "disable",
+                "connect_timeout": 5,
+                "options": "-c default_transaction_read_only=on",
+            }},
+        )
+    if write_test_mode:
+        config.update(
+            LOCAL_HARDWARE_ENABLED=False,
+            AUTO_START_SORTING_ON_LOGIN=False,
+            GOOGLE_CLIENT_ID="", GOOGLE_CLIENT_SECRET="",
+            MAIL_SERVER="", MAIL_PASSWORD="",
+            SQLALCHEMY_ENGINE_OPTIONS={
+                "connect_args": {
+                    "host": "127.0.0.1", "hostaddr": "127.0.0.1", "port": 55432,
+                    "dbname": "eggsor_p2b_disposable", "sslmode": "disable",
+                    "connect_timeout": 5, "options": "-c search_path=pg_catalog",
+                },
+                "execution_options": {"schema_translate_map": {None: "eggsor_p2b_test"}},
+            },
+        )
+    if production_mode:
+        config.update(
+            LIFECYCLE_WRITES_ENABLED=env_bool("EGGSOR_PRODUCTION_SORTING_ENABLED", False),
+            SQLALCHEMY_ENGINE_OPTIONS={"connect_args": {
+                "host": "aws-0-ap-northeast-2.pooler.supabase.com", "port": 5432,
+                "dbname": "postgres", "sslmode": "require", "connect_timeout": 5,
+            }},
+        )
     if public_base_url.startswith("https://"):
         public_host = urlsplit(public_base_url).hostname
         if public_host:

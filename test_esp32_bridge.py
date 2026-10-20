@@ -5,21 +5,88 @@ from esp32_bridge import Esp32Bridge, Esp32ProtocolParser
 
 
 class Esp32BridgeDiagnosticsTests(unittest.TestCase):
-    def test_sort_egg_sends_expected_serial_command(self) -> None:
+    def test_automatic_protocol_handshake_is_parsed_and_exposed(self):
         bridge = Esp32Bridge()
-        bridge._connected = True
-        bridge._serial = Mock()
-        command = bridge.sort_egg("Large")
-        self.assertEqual(command, "SORT:LARGE")
-        bridge._serial.write.assert_called_once_with(b"SORT:LARGE\n")
+        event = Esp32ProtocolParser().parse("PROTOCOL: EGGSORT_AUTO_V1")[0]
+        bridge._publish(event)
+        self.assertEqual(bridge.status()["diagnostics"]["controller_protocol"], "EGGSORT_AUTO_V1")
+        self.assertTrue(bridge.status()["diagnostics"]["automatic_release"])
 
-    def test_reject_waits_for_controller_startup(self) -> None:
+    def test_tagged_hardware_failure_retains_exact_reason_and_cycle(self):
+        bridge = Esp32Bridge()
+        event = Esp32ProtocolParser().parse(
+            "MEASURE FAILED: RELEASE NOT CLEARED; CHECK SCALE OR BLOCKED EGG; CYCLE:7")[0]
+        bridge._publish(event)
+        self.assertEqual(event["cycle_id"], 7)
+        self.assertIn("RELEASE NOT CLEARED", bridge.status()["diagnostics"]["flow_error"])
+
+    def test_automatic_cycle_protocol_does_not_require_camera_capture_id(self):
+        parser = Esp32ProtocolParser()
+        detected = parser.parse("EGG DETECTED; CYCLE:3")[0]
+        parser.parse("FINAL WEIGHT: 59 g; CYCLE:3")
+        measured = parser.parse("SIZE: LARGE; CYCLE:3")[0]
+        sorted_egg = parser.parse("SERVO SORTED: LARGE; CYCLE:3")[0]
+        removed = parser.parse("EGG LEFT; CYCLE:3")[0]
+        self.assertEqual(measured["weight_grams"], 59)
+        for event in (detected, measured, sorted_egg, removed):
+            self.assertEqual(event["cycle_id"], 3)
+            self.assertNotIn("capture_id", event)
+
+    def test_automatic_status_does_not_claim_camera_is_blocking_gate(self):
+        bridge = Esp32Bridge()
+        bridge._publish({"type": "egg_detected", "cycle_id": 1})
+        bridge._publish({"type": "weight_reading", "weight_grams": 59})
+        self.assertIn("stabilizing for 1.5 s", bridge.status()["diagnostics"]["latest_sensor_event"])
+
+    def test_weight_stability_progress_is_parsed_and_displayed(self):
+        event = Esp32ProtocolParser().parse("WEIGHT STABILITY: 750/1500 ms; CYCLE:7")[0]
+        self.assertEqual(event["cycle_id"], 7)
+        bridge = Esp32Bridge()
+        bridge._publish(event)
+        self.assertIn("0.8/1.5 s; gate closed", bridge.status()["diagnostics"]["latest_sensor_event"])
+
+    def test_camera_authorization_error_survives_repeated_weight_telemetry(self):
+        bridge = Esp32Bridge()
+        bridge.publish_status("Camera/session mismatch", "flow_error")
+        for weight in (62, 63, 63):
+            bridge._publish({"type": "weight_reading", "weight_grams": weight})
+        self.assertEqual(bridge.status()["diagnostics"]["flow_error"], "Camera/session mismatch")
+        bridge._publish({"type": "measurement_command", "quality": "Good", "capture_id": 1})
+        self.assertIsNone(bridge.status()["diagnostics"]["flow_error"])
+    def test_measurement_command_includes_original_camera_capture(self):
         bridge = Esp32Bridge()
         bridge._connected = True
         bridge._serial = Mock()
-        with self.assertRaises(RuntimeError):
-            bridge.reject_egg("Crack")
-        bridge._serial.write.assert_called_once_with(b"STATUS\n")
+        bridge.measure_egg("Good", capture_id=7)
+        bridge._serial.write.assert_called_once_with(b"MEASURE:GOOD:7\n")
+        self.assertEqual(bridge.status()["diagnostics"]["capture_id"], 7)
+
+    def test_tagged_weight_size_and_sort_retain_capture_identity(self):
+        parser = Esp32ProtocolParser()
+        parser.parse("FINAL WEIGHT: 52 g; CAPTURE:7")
+        measured = parser.parse("SIZE: MEDIUM; CAPTURE:7")[0]
+        sorted_egg = parser.parse("SERVO SORTED: MEDIUM; CAPTURE:7")[0]
+        self.assertEqual(measured["weight_grams"], 52)
+        self.assertEqual(measured["capture_id"], 7)
+        self.assertEqual(sorted_egg["capture_id"], 7)
+
+    def test_size_cannot_take_weight_from_a_different_capture(self):
+        parser = Esp32ProtocolParser()
+        parser.parse("FINAL WEIGHT: 52 g; CAPTURE:7")
+        measured = parser.parse("SIZE: MEDIUM; CAPTURE:8")[0]
+        self.assertIsNone(measured["weight_grams"])
+
+    def test_actual_firmware_ready_banners_are_recognized(self):
+        parser = Esp32ProtocolParser()
+        for banner in ("READY FOR EGG", "READY FOR NEXT EGG", "Egg Sorting Ready"):
+            self.assertEqual(parser.parse(banner)[0]["type"], "ready")
+
+    def test_reject_does_not_wait_for_status_during_sorting(self) -> None:
+        bridge = Esp32Bridge()
+        bridge._connected = True
+        bridge._serial = Mock()
+        bridge.reject_egg("Crack")
+        bridge._serial.write.assert_called_once_with(b"REJECT:CRACK\n")
         bridge._serial.write.reset_mock()
         bridge._publish({"type": "pca9685_status", "ready": True})
         bridge.reject_egg("Rotten")
@@ -31,8 +98,7 @@ class Esp32BridgeDiagnosticsTests(unittest.TestCase):
         bridge._serial = Mock()
         with patch("esp32_bridge.monotonic", side_effect=[0.0, 0.2, 3.1]):
             for _ in range(3):
-                with self.assertRaises(RuntimeError):
-                    bridge.reject_egg("Crack")
+                bridge._request_hardware_status()
         self.assertEqual(bridge._serial.write.call_args_list, [call(b"STATUS\n")] * 2)
 
     def test_connection_recovers_readiness_without_startup_banner(self) -> None:

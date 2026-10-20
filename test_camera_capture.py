@@ -1,43 +1,95 @@
 import unittest
 from unittest.mock import Mock, patch
 
-from camera_session import CameraDetectionSession
+from camera_session import CameraDetectionSession, CameraSessionError
 from esp32_bridge import Esp32Bridge
 
 
 class CameraAutoCaptureTests(unittest.TestCase):
-    def test_start_initializes_running_session_with_mocked_dependencies(self) -> None:
+    def test_mixed_detections_keep_good_eggs_in_original_pending_order(self):
         session = CameraDetectionSession()
+        for quality in ("good", "crack", "good", "rotten", "good"):
+            for label in (quality, "no egg", "no egg"):
+                session._update_auto_capture(label, 0.9)
+        self.assertEqual([session.wait_for_captured_quality(0)["capture_id"]
+                          for _ in range(3)], [1, 3, 5])
+        self.assertIsNone(session.wait_for_captured_quality(0))
 
-        class FakeThread:
-            def __init__(self, *args, **kwargs):
-                self._alive = False
+    def test_loaded_good_egg_does_not_need_to_leave_camera_before_release(self):
+        session = CameraDetectionSession()
+        session._running = True
+        session.capture_min_samples = 1
+        session._update_auto_capture("good", 0.9)
+        capture = session.wait_for_captured_quality(0, allow_loaded_capture=True)
+        self.assertEqual(capture["capture_id"], 1)
+        self.assertEqual(capture["label"], "good")
+        self.assertTrue(capture["claimed_on_scale"])
+        self.assertEqual(session.status()["egg_count"], 1)
+        for label in ("good", "good", "no egg", "no egg"):
+            self.assertIsNone(session._update_auto_capture(label, 0.9))
+        self.assertIsNone(session.wait_for_captured_quality(0, allow_loaded_capture=True))
+        self.assertEqual(session.status()["egg_count"], 1)
+        for label in ("good", "no egg", "no egg"):
+            session._update_auto_capture(label, 0.9)
+        self.assertEqual(session.wait_for_captured_quality(0)["capture_id"], 2)
 
-            def start(self):
-                self._alive = True
+    def test_loaded_capture_requires_three_good_frames_without_any_defect(self):
+        for labels in (("good", "good"), ("crack", "good", "good", "good"),
+                       ("rotten", "good", "good", "good"), ("good", "good", "no egg")):
+            with self.subTest(labels=labels):
+                session = CameraDetectionSession()
+                session.capture_min_samples = 3
+                session._running = True
+                for label in labels:
+                    session._update_auto_capture(label, 0.9)
+                self.assertIsNone(session.wait_for_captured_quality(0, allow_loaded_capture=True))
+                self.assertEqual(session.status()["egg_count"], 0)
 
-            def is_alive(self):
-                return self._alive
+    def test_queued_egg_keeps_priority_over_visible_loaded_capture(self):
+        session = CameraDetectionSession()
+        for label in ("good", "no egg", "no egg", "good", "good", "good"):
+            session._update_auto_capture(label, 0.9)
+        capture = session.wait_for_captured_quality(0, allow_loaded_capture=True)
+        self.assertEqual(capture["capture_id"], 1)
+        self.assertNotIn("claimed_on_scale", capture)
 
-            def join(self, timeout=None):
-                self._alive = False
+    def test_cancelled_scale_wait_cannot_consume_next_capture(self):
+        session = CameraDetectionSession()
+        for label in ("good", "no egg", "no egg"):
+            session._update_auto_capture(label, 0.9)
+        self.assertIsNone(session.wait_for_captured_quality(0, is_current=lambda: False))
+        self.assertEqual(session.wait_for_captured_quality(0)["capture_id"], 1)
 
-        with (
-            patch.dict("sys.modules", {"cv2": Mock()}),
-            patch("camera_session.detector_info", return_value={
-                "path": "/tmp/model.pt",
-                "class_count": 3,
-                "classes": ["Crack", "Good", "Rotten"],
-                "confidence": 0.25,
-                "image_size": 512,
-            }),
-            patch("camera_session.Thread", FakeThread),
-        ):
-            state = session.start()
-            self.assertTrue(state["running"])
-            self.assertEqual(state["model"]["class_count"], 3)
-            stopped = session.stop()
-            self.assertFalse(stopped["running"])
+    def test_expired_capture_is_not_silently_replaced_by_next_egg(self):
+        session = CameraDetectionSession()
+        session._captured_qualities.extend([
+            {"capture_id": 1, "captured_at": 0},
+            {"capture_id": 2, "captured_at": 100},
+        ])
+        with patch("camera_session.monotonic", return_value=100):
+            with self.assertRaises(CameraSessionError):
+                session.wait_for_captured_quality(0)
+        self.assertEqual(session._captured_qualities[0]["capture_id"], 1)
+
+    def test_brief_defect_is_recorded_even_below_good_sample_threshold(self):
+        session = self.make_session()
+        handler = Mock()
+        session.set_capture_handler(handler)
+        session.set_reject_handler(Mock())
+        for label in ("crack", "no egg", "no egg"):
+            session._process_auto_capture(label, 0.9)
+        handler.assert_called_once()
+        self.assertEqual(handler.call_args.args[0]["label"], "crack")
+        self.assertFalse(session._captured_qualities)
+
+    def test_stop_releases_camera_before_waiting_for_workers(self) -> None:
+        session = CameraDetectionSession()
+        capture = Mock()
+        session._capture = capture
+
+        session.stop()
+
+        capture.release.assert_called_once_with()
 
     def test_rotten_cannot_be_overwritten_by_later_good(self) -> None:
         session = self.make_session()
@@ -228,6 +280,8 @@ class CameraAutoCaptureTests(unittest.TestCase):
                 bridge = Esp32Bridge()
                 bridge._connected = True
                 bridge._serial = Mock()
+                # End the simulated loop after the reject command, not during inference.
+                bridge._serial.write.side_effect = lambda _data: session._stop_event.set()
                 bridge._diagnostics["pca9685_ready"] = True
                 session.set_reject_handler(bridge.reject_egg)
                 frame = Mock()
@@ -237,7 +291,6 @@ class CameraAutoCaptureTests(unittest.TestCase):
                 session._raw_sequence = 1
 
                 def detect(_frame):
-                    session._stop_event.set()
                     return {"detections": [{
                         "label": defect, "confidence": 0.9,
                         "box": [40, 40, 60, 60],

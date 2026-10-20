@@ -7,12 +7,18 @@ class EggStandardsTests(unittest.TestCase):
     def test_reference_weight_boundaries(self) -> None:
         cases = {
             44: "Small",
-            45: "Medium",
+            45: "Small",
+            49: "Small",
+            50: "Medium",
             54: "Medium",
-            55: "Large",
-            62: "Large",
+            55: "Medium",
+            56: "Large",
+            61: "Large",
+            62: "Extra Large",
             63: "Extra Large",
-            69: "Extra Large",
+            66: "Extra Large",
+            67: "Jumbo",
+            69: "Jumbo",
             70: "Jumbo",
         }
         for weight, expected in cases.items():
