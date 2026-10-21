@@ -245,21 +245,22 @@
           class="flex bg-surface-container-low rounded-lg p-1 border border-surface-variant/50 overflow-x-auto"
           >
           <button
-            id="filter-all"
-            class="px-4 md:px-6 py-2 rounded-md font-button text-button bg-inverse-surface text-white shadow-sm whitespace-nowrap"
-          >
-            All Alerts
-          </button>
-          <button
             id="filter-unread"
-            class="px-4 md:px-6 py-2 rounded-md font-button text-button text-secondary hover:text-on-surface transition-colors whitespace-nowrap"
+            class="px-4 md:px-6 py-2 rounded-md font-button text-button bg-inverse-surface text-white shadow-sm whitespace-nowrap"
           >
             Unread
             <span
               id="unread-count"
               class="ml-1 bg-primary text-white text-[10px] px-1.5 py-0.5 rounded-full"
+              style="color: #ffffff !important"
               >0</span
             >
+          </button>
+          <button
+            id="filter-read"
+            class="px-4 md:px-6 py-2 rounded-md font-button text-button text-secondary hover:text-on-surface transition-colors whitespace-nowrap"
+          >
+            Read
           </button>
         </div>
       </div>
@@ -273,7 +274,7 @@
         <div id="alerts-list" class="relative z-10 space-y-3"></div>
         <div
           id="alerts-empty"
-          class="flex flex-col items-center text-center max-w-md relative z-10"
+          class="hidden flex flex-col items-center text-center max-w-md relative z-10"
           style="margin: min(12vh, 7rem) auto"
         >
           <div
@@ -289,14 +290,15 @@
               >inventory_2</span
             >
           </div>
-          <h3 class="font-headline-md text-headline-md text-on-surface mb-2">
-            No tray completion alerts
+          <h3 id="alerts-empty-title" class="font-headline-md text-headline-md text-on-surface mb-2">
+            No tray completion alerts yet.
           </h3>
-          <p class="font-body-lg text-body-lg text-secondary mb-8">
+          <p id="alerts-empty-message" class="font-body-lg text-body-lg text-secondary mb-8">
             A live alert will appear here whenever another tray reaches 30
             sorted and weighed eggs.
           </p>
           <a
+            id="alerts-empty-dashboard-link"
             class="flex items-center justify-center gap-2 bg-primary-container text-white font-button text-button h-[48px] px-8 rounded-lg hover:bg-primary transition-colors shadow-md shadow-primary/20"
             href="/dashboard"
           >
@@ -305,6 +307,12 @@
               >arrow_forward</span
             >
           </a>
+        </div>
+        <div id="alerts-error" class="hidden relative z-10 max-w-2xl mx-auto my-6 rounded-xl border border-red-200 bg-red-50 p-4 text-red-900" role="alert" aria-live="assertive">
+          <p id="alerts-error-message" class="font-body-md"></p>
+          <button id="alerts-retry" type="button" class="mt-3 rounded-lg border border-red-300 bg-white px-4 py-2 font-button text-sm hover:bg-red-100 focus:outline-none focus:ring-2 focus:ring-red-400">
+            Retry
+          </button>
         </div>
       </div>
     </main>
@@ -320,10 +328,20 @@
     const alertsEmpty = document.getElementById('alerts-empty');
     const unreadCount = document.getElementById('unread-count');
     const searchInput = document.getElementById('alert-search');
-    const allButton = document.getElementById('filter-all');
     const unreadButton = document.getElementById('filter-unread');
-    let activeFilter = 'all';
+    const readButton = document.getElementById('filter-read');
+    const emptyTitle = document.getElementById('alerts-empty-title');
+    const emptyMessage = document.getElementById('alerts-empty-message');
+    const emptyDashboardLink = document.getElementById('alerts-empty-dashboard-link');
+    const alertsError = document.getElementById('alerts-error');
+    const alertsErrorMessage = document.getElementById('alerts-error-message');
+    const retryButton = document.getElementById('alerts-retry');
+    let activeFilter = 'unread';
     let alertRows = [];
+    let hasLoadedAlerts = false;
+    let loadedFilter = null;
+    let alertsRequestPending = false;
+    let alertsRefreshQueued = false;
 
     function formatAlertTime(value) {
       const date = new Date(value);
@@ -344,15 +362,66 @@
       return element;
     }
 
+    async function markAlertRead(alert, button) {
+      if (button.disabled) return;
+      button.disabled = true;
+      try {
+        const result = await EggSortAlerts.request(
+          `/api/alerts/${encodeURIComponent(alert.id)}/read`,
+          { method: 'POST' }
+        );
+        const currentAlert = alertRows.find((row) => row.id === alert.id);
+        if (currentAlert) currentAlert.is_read = true;
+        const currentUnreadCount = Number(unreadCount.textContent) || 0;
+        const confirmedUnreadCount = Number.isFinite(Number(result.unread_count))
+          ? Number(result.unread_count)
+          : Math.max(0, currentUnreadCount - 1);
+        unreadCount.textContent = confirmedUnreadCount;
+        window.__eggsorUnreadCount = confirmedUnreadCount;
+        window.EggSortUnreadBadge?.update(confirmedUnreadCount);
+        renderAlerts();
+        await fetchAlerts(true);
+      } catch (error) {
+        await EggSortAlerts.error(error.message || 'Unable to mark this alert as read.');
+      } finally {
+        button.disabled = false;
+      }
+    }
+
     function renderAlerts() {
       const term = searchInput.value.trim().toLowerCase();
-      const visibleRows = alertRows.filter((alert) => {
+      if (!hasLoadedAlerts || loadedFilter !== activeFilter) {
+        alertsList.replaceChildren();
+        alertsEmpty.classList.add('hidden');
+        return;
+      }
+      const filteredRows = alertRows.filter((alert) => {
+        if (activeFilter === 'read') return alert.is_read;
+        if (activeFilter === 'unread') return !alert.is_read;
+        return true;
+      });
+      const visibleRows = filteredRows.filter((alert) => {
         const searchable = `${alert.title} ${alert.message} ${alert.session_ref}`.toLowerCase();
         return searchable.includes(term);
       });
 
       alertsList.replaceChildren();
       alertsEmpty.classList.toggle('hidden', visibleRows.length > 0);
+      if (visibleRows.length === 0) {
+        if (activeFilter === 'unread' && filteredRows.length === 0) {
+          emptyTitle.textContent = "You're all caught up!";
+          emptyMessage.textContent = 'New tray completion alerts will appear here when they arrive.';
+          emptyDashboardLink.classList.add('hidden');
+        } else if (activeFilter === 'read' && filteredRows.length === 0) {
+          emptyTitle.textContent = 'No read alerts yet.';
+          emptyMessage.textContent = 'Alerts you acknowledge will appear here.';
+          emptyDashboardLink.classList.add('hidden');
+        } else if (term) {
+          emptyTitle.textContent = 'No matching alerts found.';
+          emptyMessage.textContent = 'No alerts match your search in this tab.';
+          emptyDashboardLink.classList.add('hidden');
+        }
+      }
 
       visibleRows.forEach((alert) => {
         const card = document.createElement('article');
@@ -390,10 +459,24 @@
 
         card.append(icon, details);
         if (!alert.is_read) {
+          const markReadButton = makeTextElement(
+            'button',
+            'self-start sm:self-center rounded-lg border border-primary/30 bg-white px-3 py-2 text-sm font-medium text-primary hover:bg-primary/5 focus:outline-none focus:ring-2 focus:ring-primary/40 disabled:cursor-wait disabled:opacity-60',
+            'Mark as Read'
+          );
+          markReadButton.type = 'button';
+          markReadButton.addEventListener('click', () => markAlertRead(alert, markReadButton));
+          card.appendChild(markReadButton);
           card.appendChild(makeTextElement(
             'span',
             'self-start sm:self-center text-xs font-semibold text-primary bg-primary/10 rounded-full px-3 py-1',
             'UNREAD'
+          ));
+        } else {
+          card.appendChild(makeTextElement(
+            'span',
+            'self-start sm:self-center text-xs font-semibold text-secondary bg-surface-container rounded-full px-3 py-1',
+            'READ'
           ));
         }
         alertsList.appendChild(card);
@@ -404,17 +487,24 @@
       activeFilter = filter;
       const activeClasses = ['bg-inverse-surface', 'text-white', 'shadow-sm'];
       const inactiveClasses = ['text-secondary', 'hover:text-on-surface'];
-      [[allButton, 'all'], [unreadButton, 'unread']].forEach(([button, value]) => {
+      [[unreadButton, 'unread'], [readButton, 'read']].forEach(([button, value]) => {
         const active = value === filter;
         button.classList.remove(...(active ? inactiveClasses : activeClasses));
         button.classList.add(...(active ? activeClasses : inactiveClasses));
       });
+      renderAlerts();
       fetchAlerts();
     }
 
-    async function fetchAlerts() {
+    async function fetchAlerts(force = false) {
+      if (alertsRequestPending) {
+        if (force) alertsRefreshQueued = true;
+        return;
+      }
+      alertsRequestPending = true;
+      const requestedFilter = activeFilter;
       try {
-        const response = await fetch(`/api/alerts?filter=${activeFilter}`, {
+        const response = await fetch(`/api/alerts?filter=${requestedFilter}`, {
           cache: 'no-store'
         });
         if (response.status === 401) {
@@ -423,24 +513,56 @@
         }
         if (!response.ok) throw new Error('Unable to load alerts');
         const data = await response.json();
+        if (requestedFilter !== activeFilter) return;
         alertRows = data.alerts || [];
-        unreadCount.textContent = data.unread_count || 0;
+        const confirmedUnreadCount = Number(data.unread_count);
+        if (Number.isFinite(confirmedUnreadCount) && confirmedUnreadCount >= 0) {
+          unreadCount.textContent = confirmedUnreadCount;
+          window.__eggsorUnreadCount = confirmedUnreadCount;
+          window.EggSortUnreadBadge?.update(confirmedUnreadCount);
+        }
+        hasLoadedAlerts = true;
+        loadedFilter = requestedFilter;
+        alertsError.classList.add('hidden');
         renderAlerts();
       } catch (error) {
         console.error(error);
+        if (loadedFilter !== activeFilter) {
+          alertsList.replaceChildren();
+          alertsEmpty.classList.add('hidden');
+        }
+        alertsErrorMessage.textContent = hasLoadedAlerts
+          ? loadedFilter === activeFilter
+            ? 'Could not refresh alerts. The previously loaded alerts are shown and may be out of date.'
+            : 'Could not load alerts for this filter. Older results are hidden until the refresh succeeds.'
+          : 'Could not load alerts. Check your connection and retry.';
+        alertsError.classList.remove('hidden');
+      } finally {
+        alertsRequestPending = false;
+        const refreshAgain = alertsRefreshQueued || requestedFilter !== activeFilter;
+        alertsRefreshQueued = false;
+        if (refreshAgain) fetchAlerts();
       }
     }
 
-    allButton.addEventListener('click', () => setActiveFilter('all'));
     unreadButton.addEventListener('click', () => setActiveFilter('unread'));
+    readButton.addEventListener('click', () => setActiveFilter('read'));
     searchInput.addEventListener('input', renderAlerts);
+    retryButton.addEventListener('click', () => fetchAlerts(true));
     document.getElementById('mark-all-read').addEventListener('click', async (event) => {
       await EggSortAlerts.run({
-        button: event.currentTarget, title: 'Mark all alerts as read?',
-        text: 'All unread alerts will be marked as read.', success: 'All alerts marked as read.',
+        button: event.currentTarget, title: 'Mark all unread alerts as read?',
+        text: 'All unread tray completion alerts will be marked as read.',
+        confirmButtonText: 'Mark All as Read', success: 'All alerts marked as read.',
         action: async () => {
-          await EggSortAlerts.request('/api/alerts/read-all', { method: 'POST' });
-          await fetchAlerts();
+          const result = await EggSortAlerts.request('/api/alerts/read-all', { method: 'POST' });
+          const confirmedUnreadCount = Number(result.unread_count);
+          if (Number.isFinite(confirmedUnreadCount) && confirmedUnreadCount >= 0) {
+            unreadCount.textContent = confirmedUnreadCount;
+            window.__eggsorUnreadCount = confirmedUnreadCount;
+            window.EggSortUnreadBadge?.update(confirmedUnreadCount);
+          }
+          await fetchAlerts(true);
         },
       });
     });

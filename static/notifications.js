@@ -13,9 +13,9 @@
   };
 
   window.EggSortAlerts = {
-    confirm: async (title, text, destructive = false) => (await dialog({
+    confirm: async (title, text, destructive = false, confirmButtonText = 'Confirm') => (await dialog({
       title, text, icon: destructive ? 'warning' : 'question', showCancelButton: true,
-      confirmButtonText: 'Confirm', cancelButtonText: 'Cancel', focusCancel: true,
+      confirmButtonText, cancelButtonText: 'Cancel', focusCancel: true,
       confirmButtonColor: destructive ? '#ba1a1a' : '#4a7355',
     })).isConfirmed,
     success: (text) => dialog({ title: 'Success', text, icon: 'success' }),
@@ -29,11 +29,11 @@
       }
       return payload;
     },
-    async run({ button, title, text, destructive = false, success, action }) {
+    async run({ button, title, text, destructive = false, success, action, confirmButtonText = 'Confirm' }) {
       if (button?.disabled) return;
       if (button) button.disabled = true;
       try {
-        if (!await this.confirm(title, text, destructive)) return;
+        if (!await this.confirm(title, text, destructive, confirmButtonText)) return;
         const result = await action();
         await this.success(success);
         return result;

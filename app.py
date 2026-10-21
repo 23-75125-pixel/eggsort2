@@ -2084,10 +2084,12 @@ def clear_dashboard_audit_logs() -> Any:
 @app.get("/api/alerts")
 @login_required
 def alerts_data() -> Any:
-    unread_only = request.args.get("filter") == "unread"
+    alert_filter = request.args.get("filter", "all")
     query = TrayAlert.query
-    if unread_only:
+    if alert_filter == "unread":
         query = query.filter_by(is_read=False)
+    elif alert_filter == "read":
+        query = query.filter_by(is_read=True)
     alerts_list = (
         query.order_by(TrayAlert.id.desc()).limit(MAX_ALERT_RESULTS).all()
     )
@@ -2095,6 +2097,24 @@ def alerts_data() -> Any:
         alerts=[alert.to_dict() for alert in alerts_list],
         unread_count=TrayAlert.query.filter_by(is_read=False).count(),
     )
+
+
+@app.post("/api/alerts/<int:alert_id>/read")
+@login_required
+def mark_alert_read(alert_id: int) -> Any:
+    if alert_id < 1:
+        return jsonify(error="Invalid alert ID."), 400
+
+    alert = db.session.get(TrayAlert, alert_id)
+    if alert is None:
+        return jsonify(error="Alert not found."), 404
+
+    if not alert.is_read:
+        alert.is_read = True
+    alert_data = alert.to_dict()
+    unread_count = TrayAlert.query.filter_by(is_read=False).count()
+    db.session.commit()
+    return jsonify(ok=True, alert=alert_data, unread_count=unread_count)
 
 
 @app.post("/api/alerts/read-all")
