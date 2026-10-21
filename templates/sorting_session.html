@@ -210,7 +210,7 @@
     <span class="material-symbols-outlined text-[28px] md:text-[32px] text-primary-container" style="font-variation-settings: 'FILL' 0;">photo_camera</span>
   </div>
   <h3 class="font-headline-md text-headline-md text-on-surface mb-2 relative z-10">{% if local_hardware_enabled %}Sorting Session Is Not Running{% else %}Operate the Machine on the Sorting Computer{% endif %}</h3>
-  <p class="font-body-md text-body-md text-secondary max-w-md mx-auto mb-6 md:mb-8 relative z-10">{% if local_hardware_enabled %}The camera and ESP32 normally start automatically after login. Use this button to restart them if they were stopped.{% else %}Open EggSort+ on the computer connected to the camera and ESP32 to start or stop sorting. Completed egg records are available here when both apps use the same database.{% endif %}</p>
+  <p class="font-body-md text-body-md text-secondary max-w-md mx-auto mb-6 md:mb-8 relative z-10">{% if local_hardware_enabled %}The camera and ESP32 stay stopped until you start them here. Use this button when you are ready to sort.{% else %}Open EggSort+ on the computer connected to the camera and ESP32 to start or stop sorting. Completed egg records are available here when both apps use the same database.{% endif %}</p>
   <button id="start-camera" type="button" data-hardware-enabled="{{ 'true' if local_hardware_enabled else 'false' }}" {% if not local_hardware_enabled %}disabled aria-disabled="true"{% endif %} class="h-12 bg-[#4a7355] hover:bg-primary transition-colors text-white font-button text-button px-5 md:px-8 rounded-lg flex items-center gap-2 shadow-sm relative z-10 w-full md:w-auto justify-center disabled:opacity-50 disabled:cursor-not-allowed">
     <span class="material-symbols-outlined text-[20px]">videocam</span>
     Restart Camera &amp; ESP32
@@ -306,6 +306,8 @@ const latestEggRecord = document.getElementById('latest-egg-record');
 let statusTimer = null;
 let cameraStatusTimer = null;
 let cameraStatusPending = false;
+let cameraActionPending = false;
+let cameraActionRevision = 0;
 let feedConnected = false;
 function showCameraError(message) {
   errorPanel.textContent = message;
@@ -439,16 +441,19 @@ function showStoppedSession(state = {}) {
 }
 
 async function refreshSessionState(reconnectFeed = false) {
-  if (cameraStatusPending) return;
+  if (cameraStatusPending || cameraActionPending) return;
   cameraStatusPending = true;
+  const revision = cameraActionRevision;
   try {
     const state = await requestJson('/api/camera/status');
+    if (cameraActionPending || revision !== cameraActionRevision) return;
     if (state.running) {
       showRunningSession(state, reconnectFeed);
     } else {
       showStoppedSession(state);
     }
   } catch (error) {
+    if (cameraActionPending || revision !== cameraActionRevision) return;
     showStoppedSession();
     showCameraError(error.message);
   } finally {
@@ -505,7 +510,7 @@ async function refreshHardwareState() {
     } else if (hardware.connected && diagnostics.measurement_weight_grams != null) {
       const readingNumber = diagnostics.measurement_reading_number ?? 1;
       hardwareEvent.textContent =
-        `${captureLabel} • Scale reading ${readingNumber}: ${diagnostics.measurement_weight_grams} g${qualityText} • waiting for 1.5 s of stable weight`;
+        `${captureLabel} • Scale reading ${readingNumber}: ${diagnostics.measurement_weight_grams} g${qualityText} • waiting for 1 s of stable weight`;
     } else if (hardware.connected && !diagnostics.awaiting_egg) {
       const weightText = diagnostics.live_weight_grams != null
         ? `${diagnostics.live_weight_grams} g`
@@ -550,10 +555,12 @@ function startStatusPolling() {
 async function startCameraSession() {
   if (startButton.disabled) return;
   startButton.disabled = true;
-  if (!await EggSortAlerts.confirm('Start sorting session?', 'Start the camera and egg sorting hardware?')) {
+  if (!await EggSortAlerts.confirm('Restart camera and ESP32?', 'Start the sorting session now?')) {
     startButton.disabled = false;
     return;
   }
+  cameraActionPending = true;
+  cameraActionRevision++;
   clearCameraError();
   startButton.disabled = true;
   startButton.classList.add('opacity-60', 'cursor-wait');
@@ -571,18 +578,23 @@ async function startCameraSession() {
     showCameraError(error.message);
     await EggSortAlerts.error(error.message || 'Unable to start the sorting session.');
   } finally {
+    cameraActionPending = false;
+    cameraActionRevision++;
     startButton.disabled = false;
     startButton.classList.remove('opacity-60', 'cursor-wait');
+    refreshSessionState(false);
   }
 }
 
 async function stopCameraSession() {
   if (stopButton.disabled) return;
   stopButton.disabled = true;
-  if (!await EggSortAlerts.confirm('Stop sorting session?', 'Stop the camera and egg sorting hardware?')) {
+  if (!await EggSortAlerts.confirm('Stop sorting session?', 'Are you sure you want to stop the camera and ESP32?', true)) {
     stopButton.disabled = false;
     return;
   }
+  cameraActionPending = true;
+  cameraActionRevision++;
   stopButton.disabled = true;
   stopButton.classList.add('opacity-60', 'cursor-wait');
   statusText.textContent = 'Stopping camera session...';
@@ -594,12 +606,16 @@ async function stopCameraSession() {
   } catch (error) {
     // Recover the displayed state from the server: the stop may have finished
     // even when the browser lost the response.
+    cameraActionPending = false;
     await refreshSessionState(false);
     showCameraError(error.message);
     await EggSortAlerts.error(error.message || 'Unable to stop the sorting session.');
   } finally {
+    cameraActionPending = false;
+    cameraActionRevision++;
     stopButton.disabled = false;
     stopButton.classList.remove('opacity-60', 'cursor-wait');
+    refreshSessionState(false);
   }
 }
 

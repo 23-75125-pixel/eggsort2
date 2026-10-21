@@ -36,14 +36,14 @@ class Esp32BridgeDiagnosticsTests(unittest.TestCase):
         bridge = Esp32Bridge()
         bridge._publish({"type": "egg_detected", "cycle_id": 1})
         bridge._publish({"type": "weight_reading", "weight_grams": 59})
-        self.assertIn("stabilizing for 1.5 s", bridge.status()["diagnostics"]["latest_sensor_event"])
+        self.assertIn("stabilizing for 1 s", bridge.status()["diagnostics"]["latest_sensor_event"])
 
     def test_weight_stability_progress_is_parsed_and_displayed(self):
-        event = Esp32ProtocolParser().parse("WEIGHT STABILITY: 750/1500 ms; CYCLE:7")[0]
+        event = Esp32ProtocolParser().parse("WEIGHT STABILITY: 750/1000 ms; CYCLE:7")[0]
         self.assertEqual(event["cycle_id"], 7)
         bridge = Esp32Bridge()
         bridge._publish(event)
-        self.assertIn("0.8/1.5 s; gate closed", bridge.status()["diagnostics"]["latest_sensor_event"])
+        self.assertIn("0.8/1.0 s; gate closed", bridge.status()["diagnostics"]["latest_sensor_event"])
 
     def test_camera_authorization_error_survives_repeated_weight_telemetry(self):
         bridge = Esp32Bridge()

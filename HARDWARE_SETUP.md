@@ -114,10 +114,13 @@ board's USB-to-serial chip, commonly CP210x or CH340.
 The project `.env` is configured for the ESP32 firmware:
 
 ```dotenv
-AUTO_START_SORTING_ON_LOGIN=1
+AUTO_START_SORTING_ON_LOGIN=0
 ESP32_BAUD_RATE=115200
 ESP32_PORT=
 ```
+
+The sorting camera stays stopped after login. Start it from **Sorting Sessions**
+with **Restart Camera & ESP32** when you are ready to sort.
 
 When exactly one USB serial controller is attached, `ESP32_PORT` can remain
 blank. To specify it, list the ports in PowerShell:
@@ -203,9 +206,12 @@ From the project folder:
 Logging out stops both the ESP32 serial bridge and camera session. If an
 operator manually stops the session, **Restart Camera & ESP32** starts it again.
 
-The load-cell gate opens automatically after 1.5 seconds of stable weight,
-independently of camera authorization. Every sensor and servo is controlled through this one
-ESP32.
+The load-cell gate opens one second after stable weight is confirmed and closes
+after `LOADCELL_OPEN_TIME`. Weighing and gate release continue independently of
+the earlier egg's size-servo travel timer. Each measured egg keeps its own
+cycle ID and route timer, so the ESP32 can weigh and release the next egg while
+an earlier egg is still travelling to its size gate. Every sensor and servo is
+controlled through this one ESP32.
 
 ## Weight sizes and physical routes
 

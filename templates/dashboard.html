@@ -418,8 +418,7 @@
                 System Security Audit Logs
               </h4>
               <p class="font-caption text-caption text-secondary mt-1">
-                Chronological directory of operator logins &amp; physical
-                machine sorting events
+                Logins, session activity, and other system actions
               </p>
             </div>
             <button
@@ -448,8 +447,27 @@
     }
 
     const sizeOrder = ['Small', 'Medium', 'Large', 'Extra Large', 'Jumbo'];
+    let followDashboardToday = true;
 
-    function renderDailyTrend(trend, selectedDate) {
+    function manilaToday() {
+      const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Manila', year: 'numeric', month: '2-digit', day: '2-digit'
+      }).formatToParts(new Date());
+      const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+      return `${values.year}-${values.month}-${values.day}`;
+    }
+
+    function manilaDateOffset(days) {
+      const [year, month, day] = manilaToday().split('-').map(Number);
+      const date = new Date(Date.UTC(year, month - 1, day + days));
+      return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}-${String(date.getUTCDate()).padStart(2, '0')}`;
+    }
+
+    function dashboardDefaultStart() {
+      return manilaDateOffset(-6);
+    }
+
+    function renderDailyTrend(trend, selectedStartDate, selectedEndDate) {
       const container = document.getElementById('dashboard-daily-trend');
       container.replaceChildren();
 
@@ -458,22 +476,51 @@
       const title = document.createElement('h4');
       title.className = 'font-headline-md text-body-lg font-bold text-on-background';
       title.textContent = 'Daily Sorting Trend';
-      const dateLabel = document.createElement('label');
-      dateLabel.className = 'flex items-center gap-2 text-sm text-secondary';
-      dateLabel.textContent = 'Through';
-      const datePicker = document.createElement('input');
-      datePicker.type = 'date';
-      datePicker.id = 'dashboard-trend-date';
-      datePicker.className = 'rounded-lg border border-outline-variant/50 px-3 py-2 text-on-surface';
-      datePicker.value = selectedDate;
-      datePicker.setAttribute('aria-label', 'Choose end date for daily sorting trend');
-      datePicker.addEventListener('change', () => refreshDashboard());
-      dateLabel.appendChild(datePicker);
-      heading.append(title, dateLabel);
+      const dateControls = document.createElement('div');
+      dateControls.className = 'flex flex-wrap items-center gap-2';
+      const makeDateFilter = (id, caption, value) => {
+        const label = document.createElement('label');
+        label.className = 'flex items-center gap-2 text-sm text-secondary';
+        label.append(caption);
+        const input = document.createElement('input');
+        input.type = 'date';
+        input.id = id;
+        input.className = 'rounded-lg border border-outline-variant/50 px-3 py-2 text-on-surface';
+        input.value = value;
+        input.setAttribute('aria-label', `${caption} date for dashboard`);
+        input.addEventListener('change', () => {
+          followDashboardToday =
+            document.getElementById('dashboard-start-date')?.value === dashboardDefaultStart() &&
+            document.getElementById('dashboard-end-date')?.value === manilaToday();
+          refreshDashboard({ immediate: true });
+        });
+        label.appendChild(input);
+        return label;
+      };
+      dateControls.append(
+        makeDateFilter('dashboard-start-date', 'From', selectedStartDate),
+        makeDateFilter('dashboard-end-date', 'To', selectedEndDate)
+      );
+      const todayButton = document.createElement('button');
+      todayButton.type = 'button';
+      todayButton.id = 'dashboard-today-button';
+      todayButton.className = 'rounded-lg border border-outline-variant/50 px-3 py-2 text-sm text-secondary hover:bg-surface-container';
+      todayButton.textContent = 'Last 7 days';
+      todayButton.addEventListener('click', () => {
+        followDashboardToday = true;
+        document.getElementById('dashboard-start-date').value = dashboardDefaultStart();
+        document.getElementById('dashboard-end-date').value = manilaToday();
+        refreshDashboard({ immediate: true });
+      });
+      dateControls.appendChild(todayButton);
+      heading.append(title, dateControls);
       container.appendChild(heading);
 
+      const chartViewport = document.createElement('div');
+      chartViewport.className = 'w-full overflow-x-auto';
       const chart = document.createElement('div');
       chart.className = 'h-48 flex items-end justify-between gap-2 sm:gap-3';
+      chart.style.width = `${Math.max(container.clientWidth, trend.length * 56)}px`;
       const maxCount = Math.max(1, ...trend.map((entry) => entry.count));
 
       trend.forEach((entry) => {
@@ -496,11 +543,12 @@
 
         const label = document.createElement('span');
         label.className = 'text-xs text-secondary mt-2';
-        label.textContent = entry.label;
+        label.textContent = trend.length > 7 ? entry.date.slice(5) : entry.label;
         column.append(count, track, label);
         chart.appendChild(column);
       });
-      container.appendChild(chart);
+      chartViewport.appendChild(chart);
+      container.appendChild(chartViewport);
     }
 
     function auditIcon(eventType) {
@@ -559,6 +607,7 @@
     }
 
     let dashboardRequestPending = false;
+    let dashboardRefreshQueued = false;
     let renderedSections = {};
 
     document.getElementById('clear-audit-logs')?.addEventListener('click', async (event) => {
@@ -614,15 +663,34 @@
     async function refreshDashboard(options = {}) {
       /* The 750ms poll below can fire while a slower manual request is still
          open. Without this guard the two would race and interleave DOM writes. */
-      if (dashboardRequestPending) return;
+      if (dashboardRequestPending) {
+        if (options.immediate) dashboardRefreshQueued = true;
+        return;
+      }
       dashboardRequestPending = true;
       setRefreshingUI(true);
       if (options.manual) setDashboardStatus('busy', 'Refreshing...');
       let succeeded = false;
       try {
-        const trendDate = document.getElementById('dashboard-trend-date')?.value || '';
+        const startDatePicker = document.getElementById('dashboard-start-date');
+        const endDatePicker = document.getElementById('dashboard-end-date');
+        const hadDateFilters = Boolean(startDatePicker && endDatePicker);
+        if (followDashboardToday && startDatePicker && endDatePicker &&
+            (startDatePicker.value !== dashboardDefaultStart() || endDatePicker.value !== manilaToday())) {
+          startDatePicker.value = dashboardDefaultStart();
+          endDatePicker.value = manilaToday();
+        }
+        const startDate = startDatePicker?.value || '';
+        const endDate = endDatePicker?.value || '';
+        if (startDate && endDate && startDate > endDate) {
+          throw new Error('From date cannot be after To date.');
+        }
         const statsUrl = new URL('/api/dashboard/stats', window.location.origin);
-        if (trendDate) statsUrl.searchParams.set('date', trendDate);
+        if (startDate) statsUrl.searchParams.set('start_date', startDate);
+        if (endDate) statsUrl.searchParams.set('end_date', endDate);
+        if (hadDateFilters && !startDate && !endDate) {
+          statsUrl.searchParams.set('all_dates', 'true');
+        }
         const response = await fetch(statsUrl, {
           credentials: 'same-origin',
           cache: 'no-store'
@@ -638,10 +706,10 @@
         document.getElementById('dashboard-total-note').textContent =
           stats.latest_record
             ? `Latest: ${stats.latest_record.weight_grams == null ? 'N/A' : `${stats.latest_record.weight_grams} g`} • ${stats.latest_record.size}`
-            : 'Waiting for load cell';
+            : 'No eggs sorted in this date range';
         document.getElementById('dashboard-trays').textContent = stats.trays_completed;
         document.getElementById('dashboard-trays-note').textContent =
-          `${stats.total_sorted % 30}/30 eggs in current tray`;
+          `${stats.good_count % 30}/30 good eggs in range`;
         document.getElementById('dashboard-quality-rate').textContent =
           `${stats.quality_rate}%`;
         document.getElementById('dashboard-quality-note').textContent =
@@ -657,7 +725,11 @@
         const trendKey = JSON.stringify(stats.daily_trend || []);
         if (trendKey !== renderedSections.trend) {
           const trend = stats.daily_trend || [];
-          renderDailyTrend(trend, trendDate || trend.at(-1)?.date || '');
+          renderDailyTrend(
+            trend,
+            hadDateFilters ? startDate : stats.selected_start_date,
+            hadDateFilters ? endDate : stats.selected_end_date
+          );
           renderedSections.trend = trendKey;
         }
 
@@ -703,6 +775,10 @@
         dashboardRequestPending = false;
         setRefreshingUI(false);
         if (options.manual && succeeded) flashRefreshSuccess();
+        if (dashboardRefreshQueued) {
+          dashboardRefreshQueued = false;
+          queueMicrotask(() => refreshDashboard({ immediate: true }));
+        }
       }
       if (options.manual && succeeded) await EggSortAlerts.success('Dashboard refreshed successfully.');
     }

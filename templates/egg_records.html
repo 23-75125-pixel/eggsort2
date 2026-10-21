@@ -423,6 +423,33 @@
     let recordSearchTimer = null;
     let recordsRequestPending = false;
     let renderedRecordsKey = '';
+    let followCurrentDay = true;
+
+    function manilaDateString(date = new Date()) {
+      const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Manila', year: 'numeric', month: '2-digit', day: '2-digit'
+      }).formatToParts(date);
+      const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+      return `${values.year}-${values.month}-${values.day}`;
+    }
+
+    function shiftDate(dateString, days) {
+      const [year, month, day] = dateString.split('-').map(Number);
+      return new Date(Date.UTC(year, month - 1, day + days)).toISOString().slice(0, 10);
+    }
+
+    function manilaMidnightIso(dateString) {
+      const [year, month, day] = dateString.split('-').map(Number);
+      return new Date(Date.UTC(year, month - 1, day) - 8 * 60 * 60 * 1000).toISOString();
+    }
+
+    function setTodayRange() {
+      const today = manilaDateString();
+      startDateFilter.value = today;
+      endDateFilter.value = today;
+    }
+
+    setTodayRange();
 
     function formatRefreshTimestamp(date = new Date()) {
       return date.toLocaleString([], { dateStyle: 'medium', timeStyle: 'medium' });
@@ -498,6 +525,9 @@
     }
 
     async function refreshEggRecords() {
+      if (followCurrentDay && startDateFilter.value !== manilaDateString()) {
+        setTodayRange();
+      }
       if (recordsRequestPending) return;
       recordsRequestPending = true;
       try {
@@ -512,12 +542,10 @@
           limit: '500'
         });
         if (startDateFilter.value) {
-          params.set('start_at', new Date(`${startDateFilter.value}T00:00:00`).toISOString());
+          params.set('start_at', manilaMidnightIso(startDateFilter.value));
         }
         if (endDateFilter.value) {
-          const dayAfter = new Date(`${endDateFilter.value}T00:00:00`);
-          dayAfter.setDate(dayAfter.getDate() + 1);
-          params.set('end_before', dayAfter.toISOString());
+          params.set('end_before', manilaMidnightIso(shiftDate(endDateFilter.value, 1)));
         }
         const response = await fetch(`/api/egg-records?${params}`, {
           credentials: 'same-origin',
@@ -559,14 +587,20 @@
     });
     sizeFilter.addEventListener('change', refreshEggRecords);
     qualityFilter.addEventListener('change', refreshEggRecords);
-    startDateFilter.addEventListener('change', refreshEggRecords);
-    endDateFilter.addEventListener('change', refreshEggRecords);
+    startDateFilter.addEventListener('change', () => {
+      followCurrentDay = false;
+      refreshEggRecords();
+    });
+    endDateFilter.addEventListener('change', () => {
+      followCurrentDay = false;
+      refreshEggRecords();
+    });
     document.getElementById('reset-record-filters').addEventListener('click', () => {
       recordSearch.value = '';
       sizeFilter.value = 'All Sizes';
       qualityFilter.value = 'All Qualities';
-      startDateFilter.value = '';
-      endDateFilter.value = '';
+      followCurrentDay = true;
+      setTodayRange();
       refreshEggRecords();
     });
     document.getElementById('print-records').addEventListener('click', () => window.print());
@@ -585,7 +619,7 @@
       ).join('\r\n');
       const link = document.createElement('a');
       link.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
-      link.download = `egg-records-${new Date().toISOString().slice(0, 10)}.csv`;
+      link.download = `egg-records-${manilaDateString()}.csv`;
       link.click();
       URL.revokeObjectURL(link.href);
     });

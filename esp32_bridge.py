@@ -597,7 +597,7 @@ class Esp32Bridge:
                 # present it as an authorized measurement or open the gate.
                 if self._diagnostics["measurement_quality"] is None:
                     self._diagnostics["latest_sensor_event"] = (
-                        f"Egg on load cell: {weight} g - stabilizing for 1.5 s before gate release"
+                        f"Egg on load cell: {weight} g - stabilizing for 1 s before gate release"
                         if self._diagnostics.get("automatic_release") else
                         f"Egg on load cell: {weight} g - waiting for a "
                         "validated Good camera capture before stable-weight release"
