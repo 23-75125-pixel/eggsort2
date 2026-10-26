@@ -409,3 +409,667 @@ main table td {
     padding: 1.5rem !important;
   }
 }
+
+/* ---------------------------------------------------------------------------
+ * Page-scoped polish for Dashboard, Alerts, and Reports.
+ * These selectors use existing page IDs so the adjustments stay out of the
+ * sorting controls and other modules without changing template behavior.
+ * ------------------------------------------------------------------------- */
+
+/* Dashboard: align KPI, tray progress, chart, and audit surfaces. */
+body:has(#dashboard-tray-progress) main > div > .grid:first-child > div,
+body:has(#dashboard-tray-progress) main section[aria-labelledby="dashboard-tray-progress-title"],
+body:has(#dashboard-tray-progress) main > div > .grid:nth-child(3) > div,
+body:has(#dashboard-tray-progress) #dashboard-audit-logs {
+  border-color: var(--eggsort-line) !important;
+}
+
+body:has(#dashboard-tray-progress) main > div > .grid:first-child > div {
+  min-height: 8.5rem;
+  height: auto;
+  padding: 1.25rem;
+  border-top: 1px solid var(--eggsort-line);
+  border-right: 1px solid var(--eggsort-line);
+  border-bottom: 1px solid var(--eggsort-line);
+  border-radius: 18px !important;
+  box-shadow: var(--eggsort-shadow);
+}
+
+body:has(#dashboard-tray-progress) main > div > .grid:first-child > div h3 {
+  font-size: clamp(1.75rem, 2.5vw, 2.25rem);
+  line-height: 1.05;
+  font-variant-numeric: tabular-nums;
+}
+
+body:has(#dashboard-tray-progress) main > div > .grid:first-child > div > div:last-child {
+  align-items: flex-end;
+  gap: 0.75rem;
+}
+
+body:has(#dashboard-tray-progress) main > div > .grid:first-child > div > div:last-child p {
+  max-width: 9rem;
+  line-height: 1.35;
+  text-align: right;
+}
+
+body:has(#dashboard-tray-progress) main section[aria-labelledby="dashboard-tray-progress-title"],
+body:has(#dashboard-tray-progress) main > div > .grid:nth-child(3) > div,
+body:has(#dashboard-tray-progress) main > div > div.bg-white.rounded-2xl {
+  border-radius: 20px !important;
+  box-shadow: var(--eggsort-shadow);
+}
+
+body:has(#dashboard-tray-progress) #dashboard-tray-progress > article {
+  border-color: var(--eggsort-line) !important;
+  border-radius: 16px !important;
+  background-color: #f7f5ee !important;
+  min-height: 11rem;
+  padding: 1.125rem;
+}
+
+body:has(#dashboard-tray-progress) #dashboard-tray-progress > article h5 {
+  padding-bottom: 0.65rem;
+  border-bottom: 1px solid var(--eggsort-line);
+  color: var(--eggsort-forest-deep) !important;
+  font-size: 1.05rem;
+  line-height: 1.3;
+}
+
+body:has(#dashboard-tray-progress) #dashboard-tray-progress > article > div.mt-3 span {
+  display: inline-block;
+  color: var(--eggsort-forest-deep) !important;
+  font-size: 0.9rem;
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;
+}
+
+body:has(#dashboard-tray-progress) #dashboard-tray-progress > article > p.mt-3 {
+  font-size: 1rem;
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+}
+
+body:has(#dashboard-tray-progress) #dashboard-tray-progress [role="progressbar"] {
+  height: 0.65rem;
+  border: 1px solid var(--eggsort-line);
+  background-color: #fff !important;
+}
+
+body:has(#dashboard-tray-progress) #dashboard-tray-progress [role="progressbar"] > div {
+  background-color: var(--eggsort-forest) !important;
+}
+
+body:has(#dashboard-tray-progress) #dashboard-size-distribution,
+body:has(#dashboard-tray-progress) #dashboard-daily-trend {
+  line-height: 1.55;
+}
+
+body:has(#dashboard-tray-progress) #dashboard-size-distribution > p,
+body:has(#dashboard-tray-progress) #dashboard-daily-trend > p {
+  max-width: 34rem;
+  margin-right: auto;
+  margin-left: auto;
+}
+
+body:has(#dashboard-tray-progress) #dashboard-daily-trend > div:first-child {
+  margin-bottom: 1.25rem;
+}
+
+body:has(#dashboard-tray-progress) #dashboard-daily-trend > div:first-child > div:last-child {
+  padding: 0.5rem;
+  border: 1px solid var(--eggsort-line);
+  border-radius: 14px;
+  background: #f7f5ee;
+}
+
+body:has(#dashboard-tray-progress) #dashboard-daily-trend input[type="date"] {
+  min-height: 2.5rem;
+  padding: 0.4rem 0.6rem;
+  border-color: var(--eggsort-line) !important;
+  border-radius: 10px !important;
+  background: #fff !important;
+  font-size: 0.8rem;
+}
+
+body:has(#dashboard-tray-progress) #dashboard-today-button {
+  min-height: 2.5rem;
+  padding: 0.4rem 0.75rem;
+  border-color: var(--eggsort-line) !important;
+  border-radius: 10px !important;
+  background: #fff;
+  color: var(--eggsort-forest-deep) !important;
+  font-size: 0.8rem;
+}
+
+/* Alerts: give filter and alert rows a shared card treatment. */
+body:has(#alerts-list) main > div.bg-surface-container-lowest,
+body:has(#alerts-list) #alerts-list > article {
+  border-color: var(--eggsort-line) !important;
+  border-radius: 18px !important;
+  box-shadow: var(--eggsort-shadow);
+}
+
+body:has(#alerts-list) #alerts-list > article {
+  padding: 1rem 1.125rem;
+  gap: 1rem;
+  line-height: 1.5;
+}
+
+body:has(#alerts-list) #alerts-list h3 {
+  font-size: 1rem;
+  line-height: 1.4;
+}
+
+body:has(#alerts-list) #alerts-list p {
+  overflow-wrap: anywhere;
+}
+
+body:has(#alerts-list) main > div:has(> #alerts-empty:not(.hidden)) {
+  flex: 0 1 auto;
+  min-height: 0;
+}
+
+body:has(#alerts-list) #alerts-empty {
+  min-height: 0;
+  margin: 1rem auto !important;
+  padding: 1rem;
+  gap: 0;
+}
+
+body:has(#alerts-list) #alerts-empty > div:first-child {
+  width: 4.5rem;
+  height: 4.5rem;
+  margin-bottom: 1rem;
+}
+
+body:has(#alerts-list) #alerts-empty > div:first-child > span {
+  font-size: 2.25rem;
+}
+
+body:has(#alerts-list) #alerts-empty-title {
+  margin-bottom: 0.5rem;
+  font-size: 1.2rem;
+  line-height: 1.4;
+}
+
+body:has(#alerts-list) #alerts-empty-message {
+  max-width: 32rem;
+  margin-bottom: 1.25rem;
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
+body:has(#alerts-list) #alerts-empty-dashboard-link {
+  min-height: 2.75rem;
+  height: auto;
+  padding: 0.7rem 1.5rem;
+  border-radius: 999px !important;
+}
+
+body:has(#alerts-list) #filter-unread,
+body:has(#alerts-list) #filter-read {
+  min-width: 6rem;
+  min-height: 2.6rem;
+  border-radius: 999px !important;
+  padding: 0.55rem 1.1rem;
+}
+
+body:has(#alerts-list) #alert-search {
+  min-height: 2.75rem;
+  border-radius: 12px !important;
+}
+
+/* Reports: make summary cards and the data table easier to scan. */
+body:has(#report-rows) main .bg-surface-container-lowest.rounded-lg {
+  min-height: 7.25rem;
+  height: auto;
+  border-color: var(--eggsort-line) !important;
+  border-radius: 18px !important;
+  box-shadow: var(--eggsort-shadow);
+}
+
+body:has(#report-rows) main > div.max-w-7xl {
+  max-width: 90rem;
+}
+
+body:has(#report-rows) main .bg-surface-container-lowest.rounded-lg h3 {
+  font-size: 0.72rem;
+  line-height: 1.4;
+}
+
+body:has(#report-rows) main .bg-surface-container-lowest.rounded-lg > div {
+  font-size: clamp(1.65rem, 2.2vw, 2rem);
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+  color: var(--eggsort-forest-deep) !important;
+}
+
+body:has(#report-rows) #report-description {
+  max-width: 54rem;
+  line-height: 1.55;
+}
+
+body:has(#report-rows) #report-rows tr:nth-child(even) {
+  background-color: #faf9f4;
+}
+
+body:has(#report-rows) #report-rows tr:hover {
+  background-color: #f2f0e7;
+}
+
+body:has(#report-rows) main table {
+  min-width: 42rem;
+}
+
+body:has(#report-rows) main table th,
+body:has(#report-rows) main table td {
+  padding-top: 0.9rem;
+  padding-bottom: 0.9rem;
+}
+
+body:has(#report-rows) main table td:not(:first-child) {
+  font-variant-numeric: tabular-nums;
+}
+
+body:has(#report-rows) main table td:first-child {
+  min-width: 10rem;
+  font-weight: 600;
+  color: var(--eggsort-ink);
+}
+
+body:has(#report-rows) main > header {
+  padding-right: clamp(1.5rem, 3vw, 3.5rem);
+  padding-left: clamp(1.5rem, 3vw, 3.5rem);
+}
+
+@media (max-width: 767px) {
+  body:has(#dashboard-tray-progress) main > div > .grid:first-child > div {
+    min-height: 7.75rem;
+    padding: 1rem;
+  }
+
+  body:has(#dashboard-tray-progress) #dashboard-tray-progress > article {
+    min-height: 10rem;
+    padding: 1rem;
+  }
+
+  body:has(#dashboard-tray-progress) #dashboard-daily-trend > div:first-child > div:last-child {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  body:has(#alerts-list) #alerts-list > article {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    padding: 0.875rem;
+  }
+
+  body:has(#alerts-list) main > div:has(> #alerts-empty:not(.hidden)) {
+    min-height: 18rem;
+  }
+
+  body:has(#report-rows) main > header {
+    padding-right: 1rem;
+    padding-left: 1rem;
+  }
+
+  body:has(#report-rows) main > div.max-w-7xl {
+    max-width: 100%;
+  }
+}
+
+@media print {
+  body:has(#report-rows) {
+    background: #fff !important;
+  }
+
+  body:has(#report-rows) #sidebar,
+  body:has(#report-rows) #sidebar-overlay,
+  body:has(#report-rows) #refresh-report,
+  body:has(#report-rows) #print-report,
+  body:has(#report-rows) main > header > div:first-child > button {
+    display: none !important;
+  }
+
+  body:has(#report-rows) main {
+    margin: 0 !important;
+    overflow: visible !important;
+    background: #fff !important;
+  }
+
+  body:has(#report-rows) main > div {
+    max-width: none !important;
+    padding: 0 !important;
+  }
+
+  body:has(#report-rows) main .overflow-x-auto {
+    overflow: visible !important;
+  }
+
+  body:has(#report-rows) main table {
+    min-width: 0;
+    width: 100%;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * Phase 2 page-scoped polish: account screens, Egg Records, and User Management.
+ * Existing IDs are used only as CSS anchors; no form or page behavior changes.
+ * ------------------------------------------------------------------------- */
+
+/* Login and account recovery / invitation screens. */
+body:has(.login-container),
+body:has(> main > form) {
+  background-color: var(--eggsort-cream-deep) !important;
+}
+
+body:has(.login-container) .login-container {
+  border: 1px solid var(--eggsort-line);
+  border-radius: 28px !important;
+  box-shadow: 0 24px 60px -38px rgba(46, 62, 49, 0.55) !important;
+}
+
+body:has(.login-container) .login-panel {
+  padding: clamp(1.5rem, 4vw, 3rem);
+}
+
+body:has(.login-container) .login-head {
+  margin-bottom: 1.75rem;
+}
+
+body:has(.login-container) .login-head h1 {
+  font-size: clamp(1.85rem, 3vw, 2.4rem);
+  line-height: 1.12;
+}
+
+body:has(.login-container) .login-panel label,
+body:has(> main > form) main form label {
+  color: var(--eggsort-ink);
+  line-height: 1.4;
+}
+
+body:has(.login-container) .login-panel form > label {
+  margin-top: 0.15rem;
+}
+
+body:has(.login-container) .login-panel button[type="submit"],
+body:has(.login-container) .login-panel a[href*="google_login"],
+body:has(> main > form) main button[type="submit"] {
+  min-height: 3rem;
+  border-radius: 14px !important;
+  box-shadow: 0 8px 18px -14px rgba(46, 62, 49, 0.7);
+}
+
+body:has(.login-container) .login-panel a[href*="google_login"] {
+  min-height: 3rem;
+  padding-top: 0.75rem;
+  padding-bottom: 0.75rem;
+  border-radius: 14px !important;
+}
+
+body:has(.login-container) .login-panel input:not([type="checkbox"]),
+body:has(> main > form) main input:not([type="hidden"]) {
+  min-height: 2.9rem;
+  border-color: var(--eggsort-line) !important;
+  border-radius: 12px !important;
+  background-color: #fff !important;
+}
+
+body:has(> main > form) main {
+  width: min(100%, 30rem);
+  padding: clamp(1.5rem, 5vw, 2.5rem) !important;
+  border: 1px solid var(--eggsort-line);
+  border-radius: 26px !important;
+  background-color: #fff !important;
+  box-shadow: var(--eggsort-shadow-hover) !important;
+}
+
+body:has(> main > form) main > img[alt="EGGSor+ logo"] {
+  width: min(11rem, 60%);
+  height: auto;
+  margin-bottom: 1.25rem;
+}
+
+body:has(> main > form) main h1 {
+  margin-bottom: 0.75rem;
+  color: var(--eggsort-ink) !important;
+  font-size: clamp(1.65rem, 4vw, 2rem);
+  line-height: 1.2;
+}
+
+body:has(> main > form) main form {
+  margin-top: 1.5rem;
+}
+
+body:has(> main > form) main form > label {
+  margin-bottom: -0.5rem;
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+
+@media (max-width: 640px) {
+  body:has(.login-container) {
+    align-items: flex-start;
+    padding: 0.75rem !important;
+  }
+
+  body:has(.login-container) .login-container {
+    border-radius: 22px !important;
+  }
+
+  body:has(.login-container) .login-panel {
+    padding: 1.35rem !important;
+  }
+
+  body:has(> main > form) {
+    align-items: flex-start;
+    padding: 0.75rem !important;
+  }
+
+  body:has(> main > form) main {
+    padding: 1.35rem !important;
+    border-radius: 20px !important;
+  }
+}
+
+/* Egg Records filters, table, and horizontal scrolling. */
+body:has(#egg-records-body) main .bg-surface-container-lowest.rounded-xl {
+  border-color: var(--eggsort-line) !important;
+  border-radius: 20px !important;
+  box-shadow: var(--eggsort-shadow);
+}
+
+body:has(#egg-records-body) #record-search,
+body:has(#egg-records-body) #size-filter,
+body:has(#egg-records-body) #quality-filter,
+body:has(#egg-records-body) #start-date-filter,
+body:has(#egg-records-body) #end-date-filter {
+  min-height: 2.8rem;
+  border-color: var(--eggsort-line) !important;
+  border-radius: 11px !important;
+  color: var(--eggsort-ink) !important;
+}
+
+body:has(#egg-records-body) #record-search {
+  background-color: #fff !important;
+}
+
+body:has(#egg-records-body) #size-filter,
+body:has(#egg-records-body) #quality-filter {
+  min-width: 9.5rem;
+  background-color: #fff !important;
+}
+
+body:has(#egg-records-body) label:has(> #start-date-filter),
+body:has(#egg-records-body) label:has(> #end-date-filter) {
+  gap: 0.5rem;
+  color: var(--eggsort-muted);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+body:has(#egg-records-body) #search-records,
+body:has(#egg-records-body) #reset-record-filters,
+body:has(#egg-records-body) #export-records,
+body:has(#egg-records-body) #print-records {
+  min-height: 2.8rem;
+  border-radius: 12px !important;
+}
+
+body:has(#egg-records-body) main .overflow-x-auto {
+  max-width: 100%;
+  overscroll-behavior-inline: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+body:has(#egg-records-body) main table {
+  min-width: 62rem;
+}
+
+body:has(#egg-records-body) main table th {
+  padding: 0.9rem 1rem;
+  white-space: nowrap;
+}
+
+body:has(#egg-records-body) main table td {
+  padding: 0.9rem 1rem;
+  vertical-align: middle;
+}
+
+body:has(#egg-records-body) #egg-records-body tr:nth-child(even):not(#egg-records-empty) {
+  background-color: #faf9f4;
+}
+
+body:has(#egg-records-body) #egg-records-body tr:hover:not(#egg-records-empty) {
+  background-color: #f2f0e7;
+}
+
+body:has(#egg-records-body) #egg-records-empty td {
+  padding-top: 2.5rem;
+  padding-bottom: 2.5rem;
+  white-space: normal;
+}
+
+@media (max-width: 767px) {
+  body:has(#egg-records-body) main .bg-surface-container-lowest.rounded-xl {
+    border-radius: 16px !important;
+  }
+
+  body:has(#egg-records-body) #search-records {
+    width: 100%;
+  }
+
+  body:has(#egg-records-body) label:has(> #start-date-filter),
+  body:has(#egg-records-body) label:has(> #end-date-filter) {
+    flex: 1 1 8rem;
+    flex-wrap: wrap;
+  }
+
+  body:has(#egg-records-body) #start-date-filter,
+  body:has(#egg-records-body) #end-date-filter {
+    width: 100%;
+  }
+
+  body:has(#egg-records-body) main table {
+    min-width: 58rem;
+  }
+}
+
+/* User Management cards, tabs, forms, and dialogs. */
+body:has(#users-grid) main > header {
+  margin-bottom: 2rem;
+}
+
+body:has(#users-grid) main > div:has(> #tab-operators) {
+  gap: 0.5rem;
+  border-color: var(--eggsort-line) !important;
+}
+
+body:has(#users-grid) #tab-operators,
+body:has(#users-grid) #tab-audit,
+body:has(#users-grid) #tab-docs {
+  min-height: 2.9rem;
+  padding: 0.7rem 1rem;
+  border-radius: 12px 12px 0 0 !important;
+  font-size: 0.9rem;
+}
+
+body:has(#users-grid) #users-grid > article {
+  min-height: 6.5rem;
+  border-color: var(--eggsort-line) !important;
+  border-radius: 18px !important;
+  padding: 1.125rem;
+  box-shadow: var(--eggsort-shadow);
+}
+
+body:has(#users-grid) #users-grid > article h3 {
+  overflow-wrap: anywhere;
+  font-size: 0.98rem;
+  line-height: 1.35;
+}
+
+body:has(#users-grid) #users-grid > article > div:last-child {
+  flex-shrink: 0;
+}
+
+body:has(#users-grid) #register-operator,
+body:has(#users-grid) #user-form button[type="submit"],
+body:has(#users-grid) #copy-invite {
+  min-height: 2.9rem;
+  border-radius: 12px !important;
+}
+
+body:has(#users-grid) #user-modal,
+body:has(#users-grid) #invite-modal {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+body:has(#users-grid) #user-form,
+body:has(#users-grid) #invite-modal > div {
+  max-height: calc(100dvh - 2rem);
+  overflow-y: auto;
+  border: 1px solid var(--eggsort-line);
+  border-radius: 20px !important;
+  padding: clamp(1.25rem, 4vw, 1.75rem);
+  box-shadow: 0 24px 60px -32px rgba(25, 35, 27, 0.5);
+}
+
+body:has(#users-grid) #user-form label {
+  color: var(--eggsort-ink);
+  font-size: 0.88rem;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+body:has(#users-grid) #user-form input:not([type="hidden"]),
+body:has(#users-grid) #invite-url {
+  min-height: 2.8rem;
+  border-color: var(--eggsort-line) !important;
+  border-radius: 11px !important;
+}
+
+@media (max-width: 767px) {
+  body:has(#users-grid) #users-grid > article {
+    flex-wrap: wrap;
+    gap: 0.875rem;
+    padding: 1rem;
+  }
+
+  body:has(#users-grid) #users-grid > article > div:first-child {
+    flex: 1 1 100%;
+  }
+
+  body:has(#users-grid) #users-grid > article > div:last-child {
+    margin-left: auto;
+  }
+
+  body:has(#users-grid) #invite-copy-controls {
+    flex-wrap: wrap;
+  }
+
+  body:has(#users-grid) #invite-url {
+    flex-basis: 100%;
+  }
+}

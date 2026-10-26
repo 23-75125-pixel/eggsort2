@@ -460,7 +460,7 @@ class BackendLifecycleTests(unittest.TestCase):
         ]
         with backend.app.test_request_context("/api/dashboard/stats"), \
              patch.object(backend.EggRecord, "query", egg_query), \
-             patch.object(backend.TrayAlert, "query", tray_query), \
+             patch.object(backend.TraySizeAlert, "query", tray_query), \
              patch.object(backend.AuditLog, "query", audit_query), \
              patch.object(backend.db.session, "query") as aggregate_query, \
              patch.object(backend.ESP32_BRIDGE, "status", return_value={}):
