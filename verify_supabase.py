@@ -15,7 +15,6 @@ from app import app, db
 TABLES = (
     "user",
     "egg_record",
-    "tray_alert",
     "audit_log",
     "password_reset_attempt",
 )

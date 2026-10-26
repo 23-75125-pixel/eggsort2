@@ -46,7 +46,17 @@ from detection_service import (
     detect_frame,
 )
 from extensions import db, oauth
-from models import AuditLog, EggRecord, SortingSession, TrayAlert, TRAY_CAPACITY, User
+from models import (
+    AuditLog,
+    EggRecord,
+    SortingSession,
+    TraySizeAlert,
+    TraySizeProgress,
+    TraySizeProgressEgg,
+    TRAY_CAPACITY,
+    TRAY_TRACKED_SIZES,
+    User,
+)
 from sorting_lifecycle import AutomaticStartSuppressed, LifecycleError, SortingLifecycle, SQLAlchemySessionStore
 from security import AttemptLimiter, init_web_security
 from validation import (
@@ -372,6 +382,7 @@ def start_sorting_runtime(user_id: int | None = None, *, automatic: bool = False
     user = db.session.get(User, operator_id) if operator_id is not None else None
     if user is None or not user.is_active:
         raise CameraSessionError("An active authenticated operator is required.")
+    _require_initialized_tray_sizes()
     try:
         LIFECYCLE.start(user.id, user_display_label(user), automatic=automatic)
     except AutomaticStartSuppressed:
@@ -457,25 +468,6 @@ def parse_timestamp_boundary(value: str | None) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def create_tray_alert_if_needed(
-    total_sorted: int,
-    session_ref: str,
-) -> TrayAlert | None:
-    if total_sorted <= 0 or total_sorted % TRAY_CAPACITY != 0:
-        return None
-    tray_number = total_sorted // TRAY_CAPACITY
-    existing = TrayAlert.query.filter_by(tray_number=tray_number).first()
-    if existing is not None:
-        return None
-    alert = TrayAlert(
-        tray_number=tray_number,
-        egg_count=total_sorted,
-        session_ref=session_ref,
-    )
-    db.session.add(alert)
-    return alert
-
-
 _AUTHENTICATED_ACTOR = object()
 
 
@@ -512,33 +504,76 @@ def write_audit_log(
     return log
 
 
-def backfill_completed_tray_alerts() -> None:
-    total_sorted = EggRecord.query.filter_by(quality="Good").count()
-    created = False
-    for tray_number in range(1, (total_sorted // TRAY_CAPACITY) + 1):
-        boundary_record = (
-            EggRecord.query
-            .order_by(EggRecord.id.asc())
-            .offset((tray_number * TRAY_CAPACITY) - 1)
-            .first()
+def _count_verified_good_egg_for_tray(record: EggRecord) -> TraySizeAlert | None:
+    """Update one size's durable progress and alert in the egg-save transaction."""
+    if record.quality != "Good" or record.quality_verified is not True:
+        return None
+    if record.size not in TRAY_TRACKED_SIZES:
+        raise ValueError(f"Verified Good egg has unsupported tray size: {record.size}")
+
+    # Serialize all updates for this size, including eggs from other sessions.
+    progress = (
+        TraySizeProgress.query.filter_by(egg_size=record.size)
+        .with_for_update().one_or_none()
+    )
+    if progress is None or progress.opening_balance is None:
+        raise RuntimeError(
+            f"Admin must initialize the {record.size} tray opening balance before sorting."
         )
-        session_ref = (
-            boundary_record.session_ref
-            if boundary_record is not None
-            else "HISTORICAL"
-        )
-        alert = create_tray_alert_if_needed(
-            tray_number * TRAY_CAPACITY, session_ref
-        )
-        created = created or alert is not None
-    if created:
-        db.session.commit()
+
+    prior_claim = (
+        TraySizeProgressEgg.query.filter_by(egg_record_id=record.id)
+        .with_for_update().one_or_none()
+    )
+    if prior_claim is not None:
+        if prior_claim.egg_size != record.size:
+            raise RuntimeError("Egg Record was already claimed for a different tray size.")
+        return None
+
+    db.session.add(TraySizeProgressEgg(egg_record_id=record.id, egg_size=record.size))
+    db.session.flush()
+
+    prior_milestones = progress.completed_milestones
+    physical_egg_total = (
+        progress.opening_balance
+        + progress.confirmed_good_eggs_since_opening
+        + 1
+    )
+    new_milestones, remaining = divmod(physical_egg_total, TRAY_CAPACITY)
+    progress.confirmed_good_eggs_since_opening += 1
+    progress.completed_milestones = new_milestones
+    progress.eggs_toward_next_milestone = remaining
+    progress.updated_at = datetime.now(timezone.utc)
+
+    if new_milestones <= prior_milestones:
+        return None
+
+    alert = TraySizeAlert(
+        egg_size=record.size,
+        milestone_number=new_milestones,
+        eligible_egg_count_at_milestone=new_milestones * TRAY_CAPACITY,
+        boundary_egg_record_id=record.id,
+    )
+    db.session.add(alert)
+    db.session.flush()
+    return alert
 
 
-with app.app_context():
-    if not (app.config["LOCAL_TEST_MODE"] or app.config["PHASE2B_WRITE_TEST_MODE"]
-            or app.config["EGGSOR_PRODUCTION_DB_MODE"]):
-        backfill_completed_tray_alerts()
+def _uninitialized_tray_sizes() -> list[str]:
+    rows = {row.egg_size: row for row in TraySizeProgress.query.all()}
+    return [
+        egg_size for egg_size in TRAY_TRACKED_SIZES
+        if egg_size not in rows or rows[egg_size].opening_balance is None
+    ]
+
+
+def _require_initialized_tray_sizes() -> None:
+    missing = _uninitialized_tray_sizes()
+    if missing:
+        raise CameraSessionError(
+            "Admin must set opening balances for all five egg sizes before sorting: "
+            + ", ".join(missing)
+        )
 
 
 EGG_FLOW_LOCK = RLock()
@@ -662,6 +697,7 @@ def _inspect_then_measure(sequence: int) -> None:
             "label": quality,
             "confidence": float(quality_result["confidence"]),
             "capture_id": quality_result["capture_id"],
+            "quality_verified": True,
             "_requires_capture_id": True,
         }
         with EGG_FLOW_LOCK:
@@ -801,6 +837,9 @@ def queue_sort_after_measurement(event: dict[str, Any]) -> None:
         "size": size,
         "quality": quality_result["label"],
         "confidence": quality_result["confidence"],
+        # A missing marker must never promote a fallback/unknown capture to a
+        # camera-verified egg for persistent per-size tray counting.
+        "quality_verified": quality_result.get("quality_verified") is True,
         "session_ref": quality_result["session_ref"],
     }
     with EGG_FLOW_LOCK:
@@ -874,7 +913,7 @@ def persist_capture(context, payload, *, rejected=False):
             db.session.add(record)
             db.session.flush()
             if not rejected:
-                create_tray_alert_if_needed(EggRecord.query.filter_by(quality="Good").count(), record.session_ref)
+                _count_verified_good_egg_for_tray(record)
             write_audit_log(
                 "egg_rejected" if rejected else "egg_sorted",
                 f"EGG-{record.id:06d} {'rejected before weighing' if rejected else 'sorted'}; "
@@ -984,6 +1023,7 @@ def _save_automatic_egg_cycles() -> None:
                     if (not LIFECYCLE.context.matches(capture)
                             or str(capture.get("label", "")).lower() != "good"):
                         raise CameraSessionError("Automatic cycle camera context mismatch; record retained.")
+                    capture = {**capture, "_quality_verified": True}
                     with EGG_FLOW_LOCK:
                         cycle["capture"] = dict(capture)
             if capture is None and measured is not None and (
@@ -997,6 +1037,7 @@ def _save_automatic_egg_cycles() -> None:
                     + key[0] * 1_000_000 + key[1],
                     "confidence": 0.0,
                     "label": "good",
+                    "_quality_verified": False,
                 }
                 with EGG_FLOW_LOCK:
                     cycle["capture"] = dict(capture)
@@ -1022,7 +1063,9 @@ def _save_automatic_egg_cycles() -> None:
             with LIFECYCLE.persistence(record_context):
                 persist_capture(record_context, dict(
                     weight_grams=int(weight), size=measured_size, quality="Good",
-                    confidence=float(capture["confidence"]), session_ref=context["session_ref"],
+                    confidence=float(capture["confidence"]),
+                    quality_verified=bool(capture.get("_quality_verified", False)),
+                    session_ref=context["session_ref"],
                 ))
         except CameraSessionError as exc:
             ESP32_BRIDGE.publish_status(str(exc), "flow_error")
@@ -1155,7 +1198,8 @@ def _save_rejected_captures() -> None:
         try:
             with LIFECYCLE.persistence(capture):
                 persist_capture(capture, dict(weight_grams=0, size="N/A", quality=capture["label"].title(),
-                    confidence=float(capture.get("confidence", 0.0)), session_ref=capture["session_ref"]), rejected=True)
+                    confidence=float(capture.get("confidence", 0.0)), quality_verified=True,
+                    session_ref=capture["session_ref"]), rejected=True)
         except Exception:
             app.logger.exception("Unable to persist a camera-rejected egg")
             ESP32_BRIDGE.publish_status(
@@ -2021,7 +2065,10 @@ def dashboard_stats() -> Any:
     quality_counts = {quality: count for quality, count in quality_rows}
     good_count = quality_counts.get("Good", 0)
     latest_record = selected_records.order_by(EggRecord.id.desc()).first()
-    trays_completed = good_count // TRAY_CAPACITY
+    tray_progress_rows = (
+        TraySizeProgress.query.order_by(TraySizeProgress.egg_size.asc()).all()
+    )
+    trays_completed = sum(row.completed_milestones for row in tray_progress_rows)
 
     # Keep exactly seven weekday columns, always Sunday through Saturday.
     # Aggregate only records inside the selected From-To range into weekdays.
@@ -2051,7 +2098,8 @@ def dashboard_stats() -> Any:
         quality_counts=quality_counts,
         latest_record=latest_record.to_dict() if latest_record else None,
         hardware=ESP32_BRIDGE.status(),
-        unread_alerts=TrayAlert.query.filter_by(is_read=False).count(),
+        unread_alerts=TraySizeAlert.query.filter_by(is_read=False).count(),
+        tray_progress=[row.to_dict() for row in tray_progress_rows],
         daily_trend=[
             {
                 "date": day.isoformat(),
@@ -2085,34 +2133,40 @@ def clear_dashboard_audit_logs() -> Any:
 @login_required
 def alerts_data() -> Any:
     alert_filter = request.args.get("filter", "all")
-    query = TrayAlert.query
+    query = TraySizeAlert.query
     if alert_filter == "unread":
         query = query.filter_by(is_read=False)
     elif alert_filter == "read":
         query = query.filter_by(is_read=True)
     alerts_list = (
-        query.order_by(TrayAlert.id.desc()).limit(MAX_ALERT_RESULTS).all()
+        query.order_by(TraySizeAlert.id.desc()).limit(MAX_ALERT_RESULTS).all()
     )
     return jsonify(
         alerts=[alert.to_dict() for alert in alerts_list],
-        unread_count=TrayAlert.query.filter_by(is_read=False).count(),
+        unread_count=TraySizeAlert.query.filter_by(is_read=False).count(),
     )
 
 
-@app.post("/api/alerts/<int:alert_id>/read")
+@app.post("/api/alerts/<alert_id>/read")
 @login_required
-def mark_alert_read(alert_id: int) -> Any:
-    if alert_id < 1:
+def mark_alert_read(alert_id: str) -> Any:
+    if not alert_id.startswith("size:"):
+        return jsonify(error="Invalid alert ID."), 400
+    try:
+        database_id = int(alert_id.removeprefix("size:"))
+    except ValueError:
+        return jsonify(error="Invalid alert ID."), 400
+    if database_id < 1:
         return jsonify(error="Invalid alert ID."), 400
 
-    alert = db.session.get(TrayAlert, alert_id)
+    alert = db.session.get(TraySizeAlert, database_id)
     if alert is None:
         return jsonify(error="Alert not found."), 404
 
     if not alert.is_read:
         alert.is_read = True
     alert_data = alert.to_dict()
-    unread_count = TrayAlert.query.filter_by(is_read=False).count()
+    unread_count = TraySizeAlert.query.filter_by(is_read=False).count()
     db.session.commit()
     return jsonify(ok=True, alert=alert_data, unread_count=unread_count)
 
@@ -2120,12 +2174,23 @@ def mark_alert_read(alert_id: int) -> Any:
 @app.post("/api/alerts/read-all")
 @login_required
 def mark_all_alerts_read() -> Any:
-    TrayAlert.query.filter_by(is_read=False).update(
+    TraySizeAlert.query.filter_by(is_read=False).update(
         {"is_read": True},
         synchronize_session=False,
     )
     db.session.commit()
     return jsonify(ok=True, unread_count=0)
+
+
+@app.get("/api/tray-progress")
+@login_required
+def tray_progress_data() -> Any:
+    rows = TraySizeProgress.query.order_by(TraySizeProgress.egg_size.asc()).all()
+    return jsonify(
+        sizes=[row.to_dict() for row in rows],
+        ready=len(rows) == len(TRAY_TRACKED_SIZES)
+        and all(row.opening_balance is not None for row in rows),
+    )
 
 
 @app.get("/api/reports")

@@ -76,7 +76,7 @@ class Phase2BPostgresTests(TestCase):
         with backend.app.app_context():
             counts = [backend.db.session.query(model).count() for model in
                       (backend.User, backend.SortingSession, backend.EggRecord,
-                       backend.AuditLog, backend.TrayAlert)]
+                       backend.AuditLog, backend.TraySizeAlert)]
         if counts != [0, 0, 0, 0, 0]:
             raise RuntimeError("Disposable fixtures are not empty; stop and inspect")
         backend.app.config["LIFECYCLE_WRITES_ENABLED"] = True

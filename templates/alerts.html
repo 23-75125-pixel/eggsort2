@@ -294,8 +294,8 @@
             No tray completion alerts yet.
           </h3>
           <p id="alerts-empty-message" class="font-body-lg text-body-lg text-secondary mb-8">
-            A live alert will appear here whenever another tray reaches 30
-            sorted and weighed eggs.
+            A size-specific alert will appear when a tray reaches 30 eggs,
+            including its manually counted opening balance.
           </p>
           <a
             id="alerts-empty-dashboard-link"
@@ -410,7 +410,7 @@
       if (visibleRows.length === 0) {
         if (activeFilter === 'unread' && filteredRows.length === 0) {
           emptyTitle.textContent = "You're all caught up!";
-          emptyMessage.textContent = 'New tray completion alerts will appear here when they arrive.';
+          emptyMessage.textContent = 'New size-specific tray alerts will appear when a tray reaches 30 eggs.';
           emptyDashboardLink.classList.add('hidden');
         } else if (activeFilter === 'read' && filteredRows.length === 0) {
           emptyTitle.textContent = 'No read alerts yet.';
@@ -453,7 +453,9 @@
         const meta = makeTextElement(
           'p',
           'font-label text-secondary mt-2 break-all',
-          `${formatAlertTime(alert.created_at)} • Session ${alert.session_ref}`
+          `${formatAlertTime(alert.created_at)} • ${alert.session_ref
+            ? `Session ${alert.session_ref}`
+            : `${alert.egg_size} size tray`}`
         );
         details.appendChild(meta);
 

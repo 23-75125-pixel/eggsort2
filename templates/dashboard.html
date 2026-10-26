@@ -308,7 +308,7 @@
                 id="dashboard-trays-note"
                 class="font-caption text-caption text-secondary flex items-center gap-1"
               >
-                30 eggs per tray
+                Based on size-specific sorted counts
               </p>
             </div>
           </div>
@@ -370,6 +370,18 @@
             </div>
           </div>
         </div>
+        <!-- Per-size tray progress uses durable verified Good-egg counts. -->
+        <section class="bg-white rounded-2xl p-6 glow-effect border border-outline-variant/20" aria-labelledby="dashboard-tray-progress-title">
+          <div class="mb-5">
+            <h4 id="dashboard-tray-progress-title" class="font-headline-md text-body-lg font-bold text-on-background">Per-Size Tray Progress</h4>
+            <p class="font-caption text-caption text-secondary mt-1">
+              Tray counts are based on sorted eggs. Physical tray filling is not confirmed by the system.
+            </p>
+          </div>
+          <div id="dashboard-tray-progress" class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-3" aria-live="polite">
+            <p class="font-caption text-caption text-secondary">Loading per-size progress…</p>
+          </div>
+        </section>
         <!-- Charts Row -->
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-gutter">
           <!-- Size Distribution (Empty State) -->
@@ -448,6 +460,82 @@
 
     const sizeOrder = ['Small', 'Medium', 'Large', 'Extra Large', 'Jumbo'];
     let followDashboardToday = true;
+
+    function renderTrayProgress(progressRows) {
+      const container = document.getElementById('dashboard-tray-progress');
+      const progressBySize = new Map(
+        (Array.isArray(progressRows) ? progressRows : []).map((row) => [row.egg_size, row])
+      );
+      container.replaceChildren();
+
+      sizeOrder.forEach((size) => {
+        const progress = progressBySize.get(size);
+        const card = document.createElement('article');
+        card.className = 'rounded-xl border border-outline-variant/30 bg-surface-container-low p-4 min-w-0';
+
+        const heading = document.createElement('h5');
+        heading.className = 'font-semibold text-on-surface';
+        heading.textContent = size;
+        card.appendChild(heading);
+
+        if (!progress || !progress.opening_balance_configured) {
+          const state = document.createElement('p');
+          state.className = 'mt-3 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-800';
+          state.textContent = 'Opening balance not initialized';
+          const setup = document.createElement('p');
+          setup.className = 'mt-2 text-xs text-secondary';
+          setup.textContent = 'Set the physical count (0–29) in User Management to start tracking.';
+          const unknown = document.createElement('p');
+          unknown.className = 'mt-3 text-xs leading-5 text-secondary';
+          unknown.textContent = 'Progress: —/30 · Milestones: — · Remaining: —';
+          card.append(state, setup, unknown);
+          container.appendChild(card);
+          return;
+        }
+
+        const current = Number(progress.eggs_toward_next_milestone);
+        const completed = Number(progress.completed_milestones);
+        const validProgress = Number.isInteger(current) && current >= 0 && current < 30;
+        const validCompleted = Number.isInteger(completed) && completed >= 0;
+        if (!validProgress || !validCompleted) {
+          const state = document.createElement('p');
+          state.className = 'mt-3 text-sm text-error';
+          state.textContent = 'Tray progress is unavailable.';
+          card.appendChild(state);
+          container.appendChild(card);
+          return;
+        }
+
+        const progressLabel = document.createElement('div');
+        progressLabel.className = 'mt-3';
+        const currentText = document.createElement('span');
+        currentText.className = 'font-semibold text-sm text-primary';
+        currentText.textContent = `Next Tray Progress: ${current}/30 Eggs`;
+        progressLabel.append(currentText);
+
+        const track = document.createElement('div');
+        track.className = 'mt-2 h-2.5 w-full overflow-hidden rounded-full bg-white';
+        track.setAttribute('role', 'progressbar');
+        track.setAttribute('aria-label', `${size} sorted-egg progress`);
+        track.setAttribute('aria-valuemin', '0');
+        track.setAttribute('aria-valuemax', '30');
+        track.setAttribute('aria-valuenow', String(current));
+        const fill = document.createElement('div');
+        fill.className = 'h-full rounded-full bg-primary-container transition-all';
+        fill.style.width = `${current / 30 * 100}%`;
+        track.appendChild(fill);
+
+        const milestoneText = document.createElement('p');
+        milestoneText.className = 'mt-3 text-sm font-medium text-on-surface';
+        milestoneText.textContent = `${completed} Tray${completed === 1 ? '' : 's'} Completed`;
+        const remainingText = document.createElement('p');
+        remainingText.className = 'mt-1 text-xs text-secondary';
+        const remaining = 30 - current;
+        remainingText.textContent = `${remaining} More Egg${remaining === 1 ? '' : 's'} Needed`;
+        card.append(progressLabel, track, milestoneText, remainingText);
+        container.appendChild(card);
+      });
+    }
 
     function manilaToday() {
       const parts = new Intl.DateTimeFormat('en-CA', {
@@ -708,8 +796,14 @@
             ? `Latest: ${stats.latest_record.weight_grams == null ? 'N/A' : `${stats.latest_record.weight_grams} g`} • ${stats.latest_record.size}`
             : 'No eggs sorted in this date range';
         document.getElementById('dashboard-trays').textContent = stats.trays_completed;
+        const trayProgress = stats.tray_progress || [];
         document.getElementById('dashboard-trays-note').textContent =
-          `${stats.good_count % 30}/30 good eggs in range`;
+          'Sorted eggs';
+        const trayKey = JSON.stringify(trayProgress);
+        if (trayKey !== renderedSections.trayProgress) {
+          renderTrayProgress(trayProgress);
+          renderedSections.trayProgress = trayKey;
+        }
         document.getElementById('dashboard-quality-rate').textContent =
           `${stats.quality_rate}%`;
         document.getElementById('dashboard-quality-note').textContent =

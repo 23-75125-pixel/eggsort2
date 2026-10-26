@@ -78,13 +78,15 @@ def verify_model_schema(inspector: Any, schema: str = "public") -> None:
         if inspector.get_pk_constraint(table.name, schema=schema)["constrained_columns"] != [c.name for c in table.primary_key.columns]:
             raise ConfigurationError("Phase 1 primary key mismatch: " + table.name)
         for constraint in table.foreign_key_constraints:
-            expected = constraint.elements[0]
+            expected_parent_columns = [element.parent.name for element in constraint.elements]
+            expected_referred_columns = [element.column.name for element in constraint.elements]
+            expected_referred_table = constraint.elements[0].column.table.name
             matches = [fk for fk in inspector.get_foreign_keys(table.name, schema=schema)
                        if fk["name"] == constraint.name
-                       and fk["constrained_columns"] == [expected.parent.name]
-                       and fk["referred_table"] == expected.column.table.name
+                       and fk["constrained_columns"] == expected_parent_columns
+                       and fk["referred_table"] == expected_referred_table
                        and fk.get("referred_schema") in (None, schema)
-                       and fk["referred_columns"] == [expected.column.name]
+                       and fk["referred_columns"] == expected_referred_columns
                        and fk.get("options", {}).get("ondelete", "").upper() == constraint.ondelete]
             if not matches:
                 raise ConfigurationError("Phase 1 foreign key mismatch: " + str(constraint.name))
@@ -202,18 +204,45 @@ def verify_production_relationship_schema() -> None:
               (c.conrelid, c.conname) IN
               (('public.sorting_session'::regclass, 'fk_sorting_session_user'),
                ('public.egg_record'::regclass, 'fk_egg_record_sorting_session'),
-               ('public.audit_log'::regclass, 'fk_audit_log_user'))
+               ('public.audit_log'::regclass, 'fk_audit_log_user'),
+               ('public.tray_size_progress'::regclass, 'fk_tray_size_progress_opened_by'),
+               ('public.tray_size_progress_egg'::regclass, 'fk_tray_size_progress_egg_record'),
+               ('public.tray_size_progress_egg'::regclass, 'fk_tray_size_progress_egg_size'),
+               ('public.tray_size_alert'::regclass, 'fk_tray_size_alert_boundary_egg'))
         """)).scalar_one()
-        if valid_fks != 3:
+        if valid_fks != 7:
             raise ConfigurationError("Production relationships are not fully validated.")
+        tray_constraints = connection.execute(text("""
+            SELECT count(*) FROM pg_constraint c
+            JOIN pg_class t ON t.oid = c.conrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            WHERE n.nspname = 'public'
+              AND t.relname IN ('tray_size_progress', 'tray_size_progress_egg', 'tray_size_alert')
+              AND c.convalidated AND c.conname IN (
+              'ck_tray_size_progress_supported_size',
+              'ck_tray_size_progress_opening_balance',
+              'ck_tray_size_progress_nonnegative_counts',
+              'ck_tray_size_progress_remaining_range',
+              'ck_tray_size_progress_state_consistency',
+              'uq_tray_size_progress_egg_id_size',
+              'ck_tray_size_alert_supported_size',
+              'ck_tray_size_alert_milestone_positive',
+              'ck_tray_size_alert_egg_count',
+              'uq_tray_size_alert_size_milestone',
+              'uq_tray_size_alert_boundary_egg'
+            )
+        """)).scalar_one()
+        if tray_constraints != 11:
+            raise ConfigurationError("Per-size tray constraints are missing or unvalidated.")
         owner_rls = connection.execute(text("""
             SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
             WHERE n.nspname='public' AND c.relname IN
-              ('user','egg_record','audit_log','tray_alert','sorting_session')
+              ('user','egg_record','audit_log','sorting_session',
+               'tray_size_progress','tray_size_progress_egg','tray_size_alert')
               AND c.relrowsecurity AND NOT c.relforcerowsecurity
               AND pg_get_userbyid(c.relowner)=current_user
         """)).scalar_one()
-        if owner_rls != 5:
+        if owner_rls != 7:
             raise ConfigurationError("Production table ownership or RLS behavior differs from preflight.")
 
 

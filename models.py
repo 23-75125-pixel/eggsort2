@@ -9,6 +9,7 @@ from extensions import db
 
 
 TRAY_CAPACITY = 30
+TRAY_TRACKED_SIZES = ("Small", "Medium", "Large", "Extra Large", "Jumbo")
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -56,6 +57,9 @@ class EggRecord(db.Model):
     size = db.Column(db.String(30), nullable=False)
     quality = db.Column(db.String(30), nullable=False)
     confidence = db.Column(db.Float, nullable=False, default=0.0)
+    # NULL means a historical/unknown record. Only explicitly camera-verified
+    # Good records are eligible for per-size tray progress.
+    quality_verified = db.Column(db.Boolean, nullable=True)
     session_ref = db.Column(db.String(40), db.ForeignKey("sorting_session.session_ref", name="fk_egg_record_sorting_session", ondelete="RESTRICT", onupdate="CASCADE"), nullable=False, index=True)
     sorting_session = db.relationship("SortingSession", back_populates="egg_records")
     sorted_at = db.Column(
@@ -74,35 +78,160 @@ class EggRecord(db.Model):
             "size": self.size,
             "quality": self.quality,
             "confidence": round(self.confidence, 4),
+            "quality_verified": self.quality_verified,
             "session_ref": self.session_ref,
             "sorted_at": _as_utc(self.sorted_at).isoformat(),
         }
 
 
-class TrayAlert(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    tray_number = db.Column(db.Integer, unique=True, nullable=False)
-    egg_count = db.Column(db.Integer, nullable=False)
-    session_ref = db.Column(db.String(40), nullable=False)
-    is_read = db.Column(db.Boolean, nullable=False, default=False)
-    created_at = db.Column(
-        db.DateTime(timezone=True),
-        nullable=False,
-        default=lambda: datetime.now(timezone.utc),
+class TraySizeProgress(db.Model):
+    __tablename__ = "tray_size_progress"
+    __table_args__ = (
+        db.CheckConstraint(
+            "egg_size IN ('Small', 'Medium', 'Large', 'Extra Large', 'Jumbo')",
+            name="ck_tray_size_progress_supported_size",
+        ),
+        db.CheckConstraint(
+            "opening_balance IS NULL OR opening_balance BETWEEN 0 AND 29",
+            name="ck_tray_size_progress_opening_balance",
+        ),
+        db.CheckConstraint(
+            "confirmed_good_eggs_since_opening >= 0 AND completed_milestones >= 0",
+            name="ck_tray_size_progress_nonnegative_counts",
+        ),
+        db.CheckConstraint(
+            "eggs_toward_next_milestone IS NULL OR eggs_toward_next_milestone BETWEEN 0 AND 29",
+            name="ck_tray_size_progress_remaining_range",
+        ),
+        db.CheckConstraint(
+            "(opening_balance IS NULL AND opening_balance_set_at IS NULL "
+            "AND eggs_toward_next_milestone IS NULL "
+            "AND confirmed_good_eggs_since_opening = 0 AND completed_milestones = 0) "
+            "OR (opening_balance IS NOT NULL AND opening_balance_set_at IS NOT NULL "
+            "AND eggs_toward_next_milestone = "
+            "((opening_balance::BIGINT + confirmed_good_eggs_since_opening) % 30)::SMALLINT "
+            "AND completed_milestones = "
+            "((opening_balance::BIGINT + confirmed_good_eggs_since_opening) / 30))",
+            name="ck_tray_size_progress_state_consistency",
+        ),
+    )
+
+    egg_size = db.Column(db.String(30), primary_key=True)
+    opening_balance = db.Column(db.SmallInteger, nullable=True)
+    opening_balance_set_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    opening_balance_set_by_user_id = db.Column(
+        db.Integer,
+        db.ForeignKey(
+            "user.id", name="fk_tray_size_progress_opened_by", ondelete="SET NULL"
+        ),
+        nullable=True,
+    )
+    confirmed_good_eggs_since_opening = db.Column(
+        db.BigInteger, nullable=False, default=0, server_default="0"
+    )
+    completed_milestones = db.Column(
+        db.BigInteger, nullable=False, default=0, server_default="0"
+    )
+    eggs_toward_next_milestone = db.Column(db.SmallInteger, nullable=True)
+    updated_at = db.Column(
+        db.DateTime(timezone=True), nullable=False, server_default=db.func.now()
     )
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.id,
-            "tray_number": self.tray_number,
-            "egg_count": self.egg_count,
-            "session_ref": self.session_ref,
+            "egg_size": self.egg_size,
+            "opening_balance": self.opening_balance,
+            "opening_balance_configured": self.opening_balance is not None,
+            "confirmed_good_eggs_since_opening": self.confirmed_good_eggs_since_opening,
+            "completed_milestones": self.completed_milestones,
+            "eggs_toward_next_milestone": self.eggs_toward_next_milestone,
+            "updated_at": _as_utc(self.updated_at).isoformat() if self.updated_at else None,
+        }
+
+
+class TraySizeProgressEgg(db.Model):
+    __tablename__ = "tray_size_progress_egg"
+    __table_args__ = (
+        db.UniqueConstraint(
+            "egg_record_id", "egg_size", name="uq_tray_size_progress_egg_id_size"
+        ),
+    )
+
+    egg_record_id = db.Column(
+        db.Integer,
+        db.ForeignKey(
+            "egg_record.id",
+            name="fk_tray_size_progress_egg_record",
+            ondelete="RESTRICT",
+        ),
+        primary_key=True,
+    )
+    egg_size = db.Column(
+        db.String(30),
+        db.ForeignKey(
+            "tray_size_progress.egg_size",
+            name="fk_tray_size_progress_egg_size",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    counted_at = db.Column(
+        db.DateTime(timezone=True), nullable=False, server_default=db.func.now()
+    )
+
+
+class TraySizeAlert(db.Model):
+    __tablename__ = "tray_size_alert"
+    __table_args__ = (
+        db.CheckConstraint(
+            "egg_size IN ('Small', 'Medium', 'Large', 'Extra Large', 'Jumbo')",
+            name="ck_tray_size_alert_supported_size",
+        ),
+        db.CheckConstraint("milestone_number >= 1", name="ck_tray_size_alert_milestone_positive"),
+        db.CheckConstraint(
+            "eligible_egg_count_at_milestone = milestone_number * 30",
+            name="ck_tray_size_alert_egg_count",
+        ),
+        db.UniqueConstraint(
+            "egg_size", "milestone_number", name="uq_tray_size_alert_size_milestone"
+        ),
+        db.UniqueConstraint(
+            "boundary_egg_record_id", name="uq_tray_size_alert_boundary_egg"
+        ),
+        db.ForeignKeyConstraint(
+            ["boundary_egg_record_id", "egg_size"],
+            ["tray_size_progress_egg.egg_record_id", "tray_size_progress_egg.egg_size"],
+            name="fk_tray_size_alert_boundary_egg",
+            ondelete="RESTRICT",
+        ),
+        db.Index(
+            "ix_tray_size_alert_read_created", "is_read", "created_at", "id"
+        ),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    egg_size = db.Column(db.String(30), nullable=False)
+    milestone_number = db.Column(db.BigInteger, nullable=False)
+    eligible_egg_count_at_milestone = db.Column(db.BigInteger, nullable=False)
+    boundary_egg_record_id = db.Column(db.Integer, nullable=False)
+    is_read = db.Column(db.Boolean, nullable=False, default=False, server_default="false")
+    created_at = db.Column(
+        db.DateTime(timezone=True), nullable=False, server_default=db.func.now()
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": f"size:{self.id}",
+            "tray_number": self.milestone_number,
+            "egg_count": self.eligible_egg_count_at_milestone,
+            "egg_size": self.egg_size,
+            "session_ref": None,
             "is_read": self.is_read,
             "created_at": _as_utc(self.created_at).isoformat(),
-            "title": f"Tray {self.tray_number} completed",
+            "title": f"{self.egg_size} tray {self.milestone_number} completed",
             "message": (
-                f"Tray {self.tray_number} reached {TRAY_CAPACITY} sorted eggs "
-                f"({self.egg_count} total eggs)."
+                f"{self.egg_size} tray reached {TRAY_CAPACITY} eggs "
+                f"at size-specific milestone {self.milestone_number}."
             ),
         }
 
