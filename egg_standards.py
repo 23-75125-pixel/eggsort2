@@ -25,15 +25,15 @@ SIZE_CODES: Final[dict[str, str]] = {
 
 
 def classify_egg_size(weight_grams: int | float) -> str:
-    """Classify with the boundaries from the proven ESP32 sorting sketch."""
+    """Classify with the Roxas Farm client-defined weight boundaries."""
     weight = float(weight_grams)
-    if weight < 50:
-        return "Small"
     if weight <= 55:
+        return "Small"
+    if weight <= 60:
         return "Medium"
-    if weight <= 61:
+    if weight <= 65:
         return "Large"
-    if weight <= 66:
+    if weight <= 70:
         return "Extra Large"
     return "Jumbo"
 

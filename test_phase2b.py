@@ -56,14 +56,14 @@ class BackendLifecycleTests(unittest.TestCase):
     def pending(self):
         backend.EGG_FLOW_STAGE = "measuring"
         backend.EGG_FLOW_QUALITY = {**self.context, "label": "Good", "confidence": 0.9}
-        backend.queue_sort_after_measurement({"weight_grams": 52, "size": "Medium"})
+        backend.queue_sort_after_measurement({"weight_grams": 52, "size": "Small"})
 
     def automatic_cycle(self, cycle_id=1):
         with patch.object(backend, "Thread"):
             for kind, fields in (
                 ("egg_detected", {}),
-                ("egg_complete", {"weight_grams": 59, "size": "Large"}),
-                ("sort_complete", {"size": "Large"}),
+                ("egg_complete", {"weight_grams": 59, "size": "Medium"}),
+                ("sort_complete", {"size": "Medium"}),
                 ("egg_left", {}),
             ):
                 backend.handle_esp32_event(self.event(kind=kind, cycle_id=cycle_id, **fields))
@@ -97,12 +97,12 @@ class BackendLifecycleTests(unittest.TestCase):
     def test_stable_weight_is_not_recorded_before_size_sort_confirmation(self):
         with patch.object(backend, "Thread"):
             backend.handle_esp32_event(self.event(kind="egg_detected", cycle_id=1))
-            backend.handle_esp32_event(self.event(kind="egg_complete", cycle_id=1, weight_grams=59, size="Large"))
+            backend.handle_esp32_event(self.event(kind="egg_complete", cycle_id=1, weight_grams=59, size="Medium"))
         capture = {**self.context, "capture_id": 7, "label": "good", "confidence": 0.9}
         def wait_for_sort(_):
             save.assert_not_called()
             with patch.object(backend, "Thread"):
-                backend.handle_esp32_event(self.event(kind="sort_complete", cycle_id=1, size="Large"))
+                backend.handle_esp32_event(self.event(kind="sort_complete", cycle_id=1, size="Medium"))
         with patch.object(backend.CAMERA_SESSION, "wait_for_captured_quality", return_value=capture), \
              patch.object(backend.AUTOMATIC_RECORD_WAKE, "wait", side_effect=wait_for_sort), \
              patch.object(backend, "persist_capture", return_value=101) as save:
@@ -321,7 +321,7 @@ class BackendLifecycleTests(unittest.TestCase):
         capture = {**self.context, "label": "good", "confidence": 0.8}
         def measure(*args, **kwargs):
             self.assertEqual(backend.EGG_FLOW_STAGE, "measuring")
-            backend.queue_sort_after_measurement({"weight_grams": 52, "size": "Medium", "capture_id": 1})
+            backend.queue_sort_after_measurement({"weight_grams": 52, "size": "Small", "capture_id": 1})
         with patch.object(backend.CAMERA_SESSION, "wait_for_captured_quality", return_value=capture), \
              patch.object(backend.ESP32_BRIDGE, "measure_egg", side_effect=measure):
             backend._inspect_then_measure(backend.EGG_FLOW_SEQUENCE)
@@ -349,7 +349,7 @@ class BackendLifecycleTests(unittest.TestCase):
         bridge._connected = True
         bridge._serial = Mock()
         bridge._serial.write.side_effect = lambda _: backend.queue_sort_after_measurement(
-            {"weight_grams": 52, "size": "Medium", "capture_id": 1})
+            {"weight_grams": 52, "size": "Small", "capture_id": 1})
         backend.EGG_FLOW_STAGE = "inspecting"
         with patch.object(backend, "CAMERA_SESSION", camera), \
              patch.object(backend, "ESP32_BRIDGE", bridge), \
@@ -401,10 +401,10 @@ class BackendLifecycleTests(unittest.TestCase):
         backend.EGG_FLOW_QUALITY = {**self.context, "label": "Good", "confidence": 0.9,
                                     "_requires_capture_id": True}
         for capture_id in (None, 2):
-            backend.queue_sort_after_measurement({"weight_grams": 52, "size": "Medium",
+            backend.queue_sort_after_measurement({"weight_grams": 52, "size": "Small",
                                                  "capture_id": capture_id})
             self.assertIsNone(backend.EGG_FLOW_PENDING)
-        backend.queue_sort_after_measurement({"weight_grams": 52, "size": "Medium", "capture_id": 1})
+        backend.queue_sort_after_measurement({"weight_grams": 52, "size": "Small", "capture_id": 1})
         with patch.object(backend, "persist_capture", return_value=101) as persist:
             backend.handle_esp32_event(self.event(capture_id=2))
             persist.assert_not_called()

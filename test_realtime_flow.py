@@ -56,8 +56,14 @@ class RealtimePersistenceFlowTests(unittest.TestCase):
     def test_good_egg_reaches_save_for_controller_boundary_sizes(self) -> None:
         # These weights previously produced a different Python size, so the
         # real controller's completion message blocked persistence.
-        cases = [(49, "SMALL"), (55, "MEDIUM"),
-                 (62, "EXTRA LARGE"), (67, "JUMBO")]
+        cases = [
+            (49, "SMALL"),
+            (50, "SMALL"), (55, "SMALL"),
+            (56, "MEDIUM"), (60, "MEDIUM"),
+            (61, "LARGE"), (65, "LARGE"),
+            (66, "EXTRA LARGE"), (70, "EXTRA LARGE"),
+            (71, "JUMBO"), (75, "JUMBO"),
+        ]
         for weight, size in cases:
             with self.subTest(weight=weight):
                 context = {"session_ref": "TEST-SESSION", "capture_id": 7,

@@ -20,7 +20,7 @@ bool pcaReady = false;
 #define BUZZER_DURATION 1000
 #define BUZZER_FREQUENCY 2000
 bool buzzerActive = false;
-unsigned long buzzerStartedAt = 0;
+unsigned long buzzerStartedAt = 0;    
 
 // =====================================================
 // SERVO CHANNELS
@@ -59,18 +59,20 @@ unsigned long rejectClosedAt = 0;
 // LOAD-CELL SERVO
 // =====================================================
 
-#define LOADCELL_CLOSED 305
-#define LOADCELL_OPEN 175
+#define LOADCELL_CLOSED 310
+#define LOADCELL_OPEN 185
 
 // Direct movement, then allow the linkage to reach its commanded position.
 #define LOADCELL_OPEN_SETTLE_TIME 250
 #define LOADCELL_OPEN_DELAY_AFTER_WEIGHT 600
 
 // How long load-cell gate stays open
-#define LOADCELL_OPEN_TIME 2500
+#define LOADCELL_OPEN_TIME 2200
+#define LOADCELL_OPEN_SPEED 5
 
 // Commanded position only; this servo has no physical position feedback.
 bool loadCellGateOpen = false;
+
 
 // =====================================================
 // SIZE SERVO RANGE
@@ -141,7 +143,7 @@ bool loadCellGateOpen = false;
 
 HX711 scale;
 
-float calibration_factor = 618.0;
+float calibration_factor = 622.0;
 
 #define EGG_THRESHOLD 30
 
@@ -556,13 +558,16 @@ void moveLoadCellServoSlow(
 
 // Opens the load-cell gate during the automatic sorting cycle.
 bool openLoadCellGate() {
-
   if (!pcaReady) {
     Serial.println("LOAD CELL GATE FAILED: PCA9685 NOT FOUND");
     return false;
   }
 
-  pwm.setPWM(LOADCELL_SERVO, 0, LOADCELL_OPEN);
+  for (int pos = LOADCELL_CLOSED; pos >= LOADCELL_OPEN; pos--) {
+    pwm.setPWM(LOADCELL_SERVO, 0, pos);
+    waitWithRejectService(LOADCELL_OPEN_SPEED);
+  }
+
   waitWithRejectService(LOADCELL_OPEN_SETTLE_TIME);
 
   loadCellGateOpen = true;
@@ -886,6 +891,10 @@ void serviceRouteJobs() {
 
 void serviceLoadCellCycle() {
   const unsigned long now = millis();
+
+  static int pos = LOADCELL_CLOSED;
+  static unsigned long lastStep = 0;
+
   if (loadCellReleasePending && (long)(now - loadCellReleaseDueAt) >= 0) {
     if (!pcaReady) {
       controllerFault = "LOAD CELL GATE UNAVAILABLE; PCA9685 NOT FOUND AT 0x40";
@@ -893,28 +902,43 @@ void serviceLoadCellCycle() {
       Serial.print(controllerFault);
       printCaptureTagFor(loadCellReleaseCycleId);
       loadCellReleasePending = false;
+      pos = LOADCELL_CLOSED;
       return;
     }
-    pwm.setPWM(LOADCELL_SERVO, 0, LOADCELL_OPEN);
+
+    if (now - lastStep < LOADCELL_OPEN_SPEED) return;
+    lastStep = now;
+
+    pwm.setPWM(LOADCELL_SERVO, 0, pos);
+
+    if (pos > LOADCELL_OPEN) {
+      pos--;
+      return;
+    }
+
+    pos = LOADCELL_CLOSED;
     loadCellGateOpen = true;
     cycleHasBeenReleased = true;
     loadCellGateCloseAt = now + LOADCELL_OPEN_TIME;
+
     for (size_t i = 0; i < ROUTE_QUEUE_CAPACITY; ++i) {
-      if (routeJobs[i].active && routeJobs[i].cycleId == loadCellReleaseCycleId) {
+      if (routeJobs[i].active &&
+          routeJobs[i].cycleId == loadCellReleaseCycleId) {
         routeJobs[i].releasedAt = now + LOADCELL_OPEN_SETTLE_TIME;
         break;
       }
     }
+
     Serial.println("LOAD CELL GATE: OPEN");
     Serial.println("EGG RELEASED");
     Serial.println("TRAVEL TIMER STARTED");
     loadCellReleasePending = false;
   }
+
   if (loadCellGateOpen && (long)(now - loadCellGateCloseAt) >= 0) {
     const unsigned long releasedCycleId = loadCellReleaseCycleId;
     closeLoadCellGate();
-    // The load-cell gate has physically released this egg. Re-arm the scale
-    // now instead of waiting for a zero sample that back-to-back eggs may hide.
+
     if (eggDetected && automaticCycleId == releasedCycleId) {
       Serial.print("EGG LEFT");
       printCaptureTagFor(releasedCycleId);
@@ -978,8 +1002,8 @@ void loop() {
         if (weightReady && !controllerFault) {
           const unsigned long cycleId = automaticCycleId;
           const int finalWeight = round(stableWeight.average());
-          const uint8_t eggSize = finalWeight < 50 ? 1 : finalWeight <= 55 ? 2 :
-            finalWeight <= 61 ? 3 : finalWeight <= 66 ? 4 : 5;
+          const uint8_t eggSize = finalWeight <= 55 ? 1 : finalWeight <= 60 ? 2 :
+            finalWeight <= 65 ? 3 : finalWeight <= 70 ? 4 : 5;
           const char* sizeName = eggSize == 1 ? "SMALL" : eggSize == 2 ? "MEDIUM" :
             eggSize == 3 ? "LARGE" : eggSize == 4 ? "EXTRA LARGE" : "JUMBO";
 
