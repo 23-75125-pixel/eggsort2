@@ -2060,12 +2060,20 @@ def dashboard_stats() -> Any:
     end_date_value = request.args.get("end_date", "").strip()
     single_date_value = request.args.get("date", "").strip()
     all_dates = request.args.get("all_dates") == "true"
+    def parse_dashboard_date(value: str):
+        if not value:
+            return None
+        parsed = datetime.strptime(value, "%Y-%m-%d").date()
+        if parsed.isoformat() != value or not 2 <= parsed.year <= 9998:
+            raise ValueError("Unsupported dashboard date")
+        return parsed
+
     try:
-        start_date = datetime.strptime(start_date_value, "%Y-%m-%d").date() if start_date_value else None
-        end_date = datetime.strptime(end_date_value, "%Y-%m-%d").date() if end_date_value else None
-        single_date = datetime.strptime(single_date_value, "%Y-%m-%d").date() if single_date_value else None
+        start_date = parse_dashboard_date(start_date_value)
+        end_date = parse_dashboard_date(end_date_value)
+        single_date = parse_dashboard_date(single_date_value)
     except ValueError:
-        return jsonify(error="Dates must use YYYY-MM-DD format."), 400
+        return jsonify(error="Dates must use YYYY-MM-DD format, with years 0002 through 9998."), 400
 
     if start_date is None and end_date is None and single_date is not None:
         start_date = end_date = single_date
@@ -2076,6 +2084,8 @@ def dashboard_stats() -> Any:
             if earliest_sorted_at is None:
                 start_date = end_date
             else:
+                if not 2 <= earliest_sorted_at.year <= 9998:
+                    return jsonify(error="Dashboard dates must be within years 0002 through 9998."), 400
                 if earliest_sorted_at.tzinfo is None:
                     earliest_sorted_at = earliest_sorted_at.replace(tzinfo=timezone.utc)
                 start_date = min(
@@ -2090,6 +2100,8 @@ def dashboard_stats() -> Any:
         if earliest_sorted_at is None:
             start_date = end_date
         else:
+            if not 2 <= earliest_sorted_at.year <= 9998:
+                return jsonify(error="Dashboard dates must be within years 0002 through 9998."), 400
             if earliest_sorted_at.tzinfo is None:
                 earliest_sorted_at = earliest_sorted_at.replace(tzinfo=timezone.utc)
             start_date = min(
@@ -2100,6 +2112,8 @@ def dashboard_stats() -> Any:
 
     if start_date > end_date:
         return jsonify(error="From date cannot be after To date."), 400
+    if start_date.year < 2 or end_date.year > 9998:
+        return jsonify(error="Dashboard dates must be within years 0002 through 9998."), 400
 
     selected_start = datetime.combine(
         start_date, time.min, tzinfo=manila_timezone
@@ -2134,19 +2148,22 @@ def dashboard_stats() -> Any:
     )
     trays_completed = sum(row.completed_milestones for row in tray_progress_rows)
 
-    # Keep exactly seven weekday columns, always Sunday through Saturday.
-    # Aggregate only records inside the selected From-To range into weekdays.
-    trend_start_date = end_date - timedelta(days=(end_date.weekday() + 1) % 7)
-    trend_days = [trend_start_date + timedelta(days=offset) for offset in range(7)]
-    trend_counts = {weekday: 0 for weekday in range(7)}
+    # Use actual Manila dates, rather than combining different weeks' weekdays.
+    trend_counts = {}
     recent_records = selected_records.all()
     for record in recent_records:
         sorted_at = record.sorted_at
         if sorted_at.tzinfo is None:
             sorted_at = sorted_at.replace(tzinfo=timezone.utc)
         sorted_date = sorted_at.astimezone(manila_timezone).date()
-        weekday_index = (sorted_date.weekday() + 1) % 7
-        trend_counts[weekday_index] += 1
+        trend_counts[sorted_date] = trend_counts.get(sorted_date, 0) + 1
+    day_count = (end_date - start_date).days + 1
+    # Keep zero-filled normal ranges. Very long ranges stay sparse instead of
+    # allocating millions of empty chart columns; database queries are unchanged.
+    trend_sparse = day_count > 366
+    trend_days = sorted(trend_counts) if trend_sparse else [
+        start_date + timedelta(days=offset) for offset in range(day_count)
+    ]
     stats = dict(
         selected_start_date=start_date.isoformat(),
         selected_end_date=end_date.isoformat(),
@@ -2164,11 +2181,12 @@ def dashboard_stats() -> Any:
         hardware=ESP32_BRIDGE.status(),
         unread_alerts=TraySizeAlert.query.filter_by(is_read=False).count(),
         tray_progress=[row.to_dict() for row in tray_progress_rows],
+        daily_trend_sparse=trend_sparse,
         daily_trend=[
             {
                 "date": day.isoformat(),
                 "label": day.strftime("%a"),
-                "count": trend_counts[(day.weekday() + 1) % 7],
+                "count": trend_counts.get(day, 0),
             }
             for day in trend_days
         ],
@@ -2188,9 +2206,10 @@ def dashboard_stats() -> Any:
 @app.post("/api/dashboard/audit-logs/clear")
 @admin_required
 def clear_dashboard_audit_logs() -> Any:
-    deleted_count = AuditLog.query.delete(synchronize_session=False)
-    db.session.commit()
-    return jsonify(deleted_count=deleted_count)
+    return jsonify(error=(
+        "Clearing audit logs is disabled pending approval of a safe retention policy. "
+        "No audit records were deleted."
+    )), 409
 
 
 @app.get("/api/alerts")
