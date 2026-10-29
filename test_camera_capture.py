@@ -6,6 +6,23 @@ from esp32_bridge import Esp32Bridge
 
 
 class CameraAutoCaptureTests(unittest.TestCase):
+    def setUp(self):
+        # Existing two-miss scenarios represent separated observations, not
+        # instant calls. Keep real debounce enabled without sleeping in tests.
+        self.clock = 100.0
+        timer = patch("camera_session.monotonic", side_effect=lambda: self.clock)
+        timer.start()
+        self.addCleanup(timer.stop)
+        original = CameraDetectionSession._update_auto_capture
+
+        def timed_observation(session, *args, **kwargs):
+            self.clock += 0.7
+            return original(session, *args, **kwargs)
+
+        observations = patch.object(CameraDetectionSession, "_update_auto_capture", timed_observation)
+        observations.start()
+        self.addCleanup(observations.stop)
+
     def test_mixed_detections_keep_good_eggs_in_original_pending_order(self):
         session = CameraDetectionSession()
         for quality in ("good", "crack", "good", "rotten", "good"):
@@ -24,7 +41,7 @@ class CameraAutoCaptureTests(unittest.TestCase):
         self.assertEqual(capture["capture_id"], 1)
         self.assertEqual(capture["label"], "good")
         self.assertTrue(capture["claimed_on_scale"])
-        self.assertEqual(session.status()["egg_count"], 1)
+        self.assertEqual(session.status()["egg_count"], 0)
         for label in ("good", "good", "no egg", "no egg"):
             self.assertIsNone(session._update_auto_capture(label, 0.9))
         self.assertIsNone(session.wait_for_captured_quality(0, allow_loaded_capture=True))

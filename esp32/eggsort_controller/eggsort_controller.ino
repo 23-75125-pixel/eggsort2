@@ -47,8 +47,8 @@ unsigned long buzzerStartedAt = 0;
 #define CRACK_OPEN 80
 
 // How long the reject gate stays open
-#define CRACK_GATE_OPEN_TIME 6000
-#define CRACK_RETRIGGER_CLOSE_TIME 150
+#define CRACK_GATE_OPEN_TIME 6500
+#define CRACK_RETRIGGER_CLOSE_TIME 300
 
 bool rejectGateOpen = false;
 bool rejectRestartPending = false;
@@ -59,12 +59,12 @@ unsigned long rejectClosedAt = 0;
 // LOAD-CELL SERVO
 // =====================================================
 
-#define LOADCELL_CLOSED 310
-#define LOADCELL_OPEN 185
+#define LOADCELL_CLOSED 305
+#define LOADCELL_OPEN 195
 
 // Direct movement, then allow the linkage to reach its commanded position.
 #define LOADCELL_OPEN_SETTLE_TIME 250
-#define LOADCELL_OPEN_DELAY_AFTER_WEIGHT 600
+#define LOADCELL_OPEN_DELAY_AFTER_WEIGHT 400
 
 // How long load-cell gate stays open
 #define LOADCELL_OPEN_TIME 2200

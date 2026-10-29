@@ -8,3 +8,8 @@ instance/
 .kilo/
 
 client_secret*.json
+
+# Private model variants and generated observations/builds are not source.
+best*.pt
+offline_tests/reject_observations/
+offline_tests/reject_replay/build/

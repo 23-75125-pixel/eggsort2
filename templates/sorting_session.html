@@ -552,10 +552,26 @@ function startStatusPolling() {
   }, 750);
 }
 
+function showCameraSuccessModal(title) {
+  if (!window.Swal) {
+    statusText.textContent = title;
+    return;
+  }
+  void window.Swal.fire({
+    toast: false,
+    position: 'center',
+    icon: 'success',
+    title,
+    showConfirmButton: false,
+    timer: 1500,
+    timerProgressBar: true
+  });
+}
+
 async function startCameraSession() {
-  if (startButton.disabled) return;
+  if (startButton.disabled || stopButton.disabled || cameraActionPending) return;
   startButton.disabled = true;
-  if (!await EggSortAlerts.confirm('Restart camera and ESP32?', 'Start the sorting session now?')) {
+  if (!await EggSortAlerts.confirm('Restart camera and ESP32?', 'Start the sorting session now?', false, 'Confirm Restart')) {
     startButton.disabled = false;
     return;
   }
@@ -572,7 +588,7 @@ async function startCameraSession() {
     const state = await requestJson('/api/camera/start', { method: 'POST' });
     showRunningSession(state.camera, true);
     refreshHardwareState();
-    await EggSortAlerts.success('Sorting session started successfully.');
+    showCameraSuccessModal('Restarted Successfully!');
   } catch (error) {
     showStoppedSession();
     showCameraError(error.message);
@@ -587,7 +603,7 @@ async function startCameraSession() {
 }
 
 async function stopCameraSession() {
-  if (stopButton.disabled) return;
+  if (stopButton.disabled || startButton.disabled || cameraActionPending) return;
   stopButton.disabled = true;
   if (!await EggSortAlerts.confirm('Stop sorting session?', 'Are you sure you want to stop the camera and ESP32?', true)) {
     stopButton.disabled = false;
@@ -602,7 +618,7 @@ async function stopCameraSession() {
     const state = await requestJson('/api/camera/stop', { method: 'POST', timeoutMs: 30000 });
     showStoppedSession(state.camera);
     refreshHardwareState();
-    await EggSortAlerts.success('Sorting session stopped successfully.');
+    showCameraSuccessModal('Closed Successfully!');
   } catch (error) {
     // Recover the displayed state from the server: the stop may have finished
     // even when the browser lost the response.
