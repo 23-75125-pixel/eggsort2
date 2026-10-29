@@ -13,3 +13,4 @@ client_secret*.json
 best*.pt
 offline_tests/reject_observations/
 offline_tests/reject_replay/build/
+testing/selenium-artifacts/
