@@ -1,4 +1,5 @@
 import hashlib
+import ipaddress
 import secrets
 import smtplib
 from datetime import datetime, time, timedelta, timezone
@@ -48,6 +49,7 @@ from detection_service import (
 from extensions import db, oauth
 from models import (
     AuditLog,
+    PasswordResetAttempt,
     EggRecord,
     SortingSession,
     TraySizeAlert,
@@ -147,6 +149,34 @@ def user_display_label(user: "User") -> str:
 
 def invite_token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def password_reset_identifier_hash(identifier: str) -> str:
+    return invite_token_hash(identifier.strip().lower())
+
+
+def password_reset_client_ip() -> str:
+    # Do not trust client-supplied forwarded headers for throttling.
+    try:
+        return str(ipaddress.ip_address(request.remote_addr or ""))
+    except ValueError:
+        return "unknown"
+
+
+def password_reset_request_is_limited(identifier_hash: str, client_ip: str,
+                                      *, now: datetime) -> bool:
+    recent = PasswordResetAttempt.query.filter(
+        PasswordResetAttempt.created_at > now - PASSWORD_RESET_WINDOW
+    )
+    identifier_attempts = recent.filter_by(identifier_hash=identifier_hash)
+    return (
+        identifier_attempts.count() >= PASSWORD_RESET_MAX_PER_IDENTIFIER
+        or recent.filter_by(ip_address=client_ip).count() >= PASSWORD_RESET_MAX_PER_IP
+        or PasswordResetAttempt.query.filter(
+            PasswordResetAttempt.identifier_hash == identifier_hash,
+            PasswordResetAttempt.created_at > now - PASSWORD_RESET_COOLDOWN,
+        ).first() is not None
+    )
 
 
 def invitation_is_valid(user: "User") -> bool:
@@ -502,6 +532,18 @@ def write_audit_log(
     if commit:
         db.session.commit()
     return log
+
+
+def write_auth_audit_log(*args: Any, **kwargs: Any) -> None:
+    """An audit outage must not undo an established authentication outcome."""
+    try:
+        write_audit_log(*args, **kwargs)
+    except Exception:
+        try:
+            db.session.rollback()
+        except Exception:
+            app.logger.exception("Authentication audit rollback failed")
+        app.logger.exception("Authentication audit write failed")
 
 
 def _count_verified_good_egg_for_tray(record: EggRecord) -> TraySizeAlert | None:
@@ -1336,7 +1378,7 @@ def login() -> Any:
         ):
             LOGIN_LIMITER.record_failure(limiter_key)
             error = "Invalid username/email or password."
-            write_audit_log(
+            write_auth_audit_log(
                 "login_failed",
                 "Failed staff sign-in attempt.",
                 actor=identifier or "Unknown",
@@ -1347,7 +1389,7 @@ def login() -> Any:
                 user,
                 remember=request.form.get("remember-me") == "on",
             )
-            write_audit_log(
+            write_auth_audit_log(
                 "login",
                 f"{user.role.title()} signed in successfully with a password.",
                 actor=user.email or user.username,
@@ -1386,7 +1428,8 @@ def forgot_password() -> Any:
                 created_at=now,
             )
         )
-        user = User.query.filter(func.lower(User.email) == email).first() if email else None
+        valid_email = len(email) <= 254 and is_valid_email(email)
+        user = User.query.filter(func.lower(User.email) == email).first() if valid_email else None
         if not limited and user is not None and user.is_active and user.password_set:
             token = secrets.token_urlsafe(32)
             user.password_reset_token_hash = invite_token_hash(token)
@@ -1435,14 +1478,31 @@ def reset_password(token: str) -> Any:
         elif password != confirmation:
             error = "Passwords do not match."
         else:
-            user.password = generate_password_hash(password)
-            user.password_set = True
-            user.password_reset_token_hash = None
-            user.password_reset_expires_at = None
-            user.invite_token_hash = None
-            user.invite_expires_at = None
+            # Consume conditionally so two concurrent submissions cannot both
+            # use the same token. The existing columns need no migration.
+            password_hash = generate_password_hash(password)
+            updated = User.query.filter(
+                User.id == user.id,
+                User.password_reset_token_hash == invite_token_hash(token),
+                User.password_reset_expires_at > datetime.now(timezone.utc),
+                User.is_active.is_(True),
+                User.password_set.is_(True),
+            ).update({
+                User.password: password_hash,
+                User.password_set: True,
+                User.password_reset_token_hash: None,
+                User.password_reset_expires_at: None,
+                User.invite_token_hash: None,
+                User.invite_expires_at: None,
+            }, synchronize_session=False)
+            if updated != 1:
+                db.session.rollback()
+                return render_template(
+                    "reset_password.html", error="This reset link is invalid or has expired.",
+                    valid_token=False, notice=None,
+                ), 400
             db.session.commit()
-            write_audit_log("password_reset", "User reset their password.", actor=user.email or user.username)
+            write_auth_audit_log("password_reset", "User reset their password.", actor=user.email or user.username)
             session["login_notice"] = "Password updated. Sign in with your new password."
             return redirect(url_for("login"))
     return render_template("reset_password.html", error=error, valid_token=True, notice=None)
@@ -1680,15 +1740,19 @@ def google_callback() -> Any:
     user.avatar_url = avatar_url if avatar_url.startswith("https://") else None
     db.session.commit()
 
+    # Rollback after an audit outage expires ORM attributes. Preserve the
+    # already-validated setup decision without another database read.
+    is_admin = user.role == "admin"
+    password_is_set = user.password_set
     sign_in_user(user, remember=True)
-    write_audit_log(
+    write_auth_audit_log(
         "login",
         f"{user.role.title()} signed in successfully with Google.",
         actor=user.email or user.username,
     )
-    if user.role == "admin":
+    if is_admin:
         session["google_verified_for_password_setup"] = True
-        if not user.password_set:
+        if not password_is_set:
             return redirect(url_for("setup_admin_password"))
     session.pop("google_verified_for_password_setup", None)
     return redirect(url_for("dashboard"))
@@ -2509,12 +2573,28 @@ def user_management() -> Any:
 @app.post("/logout")
 @login_required
 def logout() -> Any:
-    write_audit_log(
-        "logout",
-        "Operator signed out.",
-    )
-    stop_sorting_runtime()
-    session.clear()
+    stop_failed = False
+    try:
+        write_auth_audit_log("logout", "Operator signed out.")
+        try:
+            stop_sorting_runtime()
+        except Exception:
+            stop_failed = True
+            app.logger.exception("Runtime shutdown failed during logout")
+            try:
+                db.session.rollback()
+            except Exception:
+                app.logger.exception("Runtime shutdown rollback failed during logout")
+    finally:
+        session.clear()
+    if stop_failed:
+        message = (
+            "You have been signed out, but stopping the sorting runtime failed. "
+            "Hardware shutdown could not be verified. Check the station before continuing."
+        )
+        session["login_error"] = message
+        return render_template("login.html", error=message, notice=None,
+                               google_ready=google_is_configured()), 503
     session["auth_feedback"] = {
         "icon": "success", "message": "You have been logged out."
     }

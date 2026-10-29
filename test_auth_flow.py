@@ -1,23 +1,15 @@
-import os
 import re
 import secrets
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import patch
 
-os.environ["DATABASE_URL"] = "sqlite:///:memory:"
-os.environ["SUPABASE_DB_URL"] = ""
+from auth_test_support import auth, app, db, AuditLog, PasswordResetAttempt, User
 
-from app import (
-    AuditLog,
-    PasswordResetAttempt,
-    User,
-    app,
-    create_staff_invitation,
-    db,
-    invitation_is_valid,
-    invite_token_hash,
-)
+create_staff_invitation = auth.create_staff_invitation
+invitation_is_valid = auth.invitation_is_valid
+invite_token_hash = auth.invite_token_hash
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
@@ -179,7 +171,7 @@ class PasswordResetThrottlingTests(unittest.TestCase):
         with app.app_context():
             user = User(
                 username=f"reset-{suffix}",
-                ******"ResetPassword123!"),
+                password=generate_password_hash("ResetPassword123!"),
                 email=self.email,
                 display_name="Reset User",
                 role="staff",
@@ -217,7 +209,7 @@ class PasswordResetThrottlingTests(unittest.TestCase):
         )
 
     def test_identifier_cooldown_blocks_repeat_reset_email(self) -> None:
-        with patch("app.send_password_reset") as send_password_reset:
+        with patch.object(auth, "send_password_reset") as send_password_reset:
             first = self._forgot_password(self.email)
             second = self._forgot_password(self.email)
         self.assertEqual(first.status_code, 302)
@@ -228,11 +220,11 @@ class PasswordResetThrottlingTests(unittest.TestCase):
 
     def test_ip_window_limit_blocks_even_with_zero_cooldown(self) -> None:
         with (
-            patch("app.PASSWORD_RESET_COOLDOWN", timedelta(seconds=0)),
-            patch("app.PASSWORD_RESET_WINDOW", timedelta(minutes=10)),
-            patch("app.PASSWORD_RESET_MAX_PER_IDENTIFIER", 50),
-            patch("app.PASSWORD_RESET_MAX_PER_IP", 1),
-            patch("app.send_password_reset") as send_password_reset,
+            patch.object(auth, "PASSWORD_RESET_COOLDOWN", timedelta(seconds=0)),
+            patch.object(auth, "PASSWORD_RESET_WINDOW", timedelta(minutes=10)),
+            patch.object(auth, "PASSWORD_RESET_MAX_PER_IDENTIFIER", 50),
+            patch.object(auth, "PASSWORD_RESET_MAX_PER_IP", 1),
+            patch.object(auth, "send_password_reset") as send_password_reset,
         ):
             first = self._forgot_password(
                 self.email,
