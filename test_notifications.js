@@ -145,7 +145,7 @@ test('server validation and invalid error responses are reported as failures', a
 });
 
 test('dashboard scripts remain valid JavaScript', () => {
-  for (const name of ['dashboard', 'login', 'user_management', 'alerts', 'sales', 'sorting_session', 'egg_records', 'reports']) {
+  for (const name of ['dashboard', 'login', 'user_management', 'alerts', 'sorting_session', 'egg_records', 'reports']) {
     const html = fs.readFileSync(`templates/${name}.html`, 'utf8');
     for (const match of html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)) {
       new vm.Script(match[1], { filename: `templates/${name}.html` });

@@ -219,7 +219,7 @@
           <p
             class="font-label-caps text-label-caps text-primary tracking-widest uppercase mb-1"
           >
-            Operations Portal / Admin
+            Operations Portal
           </p>
           <h2 class="font-headline-lg text-headline-lg text-on-background">
             Operational Dashboard
@@ -237,7 +237,7 @@
               id="dashboard-status-dot"
               class="w-2 h-2 rounded-full bg-primary-container animate-pulse"
             ></span>
-            <span id="dashboard-status-text">Dashboard ready</span>
+            <span id="dashboard-status-text">Loading dashboard…</span>
           </div>
           <button
             id="refresh-dashboard"
@@ -250,6 +250,10 @@
           </button>
         </div>
       </header>
+      <p id="dashboard-message" role="status" aria-live="polite"
+         class="mx-4 mt-4 rounded-lg border border-outline-variant p-3 text-sm text-secondary">
+        Loading dashboard data. Summary values are not available yet.
+      </p>
       <!-- Dashboard Content -->
       <div class="p-margin pt-gutter flex-1 flex flex-col gap-gutter">
         <!-- KPI Cards Row -->
@@ -294,7 +298,7 @@
               <p
                 class="font-label-caps text-label-caps text-secondary uppercase tracking-wider"
               >
-                Trays Completed
+                Trays Completed (Cumulative)
               </p>
               <span class="material-symbols-outlined text-primary-container"
                 >widgets</span
@@ -375,7 +379,7 @@
           <div class="mb-5">
             <h4 id="dashboard-tray-progress-title" class="font-headline-md text-body-lg font-bold text-on-background">Per-Size Tray Progress</h4>
             <p class="font-caption text-caption text-secondary mt-1">
-              Tray counts are based on sorted eggs. Physical tray filling is not confirmed by the system.
+              Cumulative counts are not affected by the date filter. Physical tray filling is not confirmed by the system.
             </p>
           </div>
           <div id="dashboard-tray-progress" class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-3" aria-live="polite">
@@ -436,12 +440,15 @@
             <button
               id="clear-audit-logs"
               type="button"
+              disabled
+              title="Disabled until a safe audit retention policy is approved"
               class="inline-flex items-center gap-2 rounded-lg border border-red-200 px-4 py-2 text-sm font-semibold text-red-700 hover:bg-red-50 transition-colors"
             >
               <span class="material-symbols-outlined text-base">delete_sweep</span>
-              Clear Logs
+              Clear Logs (Disabled)
             </button>
           </div>
+          <p class="mb-4 text-sm text-secondary">Audit clearing is disabled to protect history and capture deduplication keys.</p>
           <div id="dashboard-audit-logs" class="flex flex-col items-center justify-center py-12 text-center">
             <span class="material-symbols-outlined text-4xl text-secondary-fixed-dim mb-4">history</span>
             <p class="font-body-md text-body-md text-secondary">No audit log entries yet.</p>
@@ -555,60 +562,72 @@
       return manilaDateOffset(-6);
     }
 
-    function renderDailyTrend(trend, selectedStartDate, selectedEndDate) {
+    function renderDailyTrend(trend, selectedStartDate, selectedEndDate, sparse = false) {
       const container = document.getElementById('dashboard-daily-trend');
-      container.replaceChildren();
-
-      const heading = document.createElement('div');
-      heading.className = 'flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-6';
-      const title = document.createElement('h4');
-      title.className = 'font-headline-md text-body-lg font-bold text-on-background';
-      title.textContent = 'Daily Sorting Trend';
-      const dateControls = document.createElement('div');
-      dateControls.className = 'flex flex-wrap items-center gap-2';
-      const makeDateFilter = (id, caption, value) => {
-        const label = document.createElement('label');
-        label.className = 'flex items-center gap-2 text-sm text-secondary';
-        label.append(caption);
-        const input = document.createElement('input');
-        input.type = 'date';
-        input.id = id;
-        input.className = 'rounded-lg border border-outline-variant/50 px-3 py-2 text-on-surface';
-        input.value = value;
-        input.setAttribute('aria-label', `${caption} date for dashboard`);
-        input.addEventListener('change', () => {
-          followDashboardToday =
-            document.getElementById('dashboard-start-date')?.value === dashboardDefaultStart() &&
-            document.getElementById('dashboard-end-date')?.value === manilaToday();
+      // Build filters once: polling must not replace an operator's inputs.
+      if (!document.getElementById('dashboard-start-date')) {
+        container.replaceChildren();
+        const heading = document.createElement('div');
+        heading.className = 'flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-6';
+        const title = document.createElement('h4');
+        title.className = 'font-headline-md text-body-lg font-bold text-on-background';
+        title.textContent = 'Daily Sorting Trend';
+        const dateControls = document.createElement('div');
+        dateControls.className = 'flex flex-wrap items-center gap-2';
+        const makeDateFilter = (id, caption, value) => {
+          const label = document.createElement('label');
+          label.className = 'flex items-center gap-2 text-sm text-secondary';
+          label.append(caption);
+          const input = document.createElement('input');
+          input.type = 'date';
+          input.id = id;
+          input.className = 'rounded-lg border border-outline-variant/50 px-3 py-2 text-on-surface';
+          input.value = value;
+          input.setAttribute('aria-label', `${caption} date for dashboard`);
+          input.addEventListener('change', () => {
+            followDashboardToday =
+              document.getElementById('dashboard-start-date')?.value === dashboardDefaultStart() &&
+              document.getElementById('dashboard-end-date')?.value === manilaToday();
+            refreshDashboard({ immediate: true });
+          });
+          label.appendChild(input);
+          return label;
+        };
+        dateControls.append(
+          makeDateFilter('dashboard-start-date', 'From', selectedStartDate),
+          makeDateFilter('dashboard-end-date', 'To', selectedEndDate)
+        );
+        const todayButton = document.createElement('button');
+        todayButton.type = 'button';
+        todayButton.id = 'dashboard-today-button';
+        todayButton.className = 'rounded-lg border border-outline-variant/50 px-3 py-2 text-sm text-secondary hover:bg-surface-container';
+        todayButton.textContent = 'Last 7 days';
+        todayButton.addEventListener('click', () => {
+          followDashboardToday = true;
+          document.getElementById('dashboard-start-date').value = dashboardDefaultStart();
+          document.getElementById('dashboard-end-date').value = manilaToday();
           refreshDashboard({ immediate: true });
         });
-        label.appendChild(input);
-        return label;
-      };
-      dateControls.append(
-        makeDateFilter('dashboard-start-date', 'From', selectedStartDate),
-        makeDateFilter('dashboard-end-date', 'To', selectedEndDate)
-      );
-      const todayButton = document.createElement('button');
-      todayButton.type = 'button';
-      todayButton.id = 'dashboard-today-button';
-      todayButton.className = 'rounded-lg border border-outline-variant/50 px-3 py-2 text-sm text-secondary hover:bg-surface-container';
-      todayButton.textContent = 'Last 7 days';
-      todayButton.addEventListener('click', () => {
-        followDashboardToday = true;
-        document.getElementById('dashboard-start-date').value = dashboardDefaultStart();
-        document.getElementById('dashboard-end-date').value = manilaToday();
-        refreshDashboard({ immediate: true });
-      });
-      dateControls.appendChild(todayButton);
-      heading.append(title, dateControls);
-      container.appendChild(heading);
+        dateControls.appendChild(todayButton);
+        heading.append(title, dateControls);
+        container.appendChild(heading);
+      }
+
+      document.getElementById('dashboard-trend-chart')?.remove();
 
       const chartViewport = document.createElement('div');
+      chartViewport.id = 'dashboard-trend-chart';
       chartViewport.className = 'w-full overflow-x-auto';
+      const note = document.createElement('p');
+      note.className = 'mb-3 text-sm text-secondary';
+      note.textContent = sparse
+        ? 'Ranges longer than 366 days show only dates with records.'
+        : 'Counts by Manila calendar date. Dates without records show zero.';
+      if (!trend.some((entry) => entry.count > 0)) note.textContent += ' No eggs sorted in this range.';
+      chartViewport.appendChild(note);
       const chart = document.createElement('div');
       chart.className = 'h-48 flex items-end justify-between gap-2 sm:gap-3';
-      chart.style.width = `${Math.max(container.clientWidth, trend.length * 56)}px`;
+      chart.style.width = `${Math.max(container.clientWidth, trend.length * 84)}px`;
       const maxCount = Math.max(1, ...trend.map((entry) => entry.count));
 
       trend.forEach((entry) => {
@@ -631,7 +650,7 @@
 
         const label = document.createElement('span');
         label.className = 'text-xs text-secondary mt-2';
-        label.textContent = trend.length > 7 ? entry.date.slice(5) : entry.label;
+        label.textContent = entry.date;
         column.append(count, track, label);
         chart.appendChild(column);
       });
@@ -697,20 +716,7 @@
     let dashboardRequestPending = false;
     let dashboardRefreshQueued = false;
     let renderedSections = {};
-
-    document.getElementById('clear-audit-logs')?.addEventListener('click', async (event) => {
-      const button = event.currentTarget;
-      await EggSortAlerts.run({
-        button, title: 'Clear audit logs?',
-        text: 'All current System Security Audit Logs will be cleared. This cannot be undone.',
-        destructive: true, success: 'Audit logs cleared successfully.',
-        action: async () => {
-          await EggSortAlerts.request('/api/dashboard/audit-logs/clear', { method: 'POST' });
-          renderedSections.audit = null;
-          await refreshDashboard({ manual: false });
-        },
-      });
-    });
+    let dashboardHasData = false;
     let successFlashTimer = null;
 
     const refreshButton = document.getElementById('refresh-dashboard');
@@ -719,6 +725,15 @@
     const statusDot = document.getElementById('dashboard-status-dot');
 
     function setDashboardStatus(state, message) {
+      const notice = document.getElementById('dashboard-message');
+      if (notice) {
+        notice.hidden = state === 'ok';
+        notice.setAttribute('role', state === 'error' ? 'alert' : 'status');
+        notice.classList.toggle('text-error', state === 'error');
+        notice.textContent = state === 'error'
+          ? `${message} ${dashboardHasData ? 'Displayed data is stale.' : 'Dashboard data has not loaded; initial values are not confirmed totals.'}`
+          : (dashboardHasData ? 'Updating selected dates; displayed data may belong to the previous range.' : message);
+      }
       if (statusText && statusText.textContent !== message) {
         statusText.textContent = message;
       }
@@ -757,7 +772,7 @@
       }
       dashboardRequestPending = true;
       setRefreshingUI(true);
-      if (options.manual) setDashboardStatus('busy', 'Refreshing...');
+      if (options.manual || options.immediate) setDashboardStatus('busy', 'Refreshing...');
       let succeeded = false;
       try {
         const startDatePicker = document.getElementById('dashboard-start-date');
@@ -789,6 +804,11 @@
         }
         const stats = await response.json();
         if (!response.ok) throw new Error(stats.error || 'Dashboard update failed.');
+        // An old response must not repaint cards or filters for a new range.
+        if (hadDateFilters && (startDatePicker.value !== startDate || endDatePicker.value !== endDate)) {
+          dashboardRefreshQueued = true;
+          return;
+        }
 
         document.getElementById('dashboard-total-sorted').textContent = stats.total_sorted;
         document.getElementById('dashboard-total-note').textContent =
@@ -798,7 +818,7 @@
         document.getElementById('dashboard-trays').textContent = stats.trays_completed;
         const trayProgress = stats.tray_progress || [];
         document.getElementById('dashboard-trays-note').textContent =
-          'Sorted eggs';
+          'Cumulative; not date-filtered';
         const trayKey = JSON.stringify(trayProgress);
         if (trayKey !== renderedSections.trayProgress) {
           renderTrayProgress(trayProgress);
@@ -816,13 +836,14 @@
          * kills text selection and hover state and causes visible flicker.
          * Only re-render when the underlying payload actually changed.
          */
-        const trendKey = JSON.stringify(stats.daily_trend || []);
+        const trendKey = JSON.stringify([stats.daily_trend || [], stats.daily_trend_sparse]);
         if (trendKey !== renderedSections.trend) {
           const trend = stats.daily_trend || [];
           renderDailyTrend(
             trend,
             hadDateFilters ? startDate : stats.selected_start_date,
-            hadDateFilters ? endDate : stats.selected_end_date
+            hadDateFilters ? endDate : stats.selected_end_date,
+            stats.daily_trend_sparse
           );
           renderedSections.trend = trendKey;
         }
@@ -835,19 +856,26 @@
           }
         }
 
-        setDashboardStatus('ok', 'Updated ' + new Date().toLocaleTimeString());
-        succeeded = true;
-
         const sizeKey = JSON.stringify(stats.size_counts);
         if (sizeKey !== renderedSections.size) {
           renderedSections.size = sizeKey;
           const distribution = document.getElementById('dashboard-size-distribution');
-          const maxCount = Math.max(1, ...Object.values(stats.size_counts));
+          const displaySizes = [...sizeOrder, 'Unmeasured/N/A'];
+          const displayCounts = Object.fromEntries(sizeOrder.map((size) => [size, stats.size_counts[size] || 0]));
+          displayCounts['Unmeasured/N/A'] = stats.size_counts['N/A'] || 0;
+          const otherCount = Object.entries(stats.size_counts)
+            .filter(([size]) => !sizeOrder.includes(size) && size !== 'N/A')
+            .reduce((total, [, count]) => total + count, 0);
+          if (otherCount) {
+            displaySizes.push('Other/Unknown');
+            displayCounts['Other/Unknown'] = otherCount;
+          }
+          const maxCount = Math.max(1, ...Object.values(displayCounts));
           distribution.innerHTML = `
           <h4 class="font-headline-md text-body-lg font-bold text-on-background mb-4">Size Distribution</h4>
           <div class="space-y-3 text-left">
-            ${sizeOrder.map((size) => {
-              const count = stats.size_counts[size] || 0;
+            ${displaySizes.map((size) => {
+              const count = displayCounts[size];
               const width = Math.max(count ? 8 : 0, count / maxCount * 100);
               return `
                 <div>
@@ -861,9 +889,13 @@
             }).join('')}
           </div>`;
         }
+        dashboardHasData = true;
+        setDashboardStatus('ok', 'Updated ' + new Date().toLocaleTimeString());
+        succeeded = true;
       } catch (error) {
         console.error('Dashboard refresh failed:', error);
-        setDashboardStatus('error', 'Refresh failed');
+        if (dashboardRefreshQueued) return;
+        setDashboardStatus('error', error.message || 'Dashboard refresh failed.');
         if (options.manual) await EggSortAlerts.error(error.message || 'Dashboard refresh failed.');
       } finally {
         dashboardRequestPending = false;

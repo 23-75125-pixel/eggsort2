@@ -1,4 +1,5 @@
 import hashlib
+import ipaddress
 import secrets
 import smtplib
 from datetime import datetime, time, timedelta, timezone
@@ -48,6 +49,7 @@ from detection_service import (
 from extensions import db, oauth
 from models import (
     AuditLog,
+    PasswordResetAttempt,
     EggRecord,
     SortingSession,
     TraySizeAlert,
@@ -147,6 +149,34 @@ def user_display_label(user: "User") -> str:
 
 def invite_token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def password_reset_identifier_hash(identifier: str) -> str:
+    return invite_token_hash(identifier.strip().lower())
+
+
+def password_reset_client_ip() -> str:
+    # Do not trust client-supplied forwarded headers for throttling.
+    try:
+        return str(ipaddress.ip_address(request.remote_addr or ""))
+    except ValueError:
+        return "unknown"
+
+
+def password_reset_request_is_limited(identifier_hash: str, client_ip: str,
+                                      *, now: datetime) -> bool:
+    recent = PasswordResetAttempt.query.filter(
+        PasswordResetAttempt.created_at > now - PASSWORD_RESET_WINDOW
+    )
+    identifier_attempts = recent.filter_by(identifier_hash=identifier_hash)
+    return (
+        identifier_attempts.count() >= PASSWORD_RESET_MAX_PER_IDENTIFIER
+        or recent.filter_by(ip_address=client_ip).count() >= PASSWORD_RESET_MAX_PER_IP
+        or PasswordResetAttempt.query.filter(
+            PasswordResetAttempt.identifier_hash == identifier_hash,
+            PasswordResetAttempt.created_at > now - PASSWORD_RESET_COOLDOWN,
+        ).first() is not None
+    )
 
 
 def invitation_is_valid(user: "User") -> bool:
@@ -502,6 +532,18 @@ def write_audit_log(
     if commit:
         db.session.commit()
     return log
+
+
+def write_auth_audit_log(*args: Any, **kwargs: Any) -> None:
+    """An audit outage must not undo an established authentication outcome."""
+    try:
+        write_audit_log(*args, **kwargs)
+    except Exception:
+        try:
+            db.session.rollback()
+        except Exception:
+            app.logger.exception("Authentication audit rollback failed")
+        app.logger.exception("Authentication audit write failed")
 
 
 def _count_verified_good_egg_for_tray(record: EggRecord) -> TraySizeAlert | None:
@@ -1336,7 +1378,7 @@ def login() -> Any:
         ):
             LOGIN_LIMITER.record_failure(limiter_key)
             error = "Invalid username/email or password."
-            write_audit_log(
+            write_auth_audit_log(
                 "login_failed",
                 "Failed staff sign-in attempt.",
                 actor=identifier or "Unknown",
@@ -1347,7 +1389,7 @@ def login() -> Any:
                 user,
                 remember=request.form.get("remember-me") == "on",
             )
-            write_audit_log(
+            write_auth_audit_log(
                 "login",
                 f"{user.role.title()} signed in successfully with a password.",
                 actor=user.email or user.username,
@@ -1386,7 +1428,8 @@ def forgot_password() -> Any:
                 created_at=now,
             )
         )
-        user = User.query.filter(func.lower(User.email) == email).first() if email else None
+        valid_email = len(email) <= 254 and is_valid_email(email)
+        user = User.query.filter(func.lower(User.email) == email).first() if valid_email else None
         if not limited and user is not None and user.is_active and user.password_set:
             token = secrets.token_urlsafe(32)
             user.password_reset_token_hash = invite_token_hash(token)
@@ -1435,14 +1478,31 @@ def reset_password(token: str) -> Any:
         elif password != confirmation:
             error = "Passwords do not match."
         else:
-            user.password = generate_password_hash(password)
-            user.password_set = True
-            user.password_reset_token_hash = None
-            user.password_reset_expires_at = None
-            user.invite_token_hash = None
-            user.invite_expires_at = None
+            # Consume conditionally so two concurrent submissions cannot both
+            # use the same token. The existing columns need no migration.
+            password_hash = generate_password_hash(password)
+            updated = User.query.filter(
+                User.id == user.id,
+                User.password_reset_token_hash == invite_token_hash(token),
+                User.password_reset_expires_at > datetime.now(timezone.utc),
+                User.is_active.is_(True),
+                User.password_set.is_(True),
+            ).update({
+                User.password: password_hash,
+                User.password_set: True,
+                User.password_reset_token_hash: None,
+                User.password_reset_expires_at: None,
+                User.invite_token_hash: None,
+                User.invite_expires_at: None,
+            }, synchronize_session=False)
+            if updated != 1:
+                db.session.rollback()
+                return render_template(
+                    "reset_password.html", error="This reset link is invalid or has expired.",
+                    valid_token=False, notice=None,
+                ), 400
             db.session.commit()
-            write_audit_log("password_reset", "User reset their password.", actor=user.email or user.username)
+            write_auth_audit_log("password_reset", "User reset their password.", actor=user.email or user.username)
             session["login_notice"] = "Password updated. Sign in with your new password."
             return redirect(url_for("login"))
     return render_template("reset_password.html", error=error, valid_token=True, notice=None)
@@ -1680,15 +1740,19 @@ def google_callback() -> Any:
     user.avatar_url = avatar_url if avatar_url.startswith("https://") else None
     db.session.commit()
 
+    # Rollback after an audit outage expires ORM attributes. Preserve the
+    # already-validated setup decision without another database read.
+    is_admin = user.role == "admin"
+    password_is_set = user.password_set
     sign_in_user(user, remember=True)
-    write_audit_log(
+    write_auth_audit_log(
         "login",
         f"{user.role.title()} signed in successfully with Google.",
         actor=user.email or user.username,
     )
-    if user.role == "admin":
+    if is_admin:
         session["google_verified_for_password_setup"] = True
-        if not user.password_set:
+        if not password_is_set:
             return redirect(url_for("setup_admin_password"))
     session.pop("google_verified_for_password_setup", None)
     return redirect(url_for("dashboard"))
@@ -1996,12 +2060,20 @@ def dashboard_stats() -> Any:
     end_date_value = request.args.get("end_date", "").strip()
     single_date_value = request.args.get("date", "").strip()
     all_dates = request.args.get("all_dates") == "true"
+    def parse_dashboard_date(value: str):
+        if not value:
+            return None
+        parsed = datetime.strptime(value, "%Y-%m-%d").date()
+        if parsed.isoformat() != value or not 2 <= parsed.year <= 9998:
+            raise ValueError("Unsupported dashboard date")
+        return parsed
+
     try:
-        start_date = datetime.strptime(start_date_value, "%Y-%m-%d").date() if start_date_value else None
-        end_date = datetime.strptime(end_date_value, "%Y-%m-%d").date() if end_date_value else None
-        single_date = datetime.strptime(single_date_value, "%Y-%m-%d").date() if single_date_value else None
+        start_date = parse_dashboard_date(start_date_value)
+        end_date = parse_dashboard_date(end_date_value)
+        single_date = parse_dashboard_date(single_date_value)
     except ValueError:
-        return jsonify(error="Dates must use YYYY-MM-DD format."), 400
+        return jsonify(error="Dates must use YYYY-MM-DD format, with years 0002 through 9998."), 400
 
     if start_date is None and end_date is None and single_date is not None:
         start_date = end_date = single_date
@@ -2012,6 +2084,8 @@ def dashboard_stats() -> Any:
             if earliest_sorted_at is None:
                 start_date = end_date
             else:
+                if not 2 <= earliest_sorted_at.year <= 9998:
+                    return jsonify(error="Dashboard dates must be within years 0002 through 9998."), 400
                 if earliest_sorted_at.tzinfo is None:
                     earliest_sorted_at = earliest_sorted_at.replace(tzinfo=timezone.utc)
                 start_date = min(
@@ -2026,6 +2100,8 @@ def dashboard_stats() -> Any:
         if earliest_sorted_at is None:
             start_date = end_date
         else:
+            if not 2 <= earliest_sorted_at.year <= 9998:
+                return jsonify(error="Dashboard dates must be within years 0002 through 9998."), 400
             if earliest_sorted_at.tzinfo is None:
                 earliest_sorted_at = earliest_sorted_at.replace(tzinfo=timezone.utc)
             start_date = min(
@@ -2036,6 +2112,8 @@ def dashboard_stats() -> Any:
 
     if start_date > end_date:
         return jsonify(error="From date cannot be after To date."), 400
+    if start_date.year < 2 or end_date.year > 9998:
+        return jsonify(error="Dashboard dates must be within years 0002 through 9998."), 400
 
     selected_start = datetime.combine(
         start_date, time.min, tzinfo=manila_timezone
@@ -2070,19 +2148,22 @@ def dashboard_stats() -> Any:
     )
     trays_completed = sum(row.completed_milestones for row in tray_progress_rows)
 
-    # Keep exactly seven weekday columns, always Sunday through Saturday.
-    # Aggregate only records inside the selected From-To range into weekdays.
-    trend_start_date = end_date - timedelta(days=(end_date.weekday() + 1) % 7)
-    trend_days = [trend_start_date + timedelta(days=offset) for offset in range(7)]
-    trend_counts = {weekday: 0 for weekday in range(7)}
+    # Use actual Manila dates, rather than combining different weeks' weekdays.
+    trend_counts = {}
     recent_records = selected_records.all()
     for record in recent_records:
         sorted_at = record.sorted_at
         if sorted_at.tzinfo is None:
             sorted_at = sorted_at.replace(tzinfo=timezone.utc)
         sorted_date = sorted_at.astimezone(manila_timezone).date()
-        weekday_index = (sorted_date.weekday() + 1) % 7
-        trend_counts[weekday_index] += 1
+        trend_counts[sorted_date] = trend_counts.get(sorted_date, 0) + 1
+    day_count = (end_date - start_date).days + 1
+    # Keep zero-filled normal ranges. Very long ranges stay sparse instead of
+    # allocating millions of empty chart columns; database queries are unchanged.
+    trend_sparse = day_count > 366
+    trend_days = sorted(trend_counts) if trend_sparse else [
+        start_date + timedelta(days=offset) for offset in range(day_count)
+    ]
     stats = dict(
         selected_start_date=start_date.isoformat(),
         selected_end_date=end_date.isoformat(),
@@ -2100,11 +2181,12 @@ def dashboard_stats() -> Any:
         hardware=ESP32_BRIDGE.status(),
         unread_alerts=TraySizeAlert.query.filter_by(is_read=False).count(),
         tray_progress=[row.to_dict() for row in tray_progress_rows],
+        daily_trend_sparse=trend_sparse,
         daily_trend=[
             {
                 "date": day.isoformat(),
                 "label": day.strftime("%a"),
-                "count": trend_counts[(day.weekday() + 1) % 7],
+                "count": trend_counts.get(day, 0),
             }
             for day in trend_days
         ],
@@ -2124,9 +2206,10 @@ def dashboard_stats() -> Any:
 @app.post("/api/dashboard/audit-logs/clear")
 @admin_required
 def clear_dashboard_audit_logs() -> Any:
-    deleted_count = AuditLog.query.delete(synchronize_session=False)
-    db.session.commit()
-    return jsonify(deleted_count=deleted_count)
+    return jsonify(error=(
+        "Clearing audit logs is disabled pending approval of a safe retention policy. "
+        "No audit records were deleted."
+    )), 409
 
 
 @app.get("/api/alerts")
@@ -2509,12 +2592,28 @@ def user_management() -> Any:
 @app.post("/logout")
 @login_required
 def logout() -> Any:
-    write_audit_log(
-        "logout",
-        "Operator signed out.",
-    )
-    stop_sorting_runtime()
-    session.clear()
+    stop_failed = False
+    try:
+        write_auth_audit_log("logout", "Operator signed out.")
+        try:
+            stop_sorting_runtime()
+        except Exception:
+            stop_failed = True
+            app.logger.exception("Runtime shutdown failed during logout")
+            try:
+                db.session.rollback()
+            except Exception:
+                app.logger.exception("Runtime shutdown rollback failed during logout")
+    finally:
+        session.clear()
+    if stop_failed:
+        message = (
+            "You have been signed out, but stopping the sorting runtime failed. "
+            "Hardware shutdown could not be verified. Check the station before continuing."
+        )
+        session["login_error"] = message
+        return render_template("login.html", error=message, notice=None,
+                               google_ready=google_is_configured()), 503
     session["auth_feedback"] = {
         "icon": "success", "message": "You have been logged out."
     }

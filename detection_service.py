@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import math
+import sys
 from threading import Lock
+from time import monotonic
 from typing import Any
 
 from config import env_float, env_int, env_text
@@ -14,6 +17,7 @@ if not MODEL_PATH.is_absolute():
     MODEL_PATH = BASE_DIR / MODEL_PATH
 CONFIDENCE = env_float("YOLO_CONFIDENCE", 0.25, minimum=0.0, maximum=1.0)
 IMAGE_SIZE = env_int("YOLO_IMAGE_SIZE", 512, minimum=32, maximum=4096)
+CPU_INFERENCE_THREADS = env_int("EGGSORT_CPU_INFERENCE_THREADS", 0, minimum=0, maximum=64)
 MAX_FRAME_BYTES = 5 * 1024 * 1024
 _model: Any | None = None
 _model_lock = Lock()
@@ -26,6 +30,44 @@ class DetectorUnavailableError(RuntimeError):
 
 class InvalidFrameError(ValueError):
     """Raised when an uploaded frame cannot be decoded."""
+
+
+def _performance_details(result, model, performance, prediction_ms):
+    """Best effort only; never import torch, synchronize devices, or set threads."""
+    try:
+        speed = getattr(result, "speed", None)
+        if isinstance(speed, dict):
+            stages = {}
+            for name in ("preprocess", "inference", "postprocess"):
+                value = speed.get(name)
+                if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
+                    stages[name] = value
+                    performance[f"yolo_{name}_ms"] = value
+            if len(stages) == 3:
+                total = sum(stages.values())
+                performance["yolo_stages_total_ms"] = total
+                # Signed residual: profiled intervals are not a separate exact stopwatch.
+                performance["prediction_minus_yolo_stages_ms"] = prediction_ms - total
+    except Exception:
+        pass
+    if performance.pop("_collect_runtime", False):
+        runtime = {"device": None, "intraop_threads": None, "interop_threads": None}
+        try:
+            runtime["device"] = str(model.predictor.device)
+        except Exception:
+            pass
+        torch = sys.modules.get("torch")
+        if torch is not None:
+            for key, name in (("intraop_threads", "get_num_threads"), ("interop_threads", "get_num_interop_threads")):
+                try:
+                    runtime[key] = int(getattr(torch, name)())
+                except Exception:
+                    pass
+        runtime["sampled_monotonic_s"] = monotonic()
+        runtime["configured_intraop_threads"] = CPU_INFERENCE_THREADS or None
+        runtime["thread_limit_verified"] = (runtime["intraop_threads"] == CPU_INFERENCE_THREADS
+                                            if CPU_INFERENCE_THREADS else None)
+        performance["_runtime"] = runtime
 
 
 def _load_model() -> Any:
@@ -52,7 +94,17 @@ def _load_model() -> Any:
             ) from exc
 
         try:
-            _model = YOLO(str(MODEL_PATH))
+            verify_threads = None
+            if CPU_INFERENCE_THREADS:
+                from cpu_inference_threads import initialize_cpu_threads
+                verify_threads = initialize_cpu_threads(CPU_INFERENCE_THREADS)
+            model = YOLO(str(MODEL_PATH))
+            if verify_threads is not None:
+                # on_predict_start runs after setup_model/select_device and
+                # before preprocessing/warmup/forward. Batch-end checks again.
+                model.add_callback("on_predict_start", verify_threads)
+                model.add_callback("on_predict_batch_end", verify_threads)
+            _model = model
         except Exception as exc:
             raise DetectorUnavailableError(
                 f"Unable to load YOLO model: {exc}"
@@ -81,17 +133,21 @@ def detector_info() -> dict[str, Any]:
     }
 
 
-def detect_image(frame: Any) -> dict[str, Any]:
+def detect_image(frame: Any, *, performance: dict | None = None) -> dict[str, Any]:
     """Run YOLO on an OpenCV image and return JSON-safe detections."""
+    timing_started = monotonic() if performance is not None else 0.0
     model = _load_model()
+    lock_requested = monotonic() if performance is not None else 0.0
     try:
         with _inference_lock:
+            prediction_started = monotonic() if performance is not None else 0.0
             result = model.predict(
                 source=frame,
                 conf=CONFIDENCE,
                 imgsz=IMAGE_SIZE,
                 verbose=False,
             )[0]
+            prediction_finished = monotonic() if performance is not None else 0.0
     except Exception as exc:
         raise DetectorUnavailableError(f"YOLO inference failed: {exc}") from exc
 
@@ -124,6 +180,16 @@ def detect_image(frame: Any) -> dict[str, Any]:
             )
 
     height, width = frame.shape[:2]
+    if performance is not None:
+        finished = monotonic()
+        performance.update(
+            model_load_ms=(lock_requested - timing_started) * 1000,
+            inference_lock_wait_ms=(prediction_started - lock_requested) * 1000,
+            prediction_ms=(prediction_finished - prediction_started) * 1000,
+            result_conversion_ms=(finished - prediction_finished) * 1000,
+            detection_total_ms=(finished - timing_started) * 1000,
+        )
+        _performance_details(result, model, performance, performance["prediction_ms"])
     return {
         "detections": detections,
         "counts": counts,
