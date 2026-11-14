@@ -16,6 +16,7 @@ from typing import Any, Callable
 from config import env_bool, env_float, env_int, env_text
 from camera_performance import CameraPerformance
 from camera_negotiation import configure_camera, verify_frame
+from experimental_reject_observer import DryRunRejectObservations
 from detection_service import (
     CONFIDENCE,
     DetectorUnavailableError,
@@ -62,6 +63,7 @@ class CameraDetectionSession:
             interval=env_float("CAMERA_PERFORMANCE_INTERVAL_SECONDS", 5.0, minimum=0.1, maximum=3600.0),
         )
         self._latest_raw_returned_at: float | None = None
+        self._latest_inference_frame_timestamp: float | None = None
         self._performance_processed_sequence = 0
 
         self._latest_raw_frame: Any | None = None
@@ -75,6 +77,11 @@ class CameraDetectionSession:
         )
         self._captured_qualities: deque[dict[str, Any]] = deque(maxlen=50)
         self._passage_samples: list[tuple[str, float]] = []
+        self._passage_agreement_label: str | None = None
+        self._passage_agreement_count = 0
+        self._passage_agreement_confidences: list[float] = []
+        self._last_auto_capture_sequence = -1
+        self._auto_capture_sequence = 0
         self._passage_misses = 0
         self._passage_missing_since: float | None = None
         self._passage_quality_present = False
@@ -86,6 +93,11 @@ class CameraDetectionSession:
         self._quality_counts = {label: 0 for label in EGG_QUALITY_LABELS}
         self._reject_handler: Callable[[str], Any] | None = None
         self._capture_handler: Callable[[dict[str, Any]], Any] | None = None
+        # Observation-only: no bridge reference, serial writer, or command callback.
+        self._experimental_observations = DryRunRejectObservations(
+            enabled=env_bool("CAMERA_REJECT_DRY_RUN", False),
+            export_enabled=env_bool("CAMERA_REJECT_DRY_RUN_EXPORT", False),
+        )
         self._reject_error: str | None = None
 
         self._error: str | None = None
@@ -302,7 +314,11 @@ class CameraDetectionSession:
         now = monotonic()
         self._diag_last_exit_at = now
         claimed = bool(capture.get("claimed_on_scale"))
-        insufficient = sample_count < self.capture_min_samples and capture["label"] == "good"
+        insufficient = (
+            sample_count < self._required_quality_samples(capture["label"])
+            and capture["label"] == "good"
+        )
+        unresolved = capture["label"] not in EGG_QUALITY_LABELS
         self._log_passage_diagnostic(
             "passage_exit", at=now, capture_id=capture["capture_id"],
             label=capture["label"], consecutive_misses=self._passage_misses,
@@ -318,7 +334,9 @@ class CameraDetectionSession:
             counter_after=self._egg_count + int(not insufficient),
             counter_after_is_expected=True,
             existing_exit_will_increment=not insufficient,
-            disposition="claimed_completed" if claimed else "insufficient_good_samples" if insufficient else "completed",
+            disposition=("claimed_completed" if claimed else
+                         "unresolved_quality" if unresolved else
+                         "insufficient_good_samples" if insufficient else "completed"),
         )
         self._diag_missing_since = None
 
@@ -360,6 +378,7 @@ class CameraDetectionSession:
             self._latest_raw_frame = None
             self._camera_negotiation = None
             self._latest_raw_returned_at = None
+            self._latest_inference_frame_timestamp = None
             self._raw_sequence = 0
             self._inspection_min_sequence = 0
             self._latest_jpeg = None
@@ -368,6 +387,11 @@ class CameraDetectionSession:
             self._quality_history.clear()
             self._captured_qualities.clear()
             self._passage_samples.clear()
+            self._passage_agreement_label = None
+            self._passage_agreement_count = 0
+            self._passage_agreement_confidences.clear()
+            self._last_auto_capture_sequence = -1
+            self._auto_capture_sequence = 0
             self._passage_misses = 0
             self._passage_missing_since = None
             self._passage_quality_present = False
@@ -378,6 +402,7 @@ class CameraDetectionSession:
             self._egg_count = 0
             self._quality_counts = {label: 0 for label in EGG_QUALITY_LABELS}
             self._reset_passage_diagnostics()
+            self._experimental_observations.reset()
             self._reject_error = None
             self._error = None
             self._stream_fps = 0.0
@@ -458,11 +483,14 @@ class CameraDetectionSession:
                 self._running = False
                 self._capture_thread = None
                 self._inference_thread = None
+                self._experimental_observations.finish()
             return self.status()
 
     def _performance_gauges(self) -> dict[str, Any]:
         # Summary thread only. Approximate snapshots, deliberately no camera lock
         # or application callbacks: telemetry must not wait behind a stalled worker.
+        observer = self._experimental_observations
+        exporter = observer._exporter
         return {
             "capture_alive": bool(self._capture_thread and self._capture_thread.is_alive()),
             "inference_alive": bool(self._inference_thread and self._inference_thread.is_alive()),
@@ -471,6 +499,11 @@ class CameraDetectionSession:
             "passage_samples": len(self._passage_samples),
             "raw_slot_capacity": 1, "raw_sequence": self._raw_sequence,
             "raw_pending": int(self._raw_sequence > self._performance_processed_sequence),
+            "observer_events": len(observer._events), "observer_capacity": observer._events.maxlen,
+            "observer_dropped": observer.dropped,
+            "observation_export_pending": exporter._queue.qsize() if exporter else 0,
+            "observation_export_capacity": exporter._queue.maxsize if exporter else 0,
+            "observation_export_dropped": exporter.dropped if exporter else 0,
             "jpeg_sequence": self._frame_sequence,
             "stop_requested": self._stop_event.is_set(),
         }
@@ -504,6 +537,10 @@ class CameraDetectionSession:
                 "stream_fps": round(self._stream_fps, 1),
                 "detection_fps": round(self._detection_fps, 1),
                 "inference_ms": round(self._inference_ms),
+                "inference_frame_age_ms": (
+                    round(max(0.0, monotonic() - self._latest_inference_frame_timestamp) * 1000, 1)
+                    if self._latest_inference_frame_timestamp is not None else None
+                ),
                 "model": dict(self._model_info) if self._model_info else None,
                 "quality_queue": len(self._captured_qualities),
                 "inspection_active": self._active_capture is not None,
@@ -550,19 +587,20 @@ class CameraDetectionSession:
                 # A load-cell egg may remain in the camera zone until its gate
                 # opens. Finish its inspection after the configured Good frames
                 # instead of requiring movement that authorization prevents.
-                required = self.capture_min_samples
+                required = self._required_quality_samples("good")
                 if (allow_loaded_capture and self._active_capture is not None
                         and not self._active_capture.get("claimed_on_scale")
                         and self._passage_defect is None
                         and self._passage_misses == 0
                         and self._passage_quality_present
-                        and len(self._passage_samples) >= required
-                        and all(label == "good" for label, _ in self._passage_samples[-required:])):
+                        and self._passage_agreement_label == "good"
+                        and self._passage_agreement_count >= required):
                     capture = self._active_capture
                     capture["claimed_on_scale"] = True
                     capture["confidence"] = round(min(
-                        confidence for _, confidence in self._passage_samples[-required:]
+                        self._passage_agreement_confidences[-required:]
                     ), 4)
+                    self._observe_experimental_reject("quality_locked", capture)
                     self._log_passage_diagnostic(
                         "good_capture_claim", capture_id=capture["capture_id"],
                         source="visible_loaded_capture", before_exit=True,
@@ -695,13 +733,27 @@ class CameraDetectionSession:
         with self._lock:
             self._reject_handler = handler
 
+    def experimental_reject_snapshot(self):
+        """In-memory offline input only; never routes through the ESP32 bridge."""
+        with self._lock:
+            return self._experimental_observations.snapshot()
 
+    def _observe_experimental_reject(self, event, capture, *, at=None):
+        if self._experimental_observations.enabled:
+            self._experimental_observations.emit(
+                event, capture, monotonic() if at is None else at,
+                self._session_ref, self._runtime_context.get("runtime_generation"),
+            )
 
     def set_capture_handler(
         self, handler: Callable[[dict[str, Any]], Any]
     ) -> None:
         with self._lock:
             self._capture_handler = handler
+
+    def _required_quality_samples(self, label: str) -> int:
+        """Use one in-zone observation for Good; retain configured defect streaks."""
+        return 1 if label == "good" else self.capture_min_samples
 
     def _has_passage_occupancy(
         self, detections: list[dict[str, Any]],
@@ -717,10 +769,22 @@ class CameraDetectionSession:
         return label in EGG_QUALITY_LABELS
 
     def _process_auto_capture(
-        self, label: str, confidence: float, *, passage_occupied: bool = False
+        self, label: str, confidence: float, *, passage_occupied: bool = False,
+        observation_sequence: int | None = None,
     ) -> None:
-        """Send a defect immediately, outside the camera lock; retry while visible."""
+        """Process one fresh inference and send confirmed defects outside the lock."""
         with self._quality_ready:
+            if observation_sequence is None:
+                self._auto_capture_sequence += 1
+                observation_sequence = self._auto_capture_sequence
+            else:
+                observation_sequence = int(observation_sequence)
+                if observation_sequence <= self._last_auto_capture_sequence:
+                    return
+                self._auto_capture_sequence = max(
+                    self._auto_capture_sequence, observation_sequence
+                )
+            self._last_auto_capture_sequence = observation_sequence
             completed = self._update_auto_capture(label, confidence, passage_occupied=passage_occupied)
             defect = self._passage_defect
             handler = self._reject_handler
@@ -747,7 +811,7 @@ class CameraDetectionSession:
     def _update_auto_capture(
         self, label: str, confidence: float, *, passage_occupied: bool = False
     ) -> dict[str, Any] | None:
-        """Capture one egg per zone passage; queue Good eggs on exit."""
+        """Lock quality after a same-label streak; queue Good eggs on exit."""
         self._observe_passage_diagnostic(label, confidence, passage_occupied)
         self._passage_quality_present = label in EGG_QUALITY_LABELS
         if label in EGG_QUALITY_LABELS:
@@ -759,17 +823,51 @@ class CameraDetectionSession:
                 self._active_capture = {
                     **self._runtime_context,
                     "capture_id": self._egg_count + 1,
-                    "label": label,
-                    "confidence": round(confidence, 4),
+                    "label": "unknown",
+                    "confidence": 0.0,
                     "entered_at": monotonic(),
                 }
+                self._observe_experimental_reject(
+                    "passage_begin", self._active_capture,
+                    at=self._active_capture["entered_at"],
+                )
             self._passage_samples.append((label, confidence))
             self._passage_misses = 0
-            if label in {"crack", "rotten"} and self._passage_defect is None:
-                self._passage_defect = label
-                self._active_capture["label"] = label
-                self._active_capture["confidence"] = round(confidence, 4)
+            if self._passage_agreement_label == label:
+                self._passage_agreement_count += 1
+                self._passage_agreement_confidences.append(confidence)
+            else:
+                self._passage_agreement_label = label
+                self._passage_agreement_count = 1
+                self._passage_agreement_confidences = [confidence]
+
+            required = self._required_quality_samples(label)
+            if self._passage_agreement_count >= required:
+                if label in {"crack", "rotten"}:
+                    if self._passage_defect is None:
+                        self._passage_defect = label
+                        self._active_capture["label"] = label
+                        self._active_capture["confidence"] = round(
+                            min(self._passage_agreement_confidences[-required:]), 4
+                        )
+                        self._observe_experimental_reject(
+                            "first_defect", self._active_capture
+                        )
+                        self._observe_experimental_reject(
+                            "quality_locked", self._active_capture
+                        )
+                elif self._passage_defect is None:
+                    self._active_capture["label"] = "good"
+                    self._active_capture["confidence"] = round(
+                        min(self._passage_agreement_confidences[-required:]), 4
+                    )
             return None
+
+        # A missing/out-of-zone or conflicting observation breaks consecutive
+        # agreement. It never supplies quality evidence itself.
+        self._passage_agreement_label = None
+        self._passage_agreement_count = 0
+        self._passage_agreement_confidences.clear()
 
         if self._active_capture is None:
             return None
@@ -789,19 +887,33 @@ class CameraDetectionSession:
 
         sample_count = len(self._passage_samples)
         capture = dict(self._active_capture)
+        unresolved = capture["label"] not in EGG_QUALITY_LABELS
+        if unresolved:
+            capture["label"] = "unknown"
+            capture["quality"] = "Not Classified"
+            capture["quality_verified"] = False
+        if (capture["label"] == "good" and not capture.get("claimed_on_scale")
+                and sample_count >= self._required_quality_samples("good")):
+            self._observe_experimental_reject("quality_locked", capture, at=now)
+        self._observe_experimental_reject("passage_exit", capture, at=now)
         self._observe_exit_diagnostic(capture, sample_count)
         self._passage_samples = []
+        self._passage_agreement_label = None
+        self._passage_agreement_count = 0
+        self._passage_agreement_confidences.clear()
         self._passage_misses = 0
         self._passage_missing_since = None
         self._active_capture = None
         self._passage_defect = None
         self._passage_reject_sent = False
-        if sample_count < self.capture_min_samples and capture["label"] == "good":
+        if (sample_count < self._required_quality_samples("good")
+                and capture["label"] == "good"):
             return None
 
         capture["captured_at"] = monotonic()
         self._egg_count += 1
-        self._quality_counts[capture["label"]] += 1
+        if capture["label"] in self._quality_counts:
+            self._quality_counts[capture["label"]] += 1
         self._last_capture = dict(capture)
         self._log_passage_diagnostic(
             "exit_counter_increment", capture_id=capture["capture_id"],
@@ -891,7 +1003,9 @@ class CameraDetectionSession:
                     perf.stage("capture", "read")
                     read_started = monotonic()
                 success, frame = capture.read()
-                returned_at = monotonic() if perf else None
+                # Preserve source-frame time even when optional performance
+                # export is disabled, so result freshness can be measured.
+                returned_at = monotonic()
                 if perf:
                     perf.record({"read_ms": (returned_at - read_started) * 1000}, reads=1)
                 if self._stop_event.is_set():
@@ -928,10 +1042,6 @@ class CameraDetectionSession:
                     perf.camera(frame_width=int(width), frame_height=int(height),
                                 requested_resolution_matches_frame=(width == self.camera_width and height == self.camera_height))
                     perf.stage("capture", "ready_callback_and_frame_handoff")
-                if not readiness_sent and self._lifecycle_handler:
-                    self._lifecycle_handler("ready", dict(self._runtime_context))
-                    readiness_sent = True
-
                 # Give inference only the newest frame. No queue means no
                 # increasing detection delay when the model is slower than video.
                 with self._raw_frame_ready:
@@ -978,6 +1088,11 @@ class CameraDetectionSession:
                     self._frame_ready.notify_all()
                 if perf:
                     perf.record(jpegs=1)
+                # Lifecycle camera readiness means a streamable JPEG exists,
+                # not merely that capture.read() returned a raw frame.
+                if not readiness_sent and self._lifecycle_handler:
+                    self._lifecycle_handler("ready", dict(self._runtime_context))
+                    readiness_sent = True
         except Exception as exc:
             self._fail(str(exc))
         finally:
@@ -1041,6 +1156,10 @@ class CameraDetectionSession:
                 else:
                     result = detect_image(frame)
                 elapsed = monotonic() - started
+                frame_age_ms = (
+                    max(0.0, elapsed + started - returned_at) * 1000
+                    if returned_at is not None else None
+                )
                 with self._quality_ready:
                     if self._stop_event.is_set():
                         break
@@ -1056,6 +1175,7 @@ class CameraDetectionSession:
                         round(value) for value in inspection_zone
                     ]
                     self._latest_result = result
+                    self._latest_inference_frame_timestamp = returned_at
                     captured_at = monotonic()
                     label, confidence = self._select_frame_observation(
                         result["detections"], inspection_zone
@@ -1071,11 +1191,14 @@ class CameraDetectionSession:
                     self._inference_ms = elapsed * 1000
                     self._detection_fps = 1 / elapsed if elapsed else 0.0
                 if perf:
-                    if returned_at is not None:
-                        perf.record({"frame_age_at_result_ms": (monotonic() - returned_at) * 1000})
+                    if frame_age_ms is not None:
+                        perf.record({"frame_age_at_result_ms": frame_age_ms})
                     perf.stage("inference", "passage_and_callbacks")
                     post_started = monotonic()
-                self._process_auto_capture(label, confidence, passage_occupied=passage_occupied)
+                self._process_auto_capture(
+                    label, confidence, passage_occupied=passage_occupied,
+                    observation_sequence=processed_sequence,
+                )
                 if perf:
                     perf.record({"passage_and_callbacks_ms": (monotonic() - post_started) * 1000,
                                  "inference_cycle_ms": (monotonic() - started) * 1000}, inference_cycles=1)

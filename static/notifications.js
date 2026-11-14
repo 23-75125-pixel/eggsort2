@@ -23,9 +23,19 @@
     warning: (text) => dialog({ title: 'Please note', text, icon: 'warning' }),
     async request(url, options = {}) {
       const response = await fetch(url, options);
-      const payload = await response.json().catch(() => ({}));
+      let payload = {};
+      try {
+        payload = await response.json();
+      } catch (error) {
+        if (response.ok && !response.redirected) {
+          throw new Error('The server returned an invalid response. Please try again.');
+        }
+      }
       if (!response.ok || response.redirected) {
         throw new Error(payload.error || 'The request could not be completed. Please try again.');
+      }
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+        throw new Error('The server returned an invalid response. Please try again.');
       }
       return payload;
     },

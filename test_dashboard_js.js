@@ -8,7 +8,15 @@ const script = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)]
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 function payload(overrides = {}) {
   return {total_sorted: 0, latest_record: null, trays_completed: 0, tray_progress: [],
-    quality_rate: 0, quality_counts: {}, non_good_count: 0,
+    quality_rate: 0, recorded_good_rate: 0, verified_good_rate: 0,
+    good_count: 0, good_verification_counts: {verified: 0, unverified: 0, unknown: 0},
+    verification_by_quality: {
+      Good: {verified: 0, unverified: 0, unknown: 0},
+      Crack: {verified: 0, unverified: 0, unknown: 0},
+      Rotten: {verified: 0, unverified: 0, unknown: 0},
+      Other: {verified: 0, unverified: 0, unknown: 0}
+    },
+    quality_counts: {}, non_good_count: 0,
     selected_start_date: '2026-10-23', selected_end_date: '2026-10-29',
     daily_trend: [{date: '2026-10-29', label: 'Thu', count: 0}], daily_trend_sparse: false,
     size_counts: {Small: 0, Medium: 0, Large: 0, 'Extra Large': 0, Jumbo: 0}, ...overrides};
@@ -129,6 +137,24 @@ test('unknown sizes are shown separately without calling them unmeasured', async
   const rendered = ui.ids.get('dashboard-size-distribution').innerHTML;
   assert.match(rendered, /Other\/Unknown<\/span><strong>1/);
   assert.match(rendered, /Unmeasured\/N\/A<\/span><strong>0/);
+});
+
+test('dashboard distinguishes verified Good rate from historical Good labels', async () => {
+  const ui = build(async () => response(payload({
+    verified_good_rate: 50, recorded_good_rate: 60, good_count: 3,
+    quality_verification_counts: {verified: 3, unverified: 1, unknown: 1},
+    good_verification_counts: {verified: 1, unverified: 1, unknown: 1},
+    verification_by_quality: {
+      Good: {verified: 1, unverified: 1, unknown: 1},
+      Crack: {verified: 1, unverified: 0, unknown: 0},
+      Rotten: {verified: 1, unverified: 0, unknown: 0},
+      Other: {verified: 0, unverified: 0, unknown: 0}
+    }
+  })));
+  await settle();
+  assert.equal(ui.ids.get('dashboard-quality-rate').textContent, '50%');
+  assert.match(ui.ids.get('dashboard-quality-note').textContent,
+    /Good 1\/1\/1; Crack 1\/0\/0; Rotten 1\/0\/0; Not Classified 0\/0\/0; Other 0\/0\/0\. 0 Not Classified records are included in Non-Good total\. Historical Good rate: 60%/);
 });
 
 test('empty and sparse trends explain their scope and show actual dates', async () => {

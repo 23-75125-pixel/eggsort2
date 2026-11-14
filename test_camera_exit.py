@@ -23,7 +23,7 @@ class CameraExitTests(unittest.TestCase):
         self.addCleanup(timer.stop)
         self.session = CameraDetectionSession()
         self.session._running = True
-        self.session.capture_min_samples = 3
+        self.session.capture_min_samples = 2
         self.session.passage_exit_samples = 2
         self.reject = Mock()
         self.completed = Mock()
@@ -204,19 +204,21 @@ class CameraExitTests(unittest.TestCase):
         next_capture = self.session.wait_for_captured_quality(0, allow_loaded_capture=True)
         self.assertEqual(next_capture["capture_id"], 2)
 
-    def test_defects_reject_immediately_once_despite_dropout_and_count_on_exit(self):
+    def test_defects_require_two_consecutive_predictions_and_count_on_exit(self):
         for defect in ("crack", "rotten"):
             with self.subTest(defect=defect):
                 self.reject.reset_mock()
                 base = 0 if defect == "crack" else 4
                 self.observe(base, defect)
+                self.reject.assert_not_called()
+                self.observe(base + .2, defect)
                 self.reject.assert_called_once_with(defect)
-                self.observe(base + .2, "no egg")
                 self.observe(base + .4, "no egg")
-                self.observe(base + .6, "good")
+                self.observe(base + .6, "no egg")
+                self.observe(base + .8, "good")
                 self.assertEqual(self.session._active_capture["label"], defect)
                 self.assertIsNone(self.session.wait_for_captured_quality(0, allow_loaded_capture=True))
-                self.exit(base + .8)
+                self.exit(base + 1.0)
                 self.reject.assert_called_once_with(defect)
                 self.assertFalse(self.session._captured_qualities)
         self.assertEqual(self.session._egg_count, 2)

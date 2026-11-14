@@ -3,6 +3,14 @@
 #include "HX711.h"
 #include "stable_weight.h"
 
+// CODE PREPARATION ONLY. Do not enable without physical clearance approval.
+#ifndef EGGSORT_EXPERIMENTAL_REJECT
+#define EGGSORT_EXPERIMENTAL_REJECT 0
+#endif
+#if EGGSORT_EXPERIMENTAL_REJECT
+void serviceExperimentalReject();
+#endif
+
 // =====================================================
 // PCA9685
 // =====================================================
@@ -47,6 +55,7 @@ unsigned long buzzerStartedAt = 0;
 #define CRACK_OPEN 80
 
 // How long the reject gate stays open
+//Mas mataas na value = mas matagal ang oras
 #define CRACK_GATE_OPEN_TIME 6500
 #define CRACK_RETRIGGER_CLOSE_TIME 300
 
@@ -58,16 +67,18 @@ unsigned long rejectClosedAt = 0;
 // =====================================================
 // LOAD-CELL SERVO
 // =====================================================
-
-#define LOADCELL_CLOSED 305
-#define LOADCELL_OPEN 195
+//mas mababang value → mas bukas; mas mataas → mas sarado.
+#define LOADCELL_CLOSED 330
+#define LOADCELL_OPEN 190
 
 // Direct movement, then allow the linkage to reach its commanded position.
-#define LOADCELL_OPEN_SETTLE_TIME 250
-#define LOADCELL_OPEN_DELAY_AFTER_WEIGHT 400
+//Mas mataas na value = mas matagal na paghihintay.
+#define LOADCELL_OPEN_SETTLE_TIME 300
+#define LOADCELL_OPEN_DELAY_AFTER_WEIGHT 200
 
 // How long load-cell gate stays open
-#define LOADCELL_OPEN_TIME 2200
+#define LOADCELL_OPEN_TIME 2100
+//Mas mataas = mas mabagal bumukas; mas mababa = mas mabilis.
 #define LOADCELL_OPEN_SPEED 5
 
 // Commanded position only; this servo has no physical position feedback.
@@ -126,7 +137,7 @@ bool loadCellGateOpen = false;
 // Small and Medium
 // Oras (mula nang mag-open ang loadcell gate) bago buksan ang size servo.
 // Dapat mas maliit ito sa LOADCELL_OPEN_TIME.
-#define SM_TRAVEL_TIME 1000
+#define SM_TRAVEL_TIME 1980
 
 // Large
 #define LARGE_TRAVEL_TIME 8500
@@ -143,7 +154,7 @@ bool loadCellGateOpen = false;
 
 HX711 scale;
 
-float calibration_factor = 622.0;
+float calibration_factor = 715.0;
 
 #define EGG_THRESHOLD 30
 
@@ -286,6 +297,10 @@ void setServoAngle(uint8_t channel, int angle) {
 
 // Isasara ang reject gate kapag lumipas na ang oras
 void updateRejectServo() {
+#if EGGSORT_EXPERIMENTAL_REJECT
+  serviceExperimentalReject();
+  return;
+#endif
 
   // A second defect arriving while the gate is open starts a fresh cycle:
   // briefly command CLOSED so the linkage registers the change, then reopen.
@@ -357,6 +372,10 @@ void waitWithRejectService(unsigned long duration) {
 
 // Test: buksan ang gate at hintayin hanggang magsara
 void activateCrackServo() {
+#if EGGSORT_EXPERIMENTAL_REJECT
+  Serial.println("CRACK TEST DISABLED: EXPERIMENTAL ID PROTOCOL REQUIRED");
+  return;
+#endif
 
   startRejectServo();
 
@@ -374,6 +393,10 @@ void activateCrackServo() {
 // REJECT:CRACK | REJECT:ROTTEN | MEASURE:GOOD | MEASURE:UNDEFINED | STATUS
 // LOADCELL_CLOSE | LOADCELL_TEST (only when no egg cycle is active)
 // =====================================================
+
+#if EGGSORT_EXPERIMENTAL_REJECT
+#include "reject_gate_experimental_io.h"
+#endif
 
 void handleSerialCommands(bool urgentOnly) {
 
@@ -403,8 +426,26 @@ void handleSerialCommands(bool urgentOnly) {
       continue;
     }
 
+    // Experimental commands cannot silently fall back to untagged rejection.
+#if EGGSORT_EXPERIMENTAL_REJECT
+    if (handleExperimentalReject(command)) continue;
+    if (command == "CRACK_TEST") {
+      Serial.println("XE:PASSAGE_ID_REQUIRED");
+      continue;
+    }
+#else
+    if (command == "XH" || command.startsWith("XB:") || command.startsWith("XR:")) {
+      Serial.println("XE:EXPERIMENT_DISABLED");
+      continue;
+    }
+#endif
+
     // ---------- REJECT:CRACK / REJECT:ROTTEN ----------
     if (command.startsWith("REJECT:")) {
+#if EGGSORT_EXPERIMENTAL_REJECT
+      Serial.println("XE:PASSAGE_ID_REQUIRED");
+      continue;
+#endif
 
       String quality = command.substring(7);
       quality.trim();

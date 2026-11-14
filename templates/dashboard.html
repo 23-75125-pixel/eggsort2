@@ -182,7 +182,7 @@
           href="/alerts"
         >
           <span class="material-symbols-outlined">notifications</span>
-          <span class="font-button text-button">Alerts</span>
+          <span class="font-button text-button">Tray Alerts</span>
         </a>
         <a
           class="text-surface-variant/70 hover:text-white transition-colors py-3 px-6 flex items-center gap-3 hover:bg-surface-variant/10 transition-all active:scale-95 duration-150 ease-in-out rounded-lg mx-2 mt-xs"
@@ -260,7 +260,7 @@
         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-sm">
           <!-- Card 1 -->
           <div
-            class="bg-white rounded-xl p-6 glow-effect border-l-4 border-primary-container flex flex-col justify-between h-32 relative overflow-hidden group"
+            class="bg-white rounded-xl p-5 glow-effect border-l-4 border-primary-container flex flex-col justify-between h-44 relative overflow-hidden group"
           >
             <div
               class="absolute -right-4 -top-4 w-24 h-24 bg-primary-container/5 rounded-full group-hover:scale-150 transition-transform duration-500 ease-out"
@@ -289,7 +289,7 @@
           </div>
           <!-- Card 2 -->
           <div
-            class="bg-white rounded-xl p-6 glow-effect border-l-4 border-primary-container flex flex-col justify-between h-32 relative overflow-hidden group"
+            class="bg-white rounded-xl p-5 glow-effect border-l-4 border-primary-container flex flex-col h-44 relative overflow-hidden group"
           >
             <div
               class="absolute -right-4 -top-4 w-24 h-24 bg-primary-container/5 rounded-full group-hover:scale-150 transition-transform duration-500 ease-out"
@@ -298,27 +298,23 @@
               <p
                 class="font-label-caps text-label-caps text-secondary uppercase tracking-wider"
               >
-                Trays Completed (Cumulative)
+                Tray Equivalents
               </p>
               <span class="material-symbols-outlined text-primary-container"
                 >widgets</span
               >
             </div>
-            <div class="flex items-end justify-between z-10">
+            <div class="flex flex-col items-start z-10 mt-2 min-w-0">
               <h3 id="dashboard-trays" class="font-headline-lg text-headline-lg text-on-background">
                 0
               </h3>
-              <p
-                id="dashboard-trays-note"
-                class="font-caption text-caption text-secondary flex items-center gap-1"
-              >
-                Based on size-specific sorted counts
-              </p>
+              <p class="font-caption text-caption text-secondary mt-1 w-full max-w-full break-words leading-4">Based on 30 eggs per tray.</p>
+              <p id="dashboard-trays-note" class="font-caption text-caption text-secondary mt-1 w-full max-w-full break-words leading-4">All-time estimate · Not date-filtered.</p>
             </div>
           </div>
           <!-- Card 3 -->
           <div
-            class="bg-white rounded-xl p-6 glow-effect border-l-4 border-blue-500 flex flex-col justify-between h-32 relative overflow-hidden group"
+            class="bg-white rounded-xl p-5 glow-effect border-l-4 border-blue-500 flex flex-col h-44 relative overflow-hidden group"
           >
             <div
               class="absolute -right-4 -top-4 w-24 h-24 bg-blue-500/5 rounded-full group-hover:scale-150 transition-transform duration-500 ease-out"
@@ -327,27 +323,23 @@
               <p
                 class="font-label-caps text-label-caps text-secondary uppercase tracking-wider"
               >
-                Quality Rate
+                Verified Good Rate
               </p>
               <span class="material-symbols-outlined text-blue-500"
                 >verified</span
               >
             </div>
-            <div class="flex items-end justify-between z-10">
+            <div class="flex flex-col items-start z-10 mt-2 min-w-0">
               <h3 id="dashboard-quality-rate" class="font-headline-lg text-headline-lg text-on-background">
                 0%
               </h3>
-              <p
-                id="dashboard-quality-note"
-                class="font-caption text-caption text-secondary flex items-center gap-1"
-              >
-                Good eggs after sorting
-              </p>
+              <p class="font-caption text-caption text-secondary mt-1 w-full max-w-full break-words leading-4">Good eggs confirmed by camera</p>
+              <p id="dashboard-quality-note" class="font-caption text-caption text-secondary mt-1 w-full max-w-full break-words leading-4">Of quality-verified eggs</p>
             </div>
           </div>
           <!-- Card 4 -->
           <div
-            class="bg-white rounded-xl p-6 glow-effect border-l-4 border-amber-500 flex flex-col justify-between h-32 relative overflow-hidden group"
+            class="bg-white rounded-xl p-5 glow-effect border-l-4 border-amber-500 flex flex-col justify-between h-44 relative overflow-hidden group"
           >
             <div
               class="absolute -right-4 -top-4 w-24 h-24 bg-amber-500/5 rounded-full group-hover:scale-150 transition-transform duration-500 ease-out"
@@ -369,7 +361,7 @@
               <p
                 class="font-caption text-caption text-secondary flex items-center gap-1"
               >
-                Crack, rotten, or other
+                Crack, Rotten, or other • Not Classified shown separately
               </p>
             </div>
           </div>
@@ -813,21 +805,19 @@
         document.getElementById('dashboard-total-sorted').textContent = stats.total_sorted;
         document.getElementById('dashboard-total-note').textContent =
           stats.latest_record
-            ? `Latest: ${stats.latest_record.weight_grams == null ? 'N/A' : `${stats.latest_record.weight_grams} g`} • ${stats.latest_record.size}`
+            ? `Latest: ${stats.latest_record.weight_grams == null ? 'N/A' : `${stats.latest_record.weight_grams} g`} • ${stats.latest_record.size} • ${stats.latest_record.quality} (${stats.latest_record.quality_verified === true ? 'Verified' : stats.latest_record.quality_verified === false ? 'Unverified' : 'Legacy/Unknown'})`
             : 'No eggs sorted in this date range';
         document.getElementById('dashboard-trays').textContent = stats.trays_completed;
         const trayProgress = stats.tray_progress || [];
         document.getElementById('dashboard-trays-note').textContent =
-          'Cumulative; not date-filtered';
+          'All-time estimate · Not date-filtered.';
         const trayKey = JSON.stringify(trayProgress);
         if (trayKey !== renderedSections.trayProgress) {
           renderTrayProgress(trayProgress);
           renderedSections.trayProgress = trayKey;
         }
         document.getElementById('dashboard-quality-rate').textContent =
-          `${stats.quality_rate}%`;
-        document.getElementById('dashboard-quality-note').textContent =
-          `${stats.quality_counts.Good || 0} good eggs`;
+          `${stats.verified_good_rate}%`;
         document.getElementById('dashboard-non-good').textContent =
           stats.non_good_count;
         /*

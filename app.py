@@ -8,6 +8,7 @@ from functools import wraps
 from threading import Event, RLock, Thread
 from time import monotonic, sleep
 from typing import Callable, Any
+from zoneinfo import ZoneInfo
 from authlib.integrations.base_client.errors import OAuthError
 from joserfc.errors import JoseError
 
@@ -419,7 +420,8 @@ def start_sorting_runtime(user_id: int | None = None, *, automatic: bool = False
         raise
     except LifecycleError as exc:
         raise CameraSessionError(str(exc)) from None
-    return CAMERA_SESSION.status(), ESP32_BRIDGE.status()
+    camera_state, hardware_state = CAMERA_SESSION.status(), ESP32_BRIDGE.status()
+    return _with_lifecycle(camera_state), _with_lifecycle(hardware_state)
 
 
 def stop_sorting_runtime(*, manual: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -431,7 +433,77 @@ def stop_sorting_runtime(*, manual: bool = False) -> tuple[dict[str, Any], dict[
         LIFECYCLE.stop()
     if not EGG_FLOW_PENDING:
         reset_egg_flow()
-    return CAMERA_SESSION.status(), ESP32_BRIDGE.status()
+    camera_state, hardware_state = CAMERA_SESSION.status(), ESP32_BRIDGE.status()
+    camera_still_running = isinstance(camera_state, dict) and camera_state.get("running") is True
+    bridge_still_running = isinstance(hardware_state, dict) and hardware_state.get("running") is True
+    if camera_still_running or bridge_still_running:
+        raise LifecycleError("A camera or ESP32 software worker is still running; shutdown is incomplete.")
+    return _with_lifecycle(camera_state), _with_lifecycle(hardware_state)
+
+
+def _with_lifecycle(status: dict[str, Any]) -> dict[str, Any]:
+    """Attach the station lifecycle truth to camera and bridge status payloads."""
+    lifecycle = LIFECYCLE.snapshot()
+    bridge = ESP32_BRIDGE.status()
+    result = dict(status) if isinstance(status, dict) else {}
+    result.update(
+        lifecycle_status=("ready" if lifecycle["status"] == "running" else lifecycle["status"]),
+        recovery_required=lifecycle["recovery_required"],
+        finalization_pending=lifecycle["finalization_pending"],
+        failure_reason=lifecycle["failure_reason"],
+        session_ref=lifecycle.get("session_ref"),
+        operator_user_id=lifecycle.get("operator_user_id"),
+        bridge_connected=bridge.get("connected", False),
+        bridge_running=bridge.get("running", False),
+        physical_actuation_verified=False,
+        hardware_shutdown_note=(
+            "Software worker state is reported; physical motor or servo motion is not independently verified."
+        ),
+    )
+    return result
+
+
+def _maybe_mark_lifecycle_ready(context: dict[str, Any]) -> None:
+    """Ready means a captured camera frame and an acknowledged ESP32 are present."""
+    if not LIFECYCLE.context or not LIFECYCLE.context.matches(context):
+        return
+    try:
+        camera = CAMERA_SESSION.status()
+        bridge = ESP32_BRIDGE.status()
+    except Exception as exc:
+        app.logger.warning(
+            "Sorting startup readiness check failed (%s).", type(exc).__name__
+        )
+        return
+    missing = []
+    if not camera.get("running") or not camera.get("frame_ready"):
+        missing.append("published camera JPEG")
+    if not bridge.get("connected"):
+        missing.append("ESP32 bridge connection")
+    elif not BRIDGE_READY:
+        missing.append("ESP32 controller readiness signal")
+    if missing:
+        app.logger.info(
+            "Sorting startup remains pending; missing readiness: %s.",
+            ", ".join(missing),
+        )
+        return
+    app.logger.info("Sorting startup readiness conditions are satisfied.")
+    LIFECYCLE.ready(context)
+
+
+def _write_sorting_audit_warning(event: str, description: str) -> str | None:
+    """Record operational audit best-effort without misreporting an operation."""
+    try:
+        write_audit_log(event, description)
+    except Exception:
+        try:
+            db.session.rollback()
+        except Exception:
+            app.logger.exception("Sorting-session audit rollback failed")
+        app.logger.exception("Sorting-session operation completed but audit logging failed: %s", event)
+        return "The operation completed, but its audit event could not be saved."
+    return None
 
 
 def sign_in_user(user: "User", remember: bool = False) -> None:
@@ -487,6 +559,20 @@ def parse_date_boundary(value: str | None, end: bool = False) -> datetime | None
     parsed_date = datetime.strptime(value, "%Y-%m-%d").date()
     boundary = time.max if end else time.min
     return datetime.combine(parsed_date, boundary, tzinfo=timezone.utc)
+
+
+REPORT_TIMEZONE = ZoneInfo("Asia/Manila")
+
+
+def parse_report_date_boundary(value: str | None) -> datetime | None:
+    """Convert a selected Reports calendar date's local midnight to UTC."""
+    if not value:
+        return None
+    parsed_date = datetime.strptime(value, "%Y-%m-%d").date()
+    if parsed_date.isoformat() != value:
+        raise ValueError("Reports dates must use YYYY-MM-DD format.")
+    local_midnight = datetime.combine(parsed_date, time.min, tzinfo=REPORT_TIMEZONE)
+    return local_midnight.astimezone(timezone.utc)
 
 
 def parse_timestamp_boundary(value: str | None) -> datetime | None:
@@ -647,17 +733,40 @@ def prepare_station_generation():
         reset_egg_flow()
 
 
+def _startup_readiness_missing() -> list[str]:
+    """Describe which asynchronous camera/controller startup signals are absent."""
+    missing = []
+    camera = CAMERA_SESSION.status()
+    if not camera.get("frame_ready"):
+        missing.append("first camera frame")
+    bridge = ESP32_BRIDGE.status()
+    if not bridge.get("connected"):
+        missing.append("ESP32 bridge connection")
+    elif not BRIDGE_READY:
+        missing.append("ESP32 controller readiness signal")
+    return missing
+
+
+# 45 seconds allows model/camera warmup and several existing serial reconnect
+# intervals while ensuring a missing readiness event cannot leave UI in Starting forever.
+SORTING_READINESS_TIMEOUT_SECONDS = env_int(
+    "SORTING_READINESS_TIMEOUT_SECONDS", 45, minimum=1, maximum=300
+)
+
+
 LIFECYCLE = SortingLifecycle(SQLAlchemySessionStore(app, assert_lifecycle_writes_allowed),
     CAMERA_SESSION, ESP32_BRIDGE,
     incomplete=lambda: bool(AUTOMATIC_EGG_CYCLES) or bool(REJECTED_CAPTURES) or bool(EGG_FLOW_PENDING) or EGG_FLOW_STAGE not in {"idle", "waiting_removal"},
-    prepare=prepare_station_generation)
+    prepare=prepare_station_generation,
+    readiness_timeout_seconds=SORTING_READINESS_TIMEOUT_SECONDS,
+    readiness_missing=_startup_readiness_missing)
 
 
 def camera_lifecycle_event(kind, context):
     if kind == "ready":
-        LIFECYCLE.ready(context)
+        _maybe_mark_lifecycle_ready(context)
     elif kind == "failed":
-        LIFECYCLE.fail(context)
+        LIFECYCLE.fail(context, reason=CAMERA_SESSION.status().get("error"))
 
 
 CAMERA_SESSION.set_lifecycle_handler(camera_lifecycle_event)
@@ -1079,6 +1188,7 @@ def _save_automatic_egg_cycles() -> None:
                     + key[0] * 1_000_000 + key[1],
                     "confidence": 0.0,
                     "label": "good",
+                    "quality": "Not Classified",
                     "_quality_verified": False,
                 }
                 with EGG_FLOW_LOCK:
@@ -1104,7 +1214,8 @@ def _save_automatic_egg_cycles() -> None:
             record_context = {**context, "capture_id": capture["capture_id"]}
             with LIFECYCLE.persistence(record_context):
                 persist_capture(record_context, dict(
-                    weight_grams=int(weight), size=measured_size, quality="Good",
+                    weight_grams=int(weight), size=measured_size,
+                    quality=capture.get("quality", "Good"),
                     confidence=float(capture["confidence"]),
                     quality_verified=bool(capture.get("_quality_verified", False)),
                     session_ref=context["session_ref"],
@@ -1166,7 +1277,7 @@ def handle_esp32_event(event: dict[str, Any]) -> None:
         return
     if event_type == "connection_lost":
         BRIDGE_READY = False
-        LIFECYCLE.fail(event)
+        LIFECYCLE.fail(event, reason=ESP32_BRIDGE.status().get("error") or "ESP32 connection lost.")
         return
     if event.get("connection_epoch") != BRIDGE_EPOCH:
         return
@@ -1176,20 +1287,23 @@ def handle_esp32_event(event: dict[str, Any]) -> None:
     if event_type == "measurement_failed":
         reason = str(event.get("reason") or "Unknown controller error")
         ESP32_BRIDGE.publish_status(f"ESP32 measurement failed: {reason}", "flow_error")
-        LIFECYCLE.fail(event)
+        LIFECYCLE.fail(event, reason=reason)
         return
     if event.get("cycle_id") is not None:
         if (LIFECYCLE.accepts(event, saving=True)
                 or LIFECYCLE.snapshot()["status"] == "starting"):
             BRIDGE_READY = True
+            _maybe_mark_lifecycle_ready(event)
             _handle_automatic_egg_event(event)
         return
     if event_type == "controller_state" and event.get("state") == "WAITING FOR CAMERA":
         BRIDGE_READY = True
+        _maybe_mark_lifecycle_ready(event)
         begin_egg_flow()
         return
     if event_type == "ready" or (event_type == "controller_state" and event.get("state") == "READY"):
         BRIDGE_READY = True
+        _maybe_mark_lifecycle_ready(event)
         return
     if not BRIDGE_READY or not LIFECYCLE.accepts(event, saving=True):
         return
@@ -1914,12 +2028,13 @@ def start_camera() -> Any:
         camera_state, hardware_state = start_sorting_runtime()
         session.pop("sorting_runtime_auto_start_suppressed", None)
         session.pop("sorting_runtime_retry_after", None)
-        write_audit_log(
+        audit_warning = _write_sorting_audit_warning(
             "camera_started",
             f"Sorting camera session {camera_state.get('session_ref')} started.",
         )
-        return jsonify(camera=camera_state, hardware=hardware_state)
-    except CameraSessionError as exc:
+        return jsonify(camera=camera_state, hardware=hardware_state,
+                       audit_warning=audit_warning)
+    except (LifecycleError, CameraSessionError) as exc:
         return jsonify(error=str(exc)), 503
 
 
@@ -1933,11 +2048,12 @@ def stop_camera() -> Any:
         camera_state, hardware_state = stop_sorting_runtime(manual=True)
     except (LifecycleError, CameraSessionError) as exc:
         return jsonify(error=str(exc)), 409
-    write_audit_log(
+    audit_warning = _write_sorting_audit_warning(
         "camera_stopped",
         "Sorting camera and hardware session stopped manually.",
     )
-    return jsonify(camera=camera_state, hardware=hardware_state)
+    return jsonify(camera=camera_state, hardware=hardware_state,
+                   audit_warning=audit_warning)
 
 
 @app.get("/api/camera/status")
@@ -1945,7 +2061,7 @@ def stop_camera() -> Any:
 def camera_status() -> Any:
     if not app.config["LOCAL_HARDWARE_ENABLED"]:
         return jsonify(error="Camera status is available on the sorting computer."), 409
-    response = jsonify(CAMERA_SESSION.status())
+    response = jsonify(_with_lifecycle(CAMERA_SESSION.status()))
     response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -1993,7 +2109,7 @@ def camera_feed() -> Any:
 def hardware_status() -> Any:
     if not app.config["LOCAL_HARDWARE_ENABLED"]:
         return jsonify(error="Hardware status is available on the sorting computer."), 409
-    return jsonify(ESP32_BRIDGE.status())
+    return jsonify(_with_lifecycle(ESP32_BRIDGE.status()))
 
 
 @app.get("/api/egg-records")
@@ -2132,16 +2248,8 @@ def dashboard_stats() -> Any:
         .group_by(EggRecord.size)
         .all()
     )
-    quality_rows = (
-        db.session.query(EggRecord.quality, func.count(EggRecord.id))
-        .filter(EggRecord.sorted_at >= selected_start, EggRecord.sorted_at < selected_end)
-        .group_by(EggRecord.quality)
-        .all()
-    )
     size_counts = {size: 0 for size in SIZE_ORDER}
     size_counts.update({size: count for size, count in size_rows})
-    quality_counts = {quality: count for quality, count in quality_rows}
-    good_count = quality_counts.get("Good", 0)
     latest_record = selected_records.order_by(EggRecord.id.desc()).first()
     tray_progress_rows = (
         TraySizeProgress.query.order_by(TraySizeProgress.egg_size.asc()).all()
@@ -2151,12 +2259,37 @@ def dashboard_stats() -> Any:
     # Use actual Manila dates, rather than combining different weeks' weekdays.
     trend_counts = {}
     recent_records = selected_records.all()
+    quality_counts: dict[str, int] = {}
+    verification_counts = {"verified": 0, "unverified": 0, "unknown": 0}
+    good_verification_counts = {"verified": 0, "unverified": 0, "unknown": 0}
+    verification_by_quality = {
+        quality: {"verified": 0, "unverified": 0, "unknown": 0}
+        for quality in ("Good", "Crack", "Rotten", "Not Classified", "Other")
+    }
+    verified_quality_total = 0
+    verified_good_count = 0
     for record in recent_records:
+        quality_counts[record.quality] = quality_counts.get(record.quality, 0) + 1
+        verified = getattr(record, "quality_verified", None)
+        verification_status = (
+            "verified" if verified is True else
+            "unverified" if verified is False else "unknown"
+        )
+        verification_counts[verification_status] += 1
+        quality_bucket = record.quality if record.quality in {"Good", "Crack", "Rotten", "Not Classified"} else "Other"
+        verification_by_quality[quality_bucket][verification_status] += 1
+        if record.quality == "Good":
+            good_verification_counts[verification_status] += 1
+        if verified is True and record.quality in {"Good", "Crack", "Rotten"}:
+            verified_quality_total += 1
+            if record.quality == "Good":
+                verified_good_count += 1
         sorted_at = record.sorted_at
         if sorted_at.tzinfo is None:
             sorted_at = sorted_at.replace(tzinfo=timezone.utc)
         sorted_date = sorted_at.astimezone(manila_timezone).date()
         trend_counts[sorted_date] = trend_counts.get(sorted_date, 0) + 1
+    good_count = quality_counts.get("Good", 0)
     day_count = (end_date - start_date).days + 1
     # Keep zero-filled normal ranges. Very long ranges stay sparse instead of
     # allocating millions of empty chart columns; database queries are unchanged.
@@ -2170,13 +2303,26 @@ def dashboard_stats() -> Any:
         total_sorted=total_sorted,
         trays_completed=trays_completed,
         good_count=good_count,
+        not_classified_count=quality_counts.get("Not Classified", 0),
+        # Preserve the historical all-record Good rate under an explicit name.
+        recorded_good_rate=round((good_count / total_sorted * 100) if total_sorted else 0, 1),
         quality_rate=round(
             (good_count / total_sorted * 100) if total_sorted else 0,
+            1,
+        ),
+        verified_good_count=verified_good_count,
+        verified_quality_total=verified_quality_total,
+        verified_good_rate=round(
+            (verified_good_count / verified_quality_total * 100)
+            if verified_quality_total else 0,
             1,
         ),
         non_good_count=total_sorted - good_count,
         size_counts=size_counts,
         quality_counts=quality_counts,
+        quality_verification_counts=verification_counts,
+        good_verification_counts=good_verification_counts,
+        verification_by_quality=verification_by_quality,
         latest_record=latest_record.to_dict() if latest_record else None,
         hardware=ESP32_BRIDGE.status(),
         unread_alerts=TraySizeAlert.query.filter_by(is_read=False).count(),
@@ -2283,8 +2429,18 @@ def reports_data() -> Any:
     if sampling not in {"daily", "weekly", "monthly"}:
         return jsonify(error="Invalid sampling period."), 400
     try:
-        start_date = parse_date_boundary(request.args.get("start_date"))
-        end_date = parse_date_boundary(request.args.get("end_date"), end=True)
+        start_value = request.args.get("start_date")
+        end_value = request.args.get("end_date")
+        start_date = parse_report_date_boundary(start_value)
+        end_date = parse_report_date_boundary(end_value)
+        end_before = None
+        if end_value:
+            selected_end = datetime.strptime(end_value, "%Y-%m-%d").date()
+            if selected_end.isoformat() != end_value:
+                raise ValueError("Dates must use YYYY-MM-DD format.")
+            end_before = parse_report_date_boundary(
+                (selected_end + timedelta(days=1)).isoformat()
+            )
     except ValueError:
         return jsonify(error="Dates must use YYYY-MM-DD format."), 400
     if start_date and end_date and start_date > end_date:
@@ -2293,15 +2449,20 @@ def reports_data() -> Any:
     query = EggRecord.query
     if start_date:
         query = query.filter(EggRecord.sorted_at >= start_date)
-    if end_date:
-        query = query.filter(EggRecord.sorted_at <= end_date)
+    if end_before:
+        query = query.filter(EggRecord.sorted_at < end_before)
     records = query.order_by(EggRecord.sorted_at.asc()).all()
 
     groups: dict[str, dict[str, Any]] = {}
+    verification_by_quality = {
+        quality: {"verified": 0, "unverified": 0, "unknown": 0}
+        for quality in ("Good", "Crack", "Rotten", "Not Classified", "Other")
+    }
     for record in records:
         sorted_at = record.sorted_at
         if sorted_at.tzinfo is None:
             sorted_at = sorted_at.replace(tzinfo=timezone.utc)
+        sorted_at = sorted_at.astimezone(REPORT_TIMEZONE)
         if sampling == "daily":
             key = sorted_at.strftime("%Y-%m-%d")
         elif sampling == "weekly":
@@ -2317,23 +2478,55 @@ def reports_data() -> Any:
                 "good": 0,
                 "crack": 0,
                 "rotten": 0,
+                "not_classified": 0,
                 "other": 0,
+                "verification_counts": {"verified": 0, "unverified": 0, "unknown": 0},
+                "verification_by_quality": {
+                    quality: {"verified": 0, "unverified": 0, "unknown": 0}
+                    for quality in ("Good", "Crack", "Rotten", "Not Classified", "Other")
+                },
+                "good_verification_counts": {"verified": 0, "unverified": 0, "unknown": 0},
             },
         )
         row["total"] += 1
+        verified = getattr(record, "quality_verified", None)
+        status = "verified" if verified is True else "unverified" if verified is False else "unknown"
+        row["verification_counts"][status] += 1
         quality_key = record.quality.lower()
-        if quality_key in {"good", "crack", "rotten"}:
+        quality_bucket = "Not Classified" if quality_key == "not classified" else quality_key.title() if quality_key in {"good", "crack", "rotten"} else "Other"
+        verification_by_quality[quality_bucket][status] += 1
+        row["verification_by_quality"][quality_bucket][status] += 1
+        if quality_key == "not classified":
+            row["not_classified"] += 1
+        elif quality_key in {"good", "crack", "rotten"}:
             row[quality_key] += 1
         else:
             # Retain visibility of records made with an older model without
             # relabeling those historical predictions as a new class.
             row["other"] += 1
+        if quality_key == "good":
+            row["good_verification_counts"][status] += 1
 
     total = len(records)
     good = sum(1 for record in records if record.quality == "Good")
+    verification_counts = {"verified": 0, "unverified": 0, "unknown": 0}
+    good_verification_counts = {"verified": 0, "unverified": 0, "unknown": 0}
+    verified_quality_total = 0
+    verified_good = 0
+    for record in records:
+        verified = getattr(record, "quality_verified", None)
+        status = "verified" if verified is True else "unverified" if verified is False else "unknown"
+        verification_counts[status] += 1
+        if record.quality == "Good":
+            good_verification_counts[status] += 1
+        if verified is True and record.quality in {"Good", "Crack", "Rotten"}:
+            verified_quality_total += 1
+            if record.quality == "Good":
+                verified_good += 1
     crack = sum(1 for record in records if record.quality == "Crack")
     rotten = sum(1 for record in records if record.quality == "Rotten")
-    other = total - good - crack - rotten
+    not_classified = sum(1 for record in records if record.quality == "Not Classified")
+    other = total - good - crack - rotten - not_classified
     return jsonify(
         rows=list(groups.values()),
         summary={
@@ -2341,9 +2534,24 @@ def reports_data() -> Any:
             "good": good,
             "crack": crack,
             "rotten": rotten,
+            "not_classified": not_classified,
             "other": other,
+            # Preserve the prior non-Good treatment for existing labels while
+            # excluding explicitly unclassified weight-only records.
             "defects": total - good,
+            # Historical rate is retained with an explicit name and definition.
+            "recorded_good_rate": round((good / total * 100) if total else 0, 1),
             "quality_rate": round((good / total * 100) if total else 0, 1),
+            "verified_good": verified_good,
+            "verified_quality_total": verified_quality_total,
+            "verified_good_rate": round(
+                (verified_good / verified_quality_total * 100)
+                if verified_quality_total else 0,
+                1,
+            ),
+            "verification_counts": verification_counts,
+            "verification_by_quality": verification_by_quality,
+            "good_verification_counts": good_verification_counts,
         },
     )
 

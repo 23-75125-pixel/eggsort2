@@ -46,7 +46,7 @@ Keep the session running long enough to cover the previously observed failure
 period (at least 30 minutes if safe to supervise). Record the wall-clock time of
 visible lag/missed eggs and any camera restart. Compare early, middle, and late
 windows using `utc`. Keep other diagnostic flags consistent between comparisons;
-existing passage diagnostics continue independently; experimental exports are excluded from this release.
+existing passage diagnostics and reject-observation exports still work independently.
 
 ## Read the summaries
 
@@ -81,7 +81,8 @@ existing passage diagnostics continue independently; experimental exports are ex
   from an exited thread. `detect_image_including_lock_wait` cannot distinguish an
   in-progress lock wait from prediction until that call returns.
 - `gauges` gives approximate lock-free snapshots of latest-frame pending work,
-  sequence progress and bounded quality queues/history. `passage_samples` is the current passage's existing sample list;
+  sequence progress, bounded quality queues/history and observer/export queue
+  usage/drops. `passage_samples` is the current passage's existing sample list;
   the monitor does not retain samples. No application/database backlog, GPU
   utilization, or driver queue depth is measured.
 
@@ -198,10 +199,10 @@ Remove-Item Env:CAMERA_PERFORMANCE_INTERVAL_SECONDS -ErrorAction SilentlyContinu
 
 An explicit `false` overrides an enabled value in `.env`. For the default-off
 behavior, remove the variable instead if `.env` does not enable it. Existing
-passage diagnostics use their own unchanged flags. Experimental observation exports are not part of this release.
+passage diagnostics and reject observation exports use their own unchanged flags.
 
 Hardware-free regression command:
 
 ```powershell
-.\.venv\Scripts\python.exe -B -m unittest test_camera_performance test_camera_exit test_camera_capture test_camera_diagnostics test_esp32_bridge -q
+.\.venv\Scripts\python.exe -B -m unittest test_camera_performance test_camera_exit test_camera_capture test_camera_diagnostics test_experimental_reject_export test_experimental_reject_observer test_experimental_reject_client test_esp32_bridge -q
 ```

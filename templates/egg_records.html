@@ -169,7 +169,7 @@
           href="/alerts"
         >
           <span class="material-symbols-outlined">notifications</span>
-          <span class="font-button text-button">Alerts</span>
+          <span class="font-button text-button">Tray Alerts</span>
         </a>
         <a
           class="text-surface-variant/70 hover:text-white transition-colors py-3 px-6 flex items-center gap-3 hover:bg-surface-variant/10 transition-all active:scale-95 duration-150 ease-in-out rounded-lg mx-2 mt-xs"
@@ -293,6 +293,7 @@
               <option>Good</option>
               <option>Crack</option>
               <option>Rotten</option>
+              <option>Not Classified</option>
             </select>
             <label class="flex items-center gap-2 text-body-md text-secondary">
               From
@@ -392,10 +393,11 @@
               Sorting Classification Standards
             </h4>
             <p class="text-caption text-blue-700/80 leading-relaxed max-w-4xl">
-              EGGSor+ IoT weight measurements adhere strictly to localized
-              commercial standards: Peewee (&lt;42g), Small (42g to 49g),
-              Medium (50g to 56g), Large (57g to 63g), Extra Large
-              (64g to 70g), and Jumbo (71g and above).
+              EGGSor+ uses client-defined weight ranges: Small (50g to 55g),
+              Medium (56g to 60g), Large (61g to 65g), Extra Large
+              (66g to 70g), and Jumbo (71g and above).
+              The current classifier also assigns weights below 50g to Small.
+              Imported and historical size labels, including Peewee, are retained.
               Handlers can calibrate automatic vision scaling directly from the
               control nodes on site.
             </p>
@@ -478,6 +480,12 @@
       return 'bg-surface-container text-secondary';
     }
 
+    function qualityVerificationLabel(value) {
+      if (value === true) return 'Verified';
+      if (value === false) return 'Unverified';
+      return 'Legacy/Unknown';
+    }
+
     function createRecordRow(record) {
       const row = document.createElement('tr');
       row.className = 'border-b border-surface-variant/30';
@@ -487,7 +495,7 @@
         record.egg_id,
         record.weight_grams == null ? 'N/A' : `${record.weight_grams} g`,
         record.size,
-        record.quality,
+        `${record.quality} (${qualityVerificationLabel(record.quality_verified)})`,
         formatRecordDate(record.sorted_at),
         record.session_ref
       ];
@@ -605,12 +613,13 @@
     });
     document.getElementById('print-records').addEventListener('click', () => window.print());
     document.getElementById('export-records').addEventListener('click', () => {
-      const headings = ['Egg ID', 'Weight (g)', 'Size', 'Quality', 'Date Sorted', 'Session'];
+      const headings = ['Egg ID', 'Weight (g)', 'Size', 'Quality', 'Verification', 'Date Sorted', 'Session'];
       const rows = currentRecords.map((record) => [
         record.egg_id,
         record.weight_grams,
         record.size,
         record.quality,
+        qualityVerificationLabel(record.quality_verified),
         formatRecordDate(record.sorted_at),
         record.session_ref
       ]);
