@@ -539,9 +539,19 @@ class Esp32Bridge:
                     f"Egg #{capture_id} - {quality} - {outcome}"
                 )
             elif event_type == "load_cell_status":
-                self._diagnostics["live_weight_grams"] = event.get(
-                    "weight_grams"
-                )
+                weight = event.get("weight_grams")
+                if self._diagnostics.get("awaiting_egg"):
+                    # Idle HX711 telemetry is not an egg measurement. Keep
+                    # the display at zero until the firmware reports an egg.
+                    self._diagnostics["live_weight_grams"] = (
+                        0 if weight is not None else None
+                    )
+                    if weight is not None:
+                        self._diagnostics["latest_sensor_event"] = (
+                            "Load cell empty: 0 g"
+                        )
+                else:
+                    self._diagnostics["live_weight_grams"] = weight
             elif event_type == "egg_detected":
                 self._diagnostics["live_weight_grams"] = None
                 self._diagnostics["measurement_weight_grams"] = None
@@ -557,7 +567,7 @@ class Esp32Bridge:
                     "Egg on load cell; waiting for a completed camera inspection"
                 )
             elif event_type == "egg_left":
-                self._diagnostics["live_weight_grams"] = None
+                self._diagnostics["live_weight_grams"] = 0
                 if self._diagnostics["final_weight_grams"] is None:
                     self._diagnostics["latest_sensor_event"] = (
                         "Egg left load cell without a completed weight"
@@ -591,11 +601,25 @@ class Esp32Bridge:
                 )
             elif event_type == "weight_reading":
                 weight = event.get("weight_grams")
-                self._diagnostics["live_weight_grams"] = weight
+                if self._diagnostics.get("awaiting_egg"):
+                    # The firmware's zero-weight report confirms an empty
+                    # scale; other idle readings must not become egg data.
+                    self._diagnostics["live_weight_grams"] = (
+                        0 if weight is not None else None
+                    )
+                    if weight is not None:
+                        self._diagnostics["latest_sensor_event"] = (
+                            "Load cell empty: 0 g"
+                        )
+                else:
+                    self._diagnostics["live_weight_grams"] = weight
                 # A scale can report its weight before the camera validates
                 # the Good egg. Keep that raw reading visible, but do not
                 # present it as an authorized measurement or open the gate.
-                if self._diagnostics["measurement_quality"] is None:
+                if self._diagnostics.get("awaiting_egg"):
+                    # Do not replace the empty-scale state with idle noise.
+                    pass
+                elif self._diagnostics["measurement_quality"] is None:
                     self._diagnostics["latest_sensor_event"] = (
                         f"Egg on load cell: {weight} g - stabilizing for 1 s before gate release"
                         if self._diagnostics.get("automatic_release") else

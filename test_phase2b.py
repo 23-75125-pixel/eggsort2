@@ -2,6 +2,7 @@
 import os
 import unittest
 from datetime import datetime, timezone
+from time import sleep
 from unittest.mock import Mock, patch
 from types import SimpleNamespace
 from flask import render_template
@@ -84,15 +85,31 @@ class BackendLifecycleTests(unittest.TestCase):
             self.automatic_cycle()
         self.assertFalse(backend.AUTOMATIC_EGG_CYCLES)
 
-    def test_automatic_weight_without_camera_is_retained_without_invented_quality(self):
+    def test_automatic_weight_without_camera_is_saved_as_unverified_quality(self):
         self.automatic_cycle()
         with patch.object(backend.CAMERA_SESSION, "wait_for_captured_quality", return_value=None), \
              patch.object(backend.AUTOMATIC_RECORD_WAKE, "wait",
                           side_effect=lambda _: setattr(self.lifecycle, "state", "interrupted")), \
              patch.object(backend, "persist_capture") as save:
             backend._save_automatic_egg_cycles()
-        save.assert_not_called()
-        self.assertEqual(backend.AUTOMATIC_EGG_CYCLES[(1, 1)]["egg_complete"]["weight_grams"], 59)
+        save.assert_called_once()
+        saved_record = save.call_args.args[1]
+        self.assertEqual(saved_record["weight_grams"], 59)
+        self.assertEqual(saved_record["quality"], "Not Classified")
+        self.assertIs(saved_record["quality_verified"], False)
+        self.assertEqual(saved_record["confidence"], 0.0)
+        self.assertFalse(backend.AUTOMATIC_EGG_CYCLES)
+
+    def test_fresh_good_camera_capture_remains_verified_good(self):
+        self.automatic_cycle()
+        capture = {**self.context, "capture_id": 77, "label": "good", "confidence": 0.94}
+        with patch.object(backend.CAMERA_SESSION, "wait_for_captured_quality", return_value=capture), \
+             patch.object(backend, "persist_capture", return_value=102) as save:
+            backend._save_automatic_egg_cycles()
+        saved = save.call_args.args[1]
+        self.assertEqual(saved["quality"], "Good")
+        self.assertIs(saved["quality_verified"], True)
+        self.assertEqual(saved["confidence"], 0.94)
 
     def test_stable_weight_is_not_recorded_before_size_sort_confirmation(self):
         with patch.object(backend, "Thread"):
@@ -121,8 +138,60 @@ class BackendLifecycleTests(unittest.TestCase):
         self.assertEqual([call.args[0]["capture_id"] for call in save.call_args_list], [7, 9])
         self.assertEqual([call.args[0]["cycle_id"] for call in save.call_args_list], [1, 2])
 
+    def test_automatic_fifo_missing_first_capture_can_misassociate_next_egg(self):
+        """Characterize the current protocol risk; the FIFO has no shared passage ID."""
+        self.automatic_cycle(1)
+        self.automatic_cycle(2)
+        egg_b_capture = {**self.context, "capture_id": 9, "label": "good", "confidence": 0.91}
+        with patch.object(backend.CAMERA_SESSION, "wait_for_captured_quality",
+                          side_effect=[egg_b_capture, None]), \
+             patch.object(backend, "persist_capture", return_value=101) as save:
+            backend._save_automatic_egg_cycles()
+        associations = [(call.args[0]["cycle_id"], call.args[0]["capture_id"],
+                         call.args[1]["quality_verified"])
+                        for call in save.call_args_list]
+        # This assertion records the observed unsafe result for review, not an
+        # acceptance criterion: Egg B's capture is presented as verified for A.
+        self.assertEqual(associations[0], (1, 9, True))
+        self.assertFalse(associations[1][2])
+
+    def test_automatic_delayed_first_capture_can_shift_to_second_cycle(self):
+        self.automatic_cycle(1)
+        self.automatic_cycle(2)
+        egg_a_capture = {**self.context, "capture_id": 7, "label": "good", "confidence": 0.92}
+        with patch.object(backend.CAMERA_SESSION, "wait_for_captured_quality",
+                          side_effect=[None, egg_a_capture]), \
+             patch.object(backend, "persist_capture", return_value=101) as save:
+            backend._save_automatic_egg_cycles()
+        associations = [(call.args[0]["cycle_id"], call.args[0]["capture_id"],
+                         call.args[1]["quality_verified"])
+                        for call in save.call_args_list]
+        # A's late capture is consumed for B because matching is FIFO-only.
+        self.assertFalse(associations[0][2])
+        self.assertEqual(associations[1], (2, 7, True))
+
+    def test_duplicate_and_stale_automatic_cycle_events_are_ignored(self):
+        self.automatic_cycle(1)
+        with patch.object(backend.CAMERA_SESSION, "wait_for_captured_quality", return_value=None), \
+             patch.object(backend, "persist_capture", return_value=101) as save, \
+             patch.object(backend, "Thread"):
+            backend._save_automatic_egg_cycles()
+        saved_count = save.call_count
+        backend.handle_esp32_event(self.event(kind="egg_detected", cycle_id=1))
+        self.assertEqual(len(backend.AUTOMATIC_EGG_CYCLES), 0)
+        self.assertEqual(save.call_count, saved_count)
+
+        # A delayed event from the old bridge connection cannot create a cycle
+        # after the active connection epoch has advanced.
+        backend.BRIDGE_EPOCH = 2
+        stale = self.event(kind="egg_detected", cycle_id=2, connection_epoch=1)
+        backend.handle_esp32_event(stale)
+        self.assertEqual(len(backend.AUTOMATIC_EGG_CYCLES), 0)
+
     def event(self, kind="sort_complete", **fields):
-        return {**self.context, "type": kind, "size": "Medium", **fields}
+        # pending() uses a 52 g egg, which classifies as Small. Keep the
+        # default confirmation fixture consistent with its measured payload.
+        return {**self.context, "type": kind, "size": "Small", **fields}
 
     def test_automatic_handshake_disables_obsolete_camera_authorization(self):
         with patch.object(backend, "Thread") as worker:
@@ -144,6 +213,147 @@ class BackendLifecycleTests(unittest.TestCase):
     def test_default_write_gate_remains_closed(self):
         with self.assertRaises(backend.CameraSessionError):
             backend.assert_lifecycle_writes_allowed()
+
+    def test_readiness_requires_frame_and_connected_controller(self):
+        context = self.lifecycle.context.to_dict()
+        self.lifecycle.state = "starting"
+        with patch.object(backend, "LIFECYCLE", self.lifecycle), \
+             patch.object(backend.CAMERA_SESSION, "status", return_value={"running": True, "frame_ready": True}), \
+             patch.object(backend.ESP32_BRIDGE, "status", return_value={"connected": False, "running": True}), \
+             patch.object(backend, "BRIDGE_READY", True):
+            backend._maybe_mark_lifecycle_ready(context)
+        self.assertEqual(self.lifecycle.state, "starting")
+        with patch.object(backend, "LIFECYCLE", self.lifecycle), \
+             patch.object(backend.CAMERA_SESSION, "status", return_value={"running": True, "frame_ready": True}), \
+             patch.object(backend.ESP32_BRIDGE, "status", return_value={"connected": True, "running": True}), \
+             patch.object(backend, "BRIDGE_READY", True):
+            backend._maybe_mark_lifecycle_ready(context)
+        self.assertEqual(self.lifecycle.state, "running")
+
+    def test_readiness_converges_when_bridge_becomes_ready_before_camera_jpeg(self):
+        context = self.lifecycle.context.to_dict()
+        self.lifecycle.state = "starting"
+        with patch.object(backend, "LIFECYCLE", self.lifecycle), \
+             patch.object(backend.CAMERA_SESSION, "status", return_value={"running": True, "frame_ready": False}), \
+             patch.object(backend.ESP32_BRIDGE, "status", return_value={"connected": True, "running": True}), \
+             patch.object(backend, "BRIDGE_READY", True):
+            backend._maybe_mark_lifecycle_ready(context)
+        self.assertEqual(self.lifecycle.state, "starting")
+
+        with patch.object(backend, "LIFECYCLE", self.lifecycle), \
+             patch.object(backend.CAMERA_SESSION, "status", return_value={"running": True, "frame_ready": True}), \
+             patch.object(backend.ESP32_BRIDGE, "status", return_value={"connected": True, "running": True}), \
+             patch.object(backend, "BRIDGE_READY", True):
+            backend._maybe_mark_lifecycle_ready(context)
+        self.assertEqual(self.lifecycle.state, "running")
+
+    def test_readiness_converges_when_camera_jpeg_precedes_bridge_ready(self):
+        context = self.lifecycle.context.to_dict()
+        self.lifecycle.state = "starting"
+        with patch.object(backend, "LIFECYCLE", self.lifecycle), \
+             patch.object(backend.CAMERA_SESSION, "status", return_value={"running": True, "frame_ready": True}), \
+             patch.object(backend.ESP32_BRIDGE, "status", return_value={"connected": False, "running": True}), \
+             patch.object(backend, "BRIDGE_READY", False):
+            backend._maybe_mark_lifecycle_ready(context)
+        self.assertEqual(self.lifecycle.state, "starting")
+
+        with patch.object(backend, "LIFECYCLE", self.lifecycle), \
+             patch.object(backend.CAMERA_SESSION, "status", return_value={"running": True, "frame_ready": True}), \
+             patch.object(backend.ESP32_BRIDGE, "status", return_value={"connected": True, "running": True}), \
+             patch.object(backend, "BRIDGE_READY", True):
+            backend._maybe_mark_lifecycle_ready(context)
+        self.assertEqual(self.lifecycle.state, "running")
+
+    def test_late_camera_ready_event_cannot_revive_timed_out_lifecycle(self):
+        context = self.lifecycle.context.to_dict()
+        self.lifecycle.state = "failed"
+        self.lifecycle.failure_reason = "Startup readiness timed out."
+        with patch.object(backend, "LIFECYCLE", self.lifecycle), \
+             patch.object(backend.CAMERA_SESSION, "status", return_value={"running": True, "frame_ready": True}), \
+             patch.object(backend.ESP32_BRIDGE, "status", return_value={"connected": True, "running": True}), \
+             patch.object(backend, "BRIDGE_READY", True):
+            backend.camera_lifecycle_event("ready", context)
+        self.assertEqual(self.lifecycle.state, "failed")
+        self.assertEqual(self.lifecycle.failure_reason, "Startup readiness timed out.")
+
+    def test_status_payload_exposes_failed_lifecycle_and_recovery(self):
+        snapshot = {"status": "failed", "recovery_required": True,
+                    "finalization_pending": False,
+                    "failure_reason": "simulated connection loss", "session_ref": "SES-test",
+                    "operator_user_id": 7}
+        with patch.object(backend, "LIFECYCLE", SimpleNamespace(snapshot=lambda: snapshot)), \
+             patch.object(backend.ESP32_BRIDGE, "status", return_value={"connected": False, "running": True}):
+            state = backend._with_lifecycle({"running": True, "frame_ready": True})
+        self.assertEqual(state["lifecycle_status"], "failed")
+        self.assertTrue(state["recovery_required"])
+        self.assertEqual(state["failure_reason"], "simulated connection loss")
+        self.assertFalse(state["physical_actuation_verified"])
+
+    def test_camera_status_route_includes_lifecycle_state(self):
+        from types import SimpleNamespace
+        lifecycle = SimpleNamespace(snapshot=lambda: {
+            "status": "failed", "recovery_required": True,
+            "finalization_pending": False,
+            "failure_reason": "camera inference failed", "session_ref": "SES-fault",
+            "operator_user_id": 7,
+        })
+        with patch.dict(backend.app.config, {"LOCAL_HARDWARE_ENABLED": True}), \
+             patch.object(backend, "LIFECYCLE", lifecycle), \
+             patch.object(backend.CAMERA_SESSION, "status", return_value={"running": True, "frame_ready": True}), \
+             patch.object(backend.ESP32_BRIDGE, "status", return_value={"connected": False, "running": True}):
+            with backend.app.test_request_context("/api/camera/status"):
+                response = backend.camera_status.__wrapped__()
+        self.assertEqual(response.get_json()["lifecycle_status"], "failed")
+        self.assertTrue(response.get_json()["recovery_required"])
+        self.assertFalse(response.get_json()["physical_actuation_verified"])
+
+    def test_stop_endpoint_runtime_refuses_success_if_software_worker_remains(self):
+        lifecycle = SimpleNamespace(context=None)
+        with patch.object(backend, "LIFECYCLE", lifecycle), \
+             patch.object(backend.CAMERA_SESSION, "status", return_value={"running": True}), \
+             patch.object(backend.ESP32_BRIDGE, "status", return_value={"running": False}), \
+             patch.object(backend, "reset_egg_flow"):
+            with self.assertRaisesRegex(backend.LifecycleError, "software worker is still running"):
+                backend.stop_sorting_runtime()
+
+    def test_connection_loss_marks_failed_and_reconnect_does_not_restart(self):
+        context = self.lifecycle.context.to_dict()
+        event = {**context, "type": "connection_lost"}
+        with patch.object(backend, "LIFECYCLE", self.lifecycle), \
+             patch.object(backend.ESP32_BRIDGE, "status", return_value={"error": "USB link lost"}), \
+             patch.object(backend, "BRIDGE_EPOCH", 3), \
+             patch.object(backend, "BRIDGE_READY", True):
+            backend.handle_esp32_event(event)
+            failed = self.lifecycle.snapshot()
+            self.assertEqual(failed["status"], "failed")
+            self.assertTrue(failed["recovery_required"])
+            backend.handle_esp32_event({**context, "type": "connection_open", "connection_epoch": 4})
+        self.assertEqual(self.lifecycle.state, "failed")
+        self.assertTrue(self.lifecycle.snapshot()["recovery_required"])
+
+    def test_start_and_stop_audit_failures_do_not_reverse_runtime_outcome(self):
+        from flask import session
+        running = {"running": True, "frame_ready": False, "lifecycle_status": "starting"}
+        stopped = {"running": False, "lifecycle_status": "completed"}
+        with patch.dict(backend.app.config, {"LOCAL_HARDWARE_ENABLED": True}), \
+             patch.object(backend, "start_sorting_runtime", return_value=(running, {"running": True})), \
+             patch.object(backend, "stop_sorting_runtime", return_value=(stopped, {"running": False})), \
+             patch.object(backend, "write_audit_log", side_effect=RuntimeError("audit unavailable")), \
+             patch.object(backend.db.session, "rollback") as rollback, \
+             patch.object(backend.app.logger, "exception"):
+            with backend.app.test_request_context("/api/camera/start", method="POST"):
+                session["user_id"] = 7
+                start_response = backend.start_camera.__wrapped__()
+            with backend.app.test_request_context("/api/camera/stop", method="POST"):
+                session["user_id"] = 7
+                stop_response = backend.stop_camera.__wrapped__()
+        self.assertEqual(start_response.status_code, 200)
+        self.assertTrue(start_response.get_json()["camera"]["running"])
+        self.assertIn("audit event could not be saved", start_response.get_json()["audit_warning"])
+        self.assertEqual(stop_response.status_code, 200)
+        self.assertFalse(stop_response.get_json()["camera"]["running"])
+        self.assertIn("audit event could not be saved", stop_response.get_json()["audit_warning"])
+        self.assertEqual(rollback.call_count, 2)
 
     def test_write_flag_alone_cannot_enable_public_writes(self):
         with patch.dict(backend.app.config, {"LIFECYCLE_WRITES_ENABLED": True}):
@@ -289,14 +499,30 @@ class BackendLifecycleTests(unittest.TestCase):
         self.assertEqual(self.lifecycle.state, "failed")
         self.assertFalse(backend._flow_is_current(backend.EGG_FLOW_SEQUENCE))
 
-    def test_invalid_weight_or_size_never_creates_pending_record(self):
+    def test_invalid_weight_rejected_and_weight_authoritative_size_mismatch_handled(self):
         for weight, size in ((-1, "Small"), (0, "Small"), (True, "Small"),
-                             (float("nan"), "Jumbo"), (52, "Large"), (52, None)):
+                             (float("nan"), "Jumbo"), (1001, "Jumbo")):
             with self.subTest(weight=weight, size=size):
                 backend.EGG_FLOW_STAGE = "measuring"
                 backend.EGG_FLOW_QUALITY = {**self.context, "label": "Good", "confidence": 0.9}
                 backend.queue_sort_after_measurement({"weight_grams": weight, "size": size})
                 self.assertIsNone(backend.EGG_FLOW_PENDING)
+        from egg_standards import classify_egg_size
+        self.assertEqual(classify_egg_size(52), "Small")
+        for controller_size in ("Large", None):
+            with self.subTest(controller_size=controller_size):
+                backend.EGG_FLOW_STAGE = "measuring"
+                backend.EGG_FLOW_PENDING = None
+                backend.EGG_FLOW_QUALITY = {
+                    **self.context, "label": "Good", "confidence": 0.9
+                }
+                backend.queue_sort_after_measurement({
+                    "weight_grams": 52, "size": controller_size
+                })
+                self.assertEqual(backend.EGG_FLOW_PENDING["weight_grams"], 52)
+                self.assertEqual(backend.EGG_FLOW_PENDING["size"], "Small")
+                self.assertEqual(backend.EGG_FLOW_PENDING["_capture_id"], 1)
+                backend.reset_egg_flow()
 
     def test_rejected_save_failure_retries_same_capture_without_duplicate(self):
         capture = {**self.context, "label": "crack", "confidence": 0.8}
@@ -363,6 +589,11 @@ class BackendLifecycleTests(unittest.TestCase):
         persist.assert_called_once()
         self.assertEqual(persist.call_args.args[1]["quality"], "Good")
         self.assertEqual(persist.call_args.args[1]["weight_grams"], 52)
+        self.assertEqual(camera.status()["egg_count"], 0)
+        camera._process_auto_capture("no egg", 0.0)
+        self.assertEqual(camera.status()["egg_count"], 0)
+        sleep(camera.passage_exit_seconds + 0.02)
+        camera._process_auto_capture("no egg", 0.0)
         self.assertEqual(camera.status()["egg_count"], 1)
 
     def test_stopped_inspection_worker_retries_same_locked_capture(self):
@@ -400,10 +631,21 @@ class BackendLifecycleTests(unittest.TestCase):
         backend.EGG_FLOW_STAGE = "measuring"
         backend.EGG_FLOW_QUALITY = {**self.context, "label": "Good", "confidence": 0.9,
                                     "_requires_capture_id": True}
+        # A measurement event cannot substitute its ID for the ID of the
+        # camera-locked capture. It may queue the active egg, but the pending
+        # record must remain associated with capture 1.
         for capture_id in (None, 2):
+            backend.EGG_FLOW_STAGE = "measuring"
+            backend.EGG_FLOW_PENDING = None
             backend.queue_sort_after_measurement({"weight_grams": 52, "size": "Small",
                                                  "capture_id": capture_id})
-            self.assertIsNone(backend.EGG_FLOW_PENDING)
+            self.assertEqual(backend.EGG_FLOW_PENDING["_capture_id"], 1)
+            self.assertEqual(backend.EGG_FLOW_PENDING["_context"]["capture_id"], 1)
+            backend.EGG_FLOW_STAGE = "sorting"
+            with patch.object(backend, "persist_capture") as persist:
+                backend.handle_esp32_event(self.event(capture_id=capture_id))
+                persist.assert_not_called()
+            self.assertEqual(backend.EGG_FLOW_PENDING["_capture_id"], 1)
         backend.queue_sort_after_measurement({"weight_grams": 52, "size": "Small", "capture_id": 1})
         with patch.object(backend, "persist_capture", return_value=101) as persist:
             backend.handle_esp32_event(self.event(capture_id=2))
@@ -449,18 +691,31 @@ class BackendLifecycleTests(unittest.TestCase):
     def test_staff_dashboard_omits_audit_panel_and_api_data(self):
         egg_query = Mock()
         egg_query.count.return_value = 0
+        egg_query.filter.return_value = egg_query
+        egg_query.order_by.return_value = egg_query
+        egg_query.all.return_value = []
+        egg_query.first.return_value = None
         egg_query.order_by.return_value.first.return_value = None
         egg_query.filter.return_value.all.return_value = []
         egg_query.filter_by.return_value.count.return_value = 0
         tray_query = Mock()
         tray_query.filter_by.return_value.count.return_value = 0
+        tray_progress_query = Mock()
+        tray_progress_query.order_by.return_value.all.return_value = []
         audit_query = Mock()
+        audit_query.filter.return_value = audit_query
+        audit_query.order_by.return_value = audit_query
+        audit_query.limit.return_value = audit_query
+        audit_query.all.return_value = [
+            SimpleNamespace(to_dict=lambda: {"event_type": "login"})
+        ]
         audit_query.order_by.return_value.limit.return_value.all.return_value = [
             SimpleNamespace(to_dict=lambda: {"event_type": "login"})
         ]
         with backend.app.test_request_context("/api/dashboard/stats"), \
              patch.object(backend.EggRecord, "query", egg_query), \
              patch.object(backend.TraySizeAlert, "query", tray_query), \
+             patch.object(backend.TraySizeProgress, "query", tray_progress_query), \
              patch.object(backend.AuditLog, "query", audit_query), \
              patch.object(backend.db.session, "query") as aggregate_query, \
              patch.object(backend.ESP32_BRIDGE, "status", return_value={}):

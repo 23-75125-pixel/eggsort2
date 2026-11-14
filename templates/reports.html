@@ -395,6 +395,7 @@
                   <th class="py-3 px-5">GOOD</th>
                   <th class="py-3 px-5">CRACK</th>
                   <th class="py-3 px-5">ROTTEN</th>
+                  <th class="py-3 px-5">NOT CLASSIFIED</th>
                   <th class="py-3 px-5">LEGACY/OTHER</th>
                 </tr>
               </thead>
@@ -475,7 +476,7 @@ function renderReportRows(rows) {
   if (!rows.length) {
     const row = document.createElement('tr');
     const cell = document.createElement('td');
-    cell.colSpan = 6;
+    cell.colSpan = 7;
     cell.className = 'py-12 px-5 text-center text-secondary';
     cell.textContent = 'No sorting records match this date range.';
     row.appendChild(cell);
@@ -491,6 +492,7 @@ function renderReportRows(rows) {
       entry.good,
       entry.crack,
       entry.rotten,
+      entry.not_classified,
       entry.other
     ].forEach((value) => {
       const cell = document.createElement('td');

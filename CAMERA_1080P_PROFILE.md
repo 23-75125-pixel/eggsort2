@@ -49,7 +49,7 @@ Thirty FPS remains a request, not a startup guarantee. Compare actual
 `rates_per_s.captures`/`jpegs` over sustained windows; these rates include the
 existing annotation/encoding workload, unlike the standalone probe. Prediction
 throughput will be lower than capture throughput. All existing performance,
-passage diagnostics remain available independently. Experimental observation exports are excluded from this release.
+passage diagnostics and reject-observation exports remain available independently.
 
 Check framing, candling, blur and visible cracks on representative Good, Crack
 and Rotten eggs before a longer trial. Even with unchanged normalized zone

@@ -42,10 +42,13 @@ class Query:
     def delete(self, **kwargs): raise AssertionError("Audit deletion is forbidden")
 
 
-def record(identifier, stamp, quality="Good", size="Small"):
-    row = NS(id=identifier, sorted_at=datetime.fromisoformat(stamp), quality=quality, size=size)
+def record(identifier, stamp, quality="Good", size="Small", quality_verified=None):
+    row = NS(id=identifier, sorted_at=datetime.fromisoformat(stamp), quality=quality,
+             size=size, quality_verified=quality_verified)
     row.to_dict = lambda: {"id": identifier, "weight_grams": 50 if quality == "Good" else None,
-                           "size": size, "sorted_at": row.sorted_at.isoformat()}
+                           "size": size, "quality": quality,
+                           "quality_verified": quality_verified,
+                           "sorted_at": row.sorted_at.isoformat()}
     return row
 
 
@@ -144,6 +147,93 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(data["quality_counts"], {"Good": 1, "Crack": 1, "Rotten": 1})
         self.assertEqual(sum(data["size_counts"].values()), data["total_sorted"])
         self.assertEqual(sum(r["count"] for r in data["daily_trend"]), data["total_sorted"])
+
+    def test_not_classified_is_reported_separately_and_not_counted_as_defect(self):
+        stamp = "2026-10-29T00:00:00+00:00"
+        self.records.extend([
+            record(1, stamp, "Not Classified", "Medium", quality_verified=False),
+            record(2, stamp, "Crack", "N/A", quality_verified=True),
+        ])
+        dashboard = self.stats().get_json()
+        self.assertEqual(dashboard["not_classified_count"], 1)
+        self.assertEqual(dashboard["quality_counts"]["Not Classified"], 1)
+        self.assertEqual(dashboard["verification_by_quality"]["Not Classified"],
+                         {"verified": 0, "unverified": 1, "unknown": 0})
+        self.egg.query = Query(self.records)
+        summary = self.client.get("/api/reports").get_json()["summary"]
+        self.assertEqual(summary["not_classified"], 1)
+        self.assertEqual(summary["other"], 0)
+        self.assertEqual(summary["defects"], 2)
+        self.assertEqual(summary["recorded_good_rate"], 0.0)
+
+    def test_quality_verification_counts_do_not_promote_false_or_null_to_verified(self):
+        stamp = "2026-10-29T00:00:00+00:00"
+        self.records.extend([
+            record(1, stamp, "Good", quality_verified=True),
+            record(2, stamp, "Good", quality_verified=False),
+            record(5, stamp, "Good", quality_verified=None),
+            record(3, stamp, "Crack", quality_verified=True),
+            record(4, stamp, "Rotten", quality_verified=True),
+        ])
+        data = self.stats().get_json()
+        self.assertEqual(data["good_verification_counts"],
+                         {"verified": 1, "unverified": 1, "unknown": 1})
+        self.assertEqual(data["quality_verification_counts"],
+                         {"verified": 3, "unverified": 1, "unknown": 1})
+        self.assertEqual(data["verification_by_quality"]["Good"],
+                         {"verified": 1, "unverified": 1, "unknown": 1})
+        self.assertEqual(data["verification_by_quality"]["Crack"],
+                         {"verified": 1, "unverified": 0, "unknown": 0})
+        self.assertEqual(data["verification_by_quality"]["Rotten"],
+                         {"verified": 1, "unverified": 0, "unknown": 0})
+        self.assertEqual((data["verified_good_count"], data["verified_quality_total"],
+                          data["verified_good_rate"]), (1, 3, 33.3))
+        # The old all-record statistic remains available without changing its meaning.
+        self.assertEqual((data["good_count"], data["recorded_good_rate"],
+                          data["quality_rate"]), (3, 60.0, 60.0))
+        self.assertIsNone(data["latest_record"]["quality_verified"])
+
+    def test_reports_split_good_verification_and_keep_historical_rate(self):
+        stamp = "2026-10-29T00:00:00+00:00"
+        self.records.extend([
+            record(1, stamp, "Good", quality_verified=True),
+            record(2, stamp, "Good", quality_verified=False),
+            record(3, stamp, "Good", quality_verified=None),
+            record(4, stamp, "Crack", quality_verified=True),
+            record(5, stamp, "Rotten", quality_verified=True),
+        ])
+        self.egg.query = Query(self.records)
+        response = self.client.get("/api/reports")
+        self.assertEqual(response.status_code, 200)
+        summary = response.get_json()["summary"]
+        self.assertEqual(summary["good_verification_counts"],
+                         {"verified": 1, "unverified": 1, "unknown": 1})
+        self.assertEqual(summary["verification_counts"],
+                         {"verified": 3, "unverified": 1, "unknown": 1})
+        self.assertEqual(summary["verification_by_quality"]["Good"],
+                         {"verified": 1, "unverified": 1, "unknown": 1})
+        self.assertEqual(summary["verification_by_quality"]["Crack"],
+                         {"verified": 1, "unverified": 0, "unknown": 0})
+        self.assertEqual(summary["verification_by_quality"]["Rotten"],
+                         {"verified": 1, "unverified": 0, "unknown": 0})
+        self.assertEqual((summary["verified_good"], summary["verified_quality_total"],
+                          summary["verified_good_rate"]), (1, 3, 33.3))
+        self.assertEqual((summary["good"], summary["recorded_good_rate"],
+                          summary["quality_rate"]), (3, 60.0, 60.0))
+
+    def test_quality_verification_is_explained_in_user_views(self):
+        with self.client:
+            dashboard = self.client.get("/dashboard").get_data(as_text=True)
+            records = self.client.get("/egg-records").get_data(as_text=True)
+            reports = self.client.get("/reports").get_data(as_text=True)
+        self.assertIn("Verified Good Rate", dashboard)
+        self.assertIn("Legacy/Unknown", records)
+        self.assertIn("Verification", records)
+        self.assertIn("<option>Not Classified</option>", records)
+        self.assertIn("Verified Good Rate", reports)
+        self.assertIn("NOT CLASSIFIED", reports)
+        self.assertIn("that category is not a confirmed defect", reports)
+        self.assertIn("GOOD VERIFICATION (V / U / L)", reports)
 
     def test_cumulative_trays_are_not_filtered_or_mutated(self):
         tray = NS(egg_size="Small", completed_milestones=8, to_dict=lambda: {"egg_size": "Small", "completed_milestones": 8})

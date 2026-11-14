@@ -15,6 +15,13 @@
    SUPABASE_DB_URL=postgresql://postgres.PROJECT_REF:PASSWORD@HOST:5432/postgres?sslmode=require
    ```
 
+On this branch, production startup is explicitly gated. For the trusted local
+sorting computer only, add `EGGSOR_PRODUCTION_DB_MODE=1` and
+`EGGSOR_PRODUCTION_SORTING_ENABLED=1` to `.env` after the production schema
+preflight is complete. These flags permit real sorting-session and egg-record
+writes to Supabase. Do not enable them on disposable test environments or
+public hosted dashboard services.
+
 4. Install the PostgreSQL driver:
 
    ```powershell

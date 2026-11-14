@@ -343,6 +343,10 @@
     let alertsRequestPending = false;
     let alertsRefreshQueued = false;
 
+    function isValidUnreadCount(value) {
+      return Number.isSafeInteger(value) && value >= 0;
+    }
+
     function formatAlertTime(value) {
       const date = new Date(value);
       if (Number.isNaN(date.getTime())) return '';
@@ -370,15 +374,16 @@
           `/api/alerts/${encodeURIComponent(alert.id)}/read`,
           { method: 'POST' }
         );
+        if (result.ok !== true) {
+          throw new Error('The server returned an invalid acknowledgement response. Please try again.');
+        }
         const currentAlert = alertRows.find((row) => row.id === alert.id);
         if (currentAlert) currentAlert.is_read = true;
-        const currentUnreadCount = Number(unreadCount.textContent) || 0;
-        const confirmedUnreadCount = Number.isFinite(Number(result.unread_count))
-          ? Number(result.unread_count)
-          : Math.max(0, currentUnreadCount - 1);
-        unreadCount.textContent = confirmedUnreadCount;
-        window.__eggsorUnreadCount = confirmedUnreadCount;
-        window.EggSortUnreadBadge?.update(confirmedUnreadCount);
+        if (isValidUnreadCount(result.unread_count)) {
+          unreadCount.textContent = result.unread_count;
+          window.__eggsorUnreadCount = result.unread_count;
+          window.EggSortUnreadBadge?.update(result.unread_count);
+        }
         renderAlerts();
         await fetchAlerts(true);
       } catch (error) {
@@ -516,13 +521,13 @@
         if (!response.ok) throw new Error('Unable to load alerts');
         const data = await response.json();
         if (requestedFilter !== activeFilter) return;
-        alertRows = data.alerts || [];
-        const confirmedUnreadCount = Number(data.unread_count);
-        if (Number.isFinite(confirmedUnreadCount) && confirmedUnreadCount >= 0) {
-          unreadCount.textContent = confirmedUnreadCount;
-          window.__eggsorUnreadCount = confirmedUnreadCount;
-          window.EggSortUnreadBadge?.update(confirmedUnreadCount);
+        if (!data || !Array.isArray(data.alerts) || !isValidUnreadCount(data.unread_count)) {
+          throw new Error('The server returned an invalid alerts response. Please retry.');
         }
+        alertRows = data.alerts;
+        unreadCount.textContent = data.unread_count;
+        window.__eggsorUnreadCount = data.unread_count;
+        window.EggSortUnreadBadge?.update(data.unread_count);
         hasLoadedAlerts = true;
         loadedFilter = requestedFilter;
         alertsError.classList.add('hidden');
@@ -558,11 +563,13 @@
         confirmButtonText: 'Mark All as Read', success: 'All alerts marked as read.',
         action: async () => {
           const result = await EggSortAlerts.request('/api/alerts/read-all', { method: 'POST' });
-          const confirmedUnreadCount = Number(result.unread_count);
-          if (Number.isFinite(confirmedUnreadCount) && confirmedUnreadCount >= 0) {
-            unreadCount.textContent = confirmedUnreadCount;
-            window.__eggsorUnreadCount = confirmedUnreadCount;
-            window.EggSortUnreadBadge?.update(confirmedUnreadCount);
+          if (result.ok !== true) {
+            throw new Error('The server returned an invalid acknowledgement response. Please try again.');
+          }
+          if (isValidUnreadCount(result.unread_count)) {
+            unreadCount.textContent = result.unread_count;
+            window.__eggsorUnreadCount = result.unread_count;
+            window.EggSortUnreadBadge?.update(result.unread_count);
           }
           await fetchAlerts(true);
         },

@@ -125,6 +125,28 @@ class Esp32BridgeDiagnosticsTests(unittest.TestCase):
         self.assertEqual(connection.write.call_args_list, [call(b"STATUS\n")] * 2)
         connection.close.assert_called_once()
 
+    def test_connection_loss_after_explicit_stop_does_not_publish_failure_callback(self) -> None:
+        bridge = Esp32Bridge()
+        events = []
+        bridge.set_event_handler(events.append)
+        connection = Mock()
+
+        def stopped_read():
+            bridge.stop()
+            raise OSError("serial handle closed by stop")
+
+        connection.readline.side_effect = stopped_read
+        serial_module = Mock()
+        serial_module.Serial.return_value = connection
+        with patch.dict("sys.modules", {"serial": serial_module}), \
+                patch.object(bridge, "_find_port", return_value="COM_TEST"), \
+                patch.object(bridge, "_request_hardware_status"):
+            bridge._read_loop()
+
+        self.assertNotIn("connection_lost", [event.get("type") for event in events])
+        self.assertIn("serial handle closed by stop", bridge.status()["error"])
+        connection.close.assert_called_once()
+
     def test_egg_detected_discards_idle_zero_and_accepts_new_live_weight(self) -> None:
         bridge = Esp32Bridge()
         connection = Mock()
@@ -157,6 +179,43 @@ class Esp32BridgeDiagnosticsTests(unittest.TestCase):
         bridge._publish({"type": "load_cell_status", "weight_grams": 0})
         bridge._publish({"type": "egg_detected", "message": "Egg Detected"})
         self.assertIsNone(bridge.status()["diagnostics"]["live_weight_grams"])
+
+    def test_idle_load_cell_noise_stays_zero_and_firmware_zero_is_visible(self) -> None:
+        bridge = Esp32Bridge()
+        bridge._publish({"type": "egg_left", "message": "Egg Left"})
+        bridge._publish({"type": "load_cell_status", "weight_grams": -13})
+        bridge._publish({"type": "load_cell_status", "weight_grams": 8})
+
+        diagnostics = bridge.status()["diagnostics"]
+        self.assertTrue(diagnostics["awaiting_egg"])
+        self.assertEqual(diagnostics["live_weight_grams"], 0)
+        self.assertIsNone(diagnostics["measurement_weight_grams"])
+        self.assertIsNone(diagnostics["final_weight_grams"])
+        self.assertNotIn("-13", diagnostics["latest_sensor_event"])
+
+        bridge._publish({"type": "weight_reading", "weight_grams": 0})
+        diagnostics = bridge.status()["diagnostics"]
+        self.assertEqual(diagnostics["live_weight_grams"], 0)
+        self.assertEqual(diagnostics["latest_sensor_event"], "Load cell empty: 0 g")
+        self.assertIsNone(diagnostics["measurement_weight_grams"])
+
+    def test_active_weight_telemetry_remains_unchanged(self) -> None:
+        bridge = Esp32Bridge()
+        bridge._publish({"type": "egg_detected", "cycle_id": 2})
+        bridge._publish({"type": "measurement_quality", "quality": "Good"})
+        bridge._publish({
+            "type": "weight_reading",
+            "weight_grams": -13,
+            "reading_number": 1,
+        })
+
+        diagnostics = bridge.status()["diagnostics"]
+        self.assertEqual(diagnostics["live_weight_grams"], -13)
+        self.assertEqual(diagnostics["measurement_weight_grams"], -13)
+        self.assertIsNone(diagnostics["final_weight_grams"])
+
+        bridge._publish({"type": "final_weight", "weight_grams": 64})
+        self.assertEqual(bridge.status()["diagnostics"]["final_weight_grams"], 64)
 
     def test_disconnected_and_missing_board_have_distinct_errors(self) -> None:
         bridge = Esp32Bridge()

@@ -17,8 +17,8 @@
   });
 
   function updateBadge(unreadCount) {
-    const count = Number(unreadCount);
-    if (!Number.isFinite(count) || count < 0) return;
+    if (!Number.isSafeInteger(unreadCount) || unreadCount < 0) return;
+    const count = unreadCount;
 
     badges.forEach((badge) => {
       badge.textContent = count > 99 ? '99+' : String(count);
@@ -49,10 +49,10 @@
       const response = await fetch('/api/alerts?filter=unread', { cache: 'no-store' });
       if (!response.ok) throw new Error(`Unread alert refresh failed (${response.status})`);
       const data = await response.json();
-      if (!Number.isFinite(Number(data.unread_count)) || Number(data.unread_count) < 0) {
+      if (!Number.isSafeInteger(data.unread_count) || data.unread_count < 0) {
         throw new Error('Unread alert response did not include a valid count');
       }
-      updateBadge(Number(data.unread_count));
+      updateBadge(data.unread_count);
     } catch (error) {
       // Keep the last confirmed count. A failed refresh must not look like zero.
       console.warn('Could not refresh the unread alert badge.', error);

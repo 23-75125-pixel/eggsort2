@@ -126,9 +126,10 @@ class InitializationTests(unittest.TestCase):
         inspector.get_pk_constraint.side_effect = lambda name, **kwargs: {
             "constrained_columns": [c.name for c in db.metadata.tables[name].primary_key.columns]}
         def fks(name, **kwargs):
-            return [{"name": c.name, "constrained_columns": [c.elements[0].parent.name],
+            return [{"name": c.name,
+                     "constrained_columns": [element.parent.name for element in c.elements],
                      "referred_table": c.elements[0].column.table.name,
-                     "referred_columns": [c.elements[0].column.name],
+                     "referred_columns": [element.column.name for element in c.elements],
                      "referred_schema": "public", "options": {"ondelete": c.ondelete}}
                     for c in db.metadata.tables[name].foreign_key_constraints]
         inspector.get_foreign_keys.side_effect = fks
