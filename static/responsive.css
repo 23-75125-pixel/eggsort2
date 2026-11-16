@@ -452,6 +452,19 @@ body:has(#dashboard-tray-progress) main > div > .grid:first-child > div > div:la
   text-align: right;
 }
 
+/* Keep the explanatory copy on the tray and quality cards readable. */
+body:has(#dashboard-tray-progress) main > div > .grid:first-child > div:nth-child(2) > div:last-child,
+body:has(#dashboard-tray-progress) main > div > .grid:first-child > div:nth-child(3) > div:last-child {
+  align-items: flex-start;
+  width: 100%;
+}
+
+body:has(#dashboard-tray-progress) main > div > .grid:first-child > div:nth-child(2) > div:last-child p,
+body:has(#dashboard-tray-progress) main > div > .grid:first-child > div:nth-child(3) > div:last-child p {
+  max-width: 100%;
+  text-align: left;
+}
+
 body:has(#dashboard-tray-progress) main section[aria-labelledby="dashboard-tray-progress-title"],
 body:has(#dashboard-tray-progress) main > div > .grid:nth-child(3) > div,
 body:has(#dashboard-tray-progress) main > div > div.bg-white.rounded-2xl {

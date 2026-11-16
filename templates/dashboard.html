@@ -309,7 +309,6 @@
                 0
               </h3>
               <p class="font-caption text-caption text-secondary mt-1 w-full max-w-full break-words leading-4">Based on 30 eggs per tray.</p>
-              <p id="dashboard-trays-note" class="font-caption text-caption text-secondary mt-1 w-full max-w-full break-words leading-4">All-time estimate · Not date-filtered.</p>
             </div>
           </div>
           <!-- Card 3 -->
@@ -334,7 +333,6 @@
                 0%
               </h3>
               <p class="font-caption text-caption text-secondary mt-1 w-full max-w-full break-words leading-4">Good eggs confirmed by camera</p>
-              <p id="dashboard-quality-note" class="font-caption text-caption text-secondary mt-1 w-full max-w-full break-words leading-4">Of quality-verified eggs</p>
             </div>
           </div>
           <!-- Card 4 -->
@@ -809,8 +807,6 @@
             : 'No eggs sorted in this date range';
         document.getElementById('dashboard-trays').textContent = stats.trays_completed;
         const trayProgress = stats.tray_progress || [];
-        document.getElementById('dashboard-trays-note').textContent =
-          'All-time estimate · Not date-filtered.';
         const trayKey = JSON.stringify(trayProgress);
         if (trayKey !== renderedSections.trayProgress) {
           renderTrayProgress(trayProgress);

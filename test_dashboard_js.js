@@ -48,7 +48,7 @@ function build(fetchImpl, width = 1280) {
   for (const id of ['sidebar', 'sidebar-overlay', 'dashboard-tray-progress', 'dashboard-daily-trend',
     'refresh-dashboard', 'refresh-dashboard-icon', 'dashboard-status-text', 'dashboard-status-dot',
     'dashboard-message', 'dashboard-total-sorted', 'dashboard-total-note', 'dashboard-trays',
-    'dashboard-trays-note', 'dashboard-quality-rate', 'dashboard-quality-note', 'dashboard-non-good',
+    'dashboard-quality-rate', 'dashboard-non-good',
     'dashboard-size-distribution']) {const element = new Element(); element.id = id;}
   class FixedDate extends Date {constructor(...args) {super(...(args.length ? args : ['2026-10-29T03:00:00Z']));}}
   const document = {getElementById: (id) => ids.get(id) || null, createElement: () => new Element()};
@@ -153,8 +153,6 @@ test('dashboard distinguishes verified Good rate from historical Good labels', a
   })));
   await settle();
   assert.equal(ui.ids.get('dashboard-quality-rate').textContent, '50%');
-  assert.match(ui.ids.get('dashboard-quality-note').textContent,
-    /Good 1\/1\/1; Crack 1\/0\/0; Rotten 1\/0\/0; Not Classified 0\/0\/0; Other 0\/0\/0\. 0 Not Classified records are included in Non-Good total\. Historical Good rate: 60%/);
 });
 
 test('empty and sparse trends explain their scope and show actual dates', async () => {

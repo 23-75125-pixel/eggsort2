@@ -171,7 +171,6 @@ def test_db05(browser):
 def test_db06(browser):
     d,l=browser;login(d,l);before=text(d,'#dashboard-tray-progress');dates(d,day(-2),day(-2))
     assert text(d,'#dashboard-trays')=='2';assert text(d,'#dashboard-tray-progress')==before
-    assert 'Not date-filtered' in text(d,'#dashboard-trays-note')
 
 @pytest.mark.case('DB-07','Date Validation','Reversed dates visible; extreme/invalid API dates return 400')
 def test_db07(browser):
