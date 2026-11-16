@@ -126,6 +126,29 @@
         font-variation-settings: "FILL" 1;
       }
       .nav-active-glow { box-shadow: -4px 0 0 0 theme("colors.primary-container") inset; }
+      @page { size: A4 portrait; margin: 16mm 13mm 18mm; @bottom-right { content: "Page " counter(page); font: 9pt Arial, sans-serif; color: #526052; } }
+      @media print {
+        html, body { width: 100%; min-height: 0 !important; margin: 0 !important; background: #fff !important; color: #202820 !important; font: 9pt Arial, sans-serif !important; }
+        body { display: block !important; }
+        #sidebar, #sidebar-overlay, body > main > header, #report-controls, #report-status, #report-updated-at { display: none !important; }
+        main { display: block !important; margin: 0 !important; min-height: 0 !important; overflow: visible !important; background: #fff !important; }
+        .report-print-header { display: block !important; margin: 0 0 12mm; padding-bottom: 5mm; border-bottom: 2px solid #3e6248; }
+        .report-print-header h1 { font-size: 20pt; margin: 0 0 2mm; }
+        .report-print-header p { margin: 1mm 0; color: #435047; }
+        .report-content { width: 100% !important; max-width: none !important; margin: 0 !important; padding: 0 !important; }
+        .report-content > :nth-child(1) { display: none !important; }
+        .report-kpis { display: grid !important; grid-template-columns: repeat(4, 1fr) !important; gap: 3mm !important; margin-bottom: 7mm !important; }
+        .report-kpis > div { height: auto !important; min-height: 22mm; padding: 3mm !important; border: 1px solid #cbd3ca !important; box-shadow: none !important; break-inside: avoid; }
+        .report-table-card { overflow: visible !important; border: 0 !important; box-shadow: none !important; }
+        .report-table-card > div:first-child { padding: 0 0 3mm !important; border: 0 !important; }
+        .report-table-card .overflow-x-auto { overflow: visible !important; }
+        table { width: 100% !important; table-layout: fixed !important; font-size: 8pt !important; }
+        thead { display: table-header-group; }
+        tr { break-inside: avoid; }
+        th, td { padding: 2mm 1.5mm !important; border: 1px solid #cbd3ca !important; overflow-wrap: anywhere; }
+        th { background: #eaf0e8 !important; color: #202820 !important; }
+      }
+      @media screen { .report-print-header { display: none; } }
     </style>
     <link rel="stylesheet" href="/static/responsive.css" />
     <meta name="csrf-token" content="{{ csrf_token() }}" />
@@ -201,6 +224,12 @@
     <main
       class="flex-1 md:ml-64 flex flex-col min-h-screen bg-background relative overflow-hidden"
     >
+      <section class="report-print-header" aria-hidden="true">
+        <h1>EGGSor+ <span style="font-weight:400">| Roxas Farm</span></h1>
+        <p id="print-report-title">Daily Report</p>
+        <p id="print-report-range">Reporting period: —</p>
+        <p id="print-report-generated">Generated: —</p>
+      </section>
       <!-- Header -->
       <header
         class="w-full min-h-20 sticky top-0 z-30 bg-surface dark:bg-surface-dim flex flex-col sm:flex-row justify-between items-stretch sm:items-center gap-3 px-margin py-3 border-b border-surface-variant/50"
@@ -235,10 +264,10 @@
       </header>
       <!-- Content Canvas -->
       <div
-        class="p-margin flex-1 max-w-7xl w-full mx-auto space-y-6 relative z-10"
+        class="report-content p-margin flex-1 max-w-7xl w-full mx-auto space-y-6 relative z-10"
       >
         <!-- Filters & Controls -->
-        <div
+        <div id="report-controls"
           class="bg-surface-container-lowest rounded-xl border border-surface-variant p-4 sm:p-6 shadow-[0_4px_20px_rgba(0,0,0,0.02)]"
         >
           <div class="flex flex-col md:flex-row gap-6 items-end">
@@ -316,7 +345,7 @@
             class="mt-4 hidden text-sm font-medium"></p>
         </div>
         <!-- KPI Cards -->
-        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
+        <div class="report-kpis grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
           <!-- Card 1 -->
           <div
             class="bg-surface-container-lowest border border-surface-variant rounded-lg p-4 sm:p-5 shadow-[0_2px_10px_rgba(0,0,0,0.01)] flex flex-col justify-between h-[104px]"
@@ -371,14 +400,13 @@
           </div>
         </div>
         <!-- Main Data Table -->
-        <div
-          class="bg-surface-container-lowest border border-surface-variant rounded-xl shadow-[0_4px_20px_rgba(0,0,0,0.02)] overflow-hidden"
+        <div class="report-table-card bg-surface-container-lowest border border-surface-variant rounded-xl shadow-[0_4px_20px_rgba(0,0,0,0.02)] overflow-hidden"
         >
           <div
             class="p-4 sm:p-6 border-b border-surface-variant flex justify-between items-start"
           >
             <div>
-              <h3 class="text-body-lg font-body-lg font-bold text-on-surface">
+              <h3 id="report-title" class="text-body-lg font-body-lg font-bold text-on-surface">
                 Daily Report
               </h3>
               <p id="report-description" class="text-caption font-caption text-secondary mt-1">
@@ -451,6 +479,17 @@ function flashRefreshSuccess() {
 
 function formatRefreshTimestamp(date = new Date()) {
   return date.toLocaleString([], { dateStyle: 'medium', timeStyle: 'medium' });
+}
+
+function updatePrintReportMetadata() {
+  const sampling = reportSampling.value;
+  const title = `${sampling} Report`;
+  document.getElementById('report-title').textContent = title;
+  document.getElementById('print-report-title').textContent = title;
+  document.getElementById('print-report-range').textContent =
+    `Reporting period: ${sampling} | ${reportStart.value || '—'} through ${reportEnd.value || '—'}`;
+  document.getElementById('print-report-generated').textContent =
+    `Generated: ${formatRefreshTimestamp()}`;
 }
 
 /* Formats a Date as YYYY-MM-DD in the viewer's own timezone. The previous
@@ -541,6 +580,7 @@ async function refreshReport(options = {}) {
     document.getElementById('report-quality-rate').textContent = `${payload.summary.quality_rate}%`;
     document.getElementById('report-description').textContent =
       `${reportSampling.value} totals from ${reportStart.value} through ${reportEnd.value}.`;
+    updatePrintReportMetadata();
     const reportRowsKey = JSON.stringify(payload.rows || []);
     if (reportRowsKey !== renderedReportRowsKey) {
       renderReportRows(payload.rows || []);
@@ -565,6 +605,7 @@ async function refreshReport(options = {}) {
 }
 
 setDefaultReportDates();
+updatePrintReportMetadata();
 refreshButton.addEventListener('click', () => refreshReport({ manual: true }));
 document.getElementById('print-report').addEventListener('click', () => window.print());
 reportSampling.addEventListener('change', () => refreshReport({ manual: true }));

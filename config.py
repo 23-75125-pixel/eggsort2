@@ -156,6 +156,22 @@ def production_database_url(value: str) -> Any:
 
 def build_app_config() -> dict[str, Any]:
     """Build Flask configuration from validated environment values."""
+    app_profile = env_text("EGGSORT_PROFILE", "ngrok").lower()
+    if app_profile not in {"ngrok", "local"}:
+        raise ConfigurationError("EGGSORT_PROFILE must be 'ngrok' or 'local'.")
+    default_port = 5001 if app_profile == "local" else 5000
+    app_port = env_int("PORT", default_port, minimum=1, maximum=65535)
+    if app_profile == "local":
+        public_base_url = (
+            env_text("PUBLIC_BASE_URL_LOCAL") or "http://127.0.0.1:5001"
+        )
+    else:
+        public_base_url = (
+            env_text("PUBLIC_BASE_URL_NGROK")
+            or env_text("PUBLIC_BASE_URL")
+            or env_text("RENDER_EXTERNAL_URL")
+        )
+    public_base_url = public_base_url.rstrip("/")
     local_test_mode = env_bool("LOCAL_TEST_MODE", False)
     write_test_mode = env_bool("PHASE2B_WRITE_TEST_MODE", False)
     production_mode = env_bool("EGGSOR_PRODUCTION_DB_MODE", False)
@@ -167,9 +183,6 @@ def build_app_config() -> dict[str, Any]:
     production_url = production_database_url(
         env_text("SUPABASE_DB_URL") or env_text("DATABASE_URL")
     ) if production_mode else None
-    public_base_url = (
-        env_text("PUBLIC_BASE_URL") or env_text("RENDER_EXTERNAL_URL")
-    ).rstrip("/")
     secret_key = env_text("SECRET_KEY")
     if not secret_key or secret_key == PLACEHOLDER_SECRET:
         secret_key = secrets.token_hex(32)
@@ -222,6 +235,8 @@ def build_app_config() -> dict[str, Any]:
         "ADMIN_EMAIL": env_text("ADMIN_EMAIL", "admin@example.com").lower(),
         "ADMIN_GOOGLE_SUB": env_text("ADMIN_GOOGLE_SUB"),
         "PUBLIC_BASE_URL": public_base_url,
+        "EGGSORT_PROFILE": app_profile,
+        "PORT": app_port,
         "GOOGLE_AUTH_CLOCK_SKEW_SECONDS": env_int(
             "GOOGLE_AUTH_CLOCK_SKEW_SECONDS", 120, minimum=0, maximum=600
         ),
@@ -275,8 +290,16 @@ def build_app_config() -> dict[str, Any]:
                 "dbname": "postgres", "sslmode": "require", "connect_timeout": 5,
             }},
         )
-    if public_base_url.startswith("https://"):
-        public_host = urlsplit(public_base_url).hostname
-        if public_host:
-            config["TRUSTED_HOSTS"] = [public_host]
+    trusted_hosts: list[str] = []
+    for base_url in (
+        public_base_url,
+        env_text("PUBLIC_BASE_URL_NGROK"),
+        env_text("PUBLIC_BASE_URL_LOCAL"),
+        env_text("PUBLIC_BASE_URL"),
+    ):
+        host = urlsplit(base_url).hostname if base_url else None
+        if host and host not in trusted_hosts:
+            trusted_hosts.append(host)
+    if trusted_hosts:
+        config["TRUSTED_HOSTS"] = trusted_hosts
     return config

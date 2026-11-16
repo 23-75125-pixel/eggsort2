@@ -912,6 +912,7 @@ body:has(#egg-records-body) label:has(> #end-date-filter) {
 body:has(#egg-records-body) #search-records,
 body:has(#egg-records-body) #reset-record-filters,
 body:has(#egg-records-body) #export-records,
+body:has(#egg-records-body) #export-excel-records,
 body:has(#egg-records-body) #print-records {
   min-height: 2.8rem;
   border-radius: 12px !important;

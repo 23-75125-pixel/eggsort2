@@ -2,6 +2,7 @@ import hashlib
 import ipaddress
 import secrets
 import smtplib
+from io import BytesIO
 from datetime import datetime, time, timedelta, timezone
 from email.message import EmailMessage
 from functools import wraps
@@ -2116,6 +2117,7 @@ def hardware_status() -> Any:
 @login_required
 def egg_records_data() -> Any:
     after_id = request.args.get("after_id", default=0, type=int)
+    print_all = request.args.get("print_all") == "1"
     limit = max(
         1,
         min(
@@ -2160,10 +2162,204 @@ def egg_records_data() -> Any:
     if end_before is not None:
         query = query.filter(EggRecord.sorted_at < end_before)
 
-    records = query.order_by(EggRecord.id.desc()).limit(limit).all()
+    ordered_query = query.order_by(EggRecord.id.desc())
+    records = ordered_query.all() if print_all else ordered_query.limit(limit).all()
     return jsonify(
         records=[record.to_dict() for record in records],
         latest_id=max((record.id for record in records), default=after_id),
+    )
+
+
+@app.get("/api/egg-records/export.xlsx")
+@login_required
+def egg_records_excel_export() -> Any:
+    """Export all egg records matching the Egg Records page filters."""
+    try:
+        from openpyxl import Workbook
+        from openpyxl.chart import BarChart, PieChart, Reference
+        from openpyxl.chart.label import DataLabelList
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"openpyxl", "et_xmlfile"}:
+            raise
+        return jsonify(
+            error="Excel export dependencies are unavailable. Install the project requirements and restart the server."
+        ), 503
+
+    search = request.args.get("q", "").strip()
+    size = request.args.get("size", "").strip()
+    quality = request.args.get("quality", "").strip()
+    try:
+        start_at = parse_timestamp_boundary(request.args.get("start_at"))
+        end_before = parse_timestamp_boundary(request.args.get("end_before"))
+    except ValueError:
+        return jsonify(error="Invalid date filter."), 400
+    if start_at and end_before and start_at >= end_before:
+        return jsonify(error="From date cannot be after To date."), 400
+
+    query = EggRecord.query
+    if search:
+        numeric = "".join(character for character in search if character.isdigit())
+        conditions = [
+            EggRecord.session_ref.ilike(f"%{search}%"),
+            cast(EggRecord.weight_grams, String).ilike(f"%{search}%"),
+        ]
+        if numeric:
+            conditions.append(EggRecord.id == int(numeric))
+        query = query.filter(or_(*conditions))
+    if size and size != "All Sizes":
+        query = query.filter(EggRecord.size == size)
+    if quality and quality != "All Qualities":
+        query = query.filter(EggRecord.quality == quality)
+    if start_at is not None:
+        query = query.filter(EggRecord.sorted_at >= start_at)
+    if end_before is not None:
+        query = query.filter(EggRecord.sorted_at < end_before)
+    records = query.order_by(EggRecord.id.desc()).all()
+
+    workbook = Workbook()
+    summary = workbook.active
+    summary.title = "Summary"
+    details = workbook.create_sheet("Egg Records")
+    dark_green = "2F5D3A"
+    white = "FFFFFF"
+    thin_gray = Side(style="thin", color="CBD3CA")
+
+    summary.merge_cells("A1:E1")
+    title = summary["A1"]
+    title.value = "EGGSor+ | Roxas Farm - Egg Grading Records Report"
+    title.font = Font(name="Aptos Display", size=18, bold=True, color=white)
+    title.fill = PatternFill("solid", fgColor=dark_green)
+    title.alignment = Alignment(vertical="center")
+    summary.row_dimensions[1].height = 32
+    date_start = "Any date"
+    start_date_value = request.args.get("start_at", "")
+    if start_date_value:
+        try:
+            parsed_start = parse_timestamp_boundary(start_date_value)
+            date_start = parsed_start.astimezone(ZoneInfo("Asia/Manila")).date().isoformat()
+        except (AttributeError, ValueError):
+            date_start = start_date_value[:10]
+    date_end_value = request.args.get("end_before", "")
+    date_end = "Any date"
+    if date_end_value:
+        try:
+            parsed_end = parse_timestamp_boundary(date_end_value) - timedelta(days=1)
+            date_end = parsed_end.astimezone(ZoneInfo("Asia/Manila")).date().isoformat()
+        except (TypeError, ValueError):
+            date_end = date_end_value[:10]
+    summary["A2"] = "Selected date range"
+    summary["B2"] = f"{date_start} through {date_end}"
+    summary["A3"] = "Generated"
+    summary["B3"] = datetime.now(ZoneInfo("Asia/Manila")).strftime("%Y-%m-%d %H:%M %Z")
+
+    quality_counts = {name: 0 for name in ("Good", "Crack", "Rotten", "Not Classified")}
+    size_counts: dict[str, int] = {}
+    for record in records:
+        if record.quality in quality_counts:
+            quality_counts[record.quality] += 1
+        size_counts[record.size] = size_counts.get(record.size, 0) + 1
+
+    summary["A5"] = "Metric"
+    summary["B5"] = "Count"
+    summary["A6"] = "Total Eggs"
+    summary["B6"] = len(records)
+    other_quality_count = sum(record.quality not in quality_counts for record in records)
+    for row_number, label in enumerate(quality_counts, start=7):
+        summary.cell(row_number, 1, label)
+        summary.cell(row_number, 2, quality_counts[label])
+    summary["A11"] = "Other / Legacy"
+    summary["B11"] = other_quality_count
+    summary["D5"] = "Size"
+    summary["E5"] = "Count"
+    for row_number, (label, count) in enumerate(sorted(size_counts.items()), start=6):
+        summary.cell(row_number, 4, label)
+        summary.cell(row_number, 5, count)
+
+    for cell_range in ("A5:B5", "D5:E5"):
+        for row in summary[cell_range]:
+            for cell in row:
+                cell.font = Font(bold=True, color=white)
+                cell.fill = PatternFill("solid", fgColor=dark_green)
+    for row in summary.iter_rows(min_row=5, max_row=max(11, 5 + len(size_counts)), min_col=1, max_col=5):
+        for cell in row:
+            if cell.value is not None:
+                cell.border = Border(bottom=thin_gray)
+                cell.alignment = Alignment(vertical="center")
+
+    pie = PieChart()
+    pie.title = "Egg Quality Distribution"
+    pie_data = Reference(summary, min_col=2, min_row=7, max_row=11)
+    pie_labels = Reference(summary, min_col=1, min_row=7, max_row=11)
+    pie.add_data(pie_data, titles_from_data=False)
+    pie.set_categories(pie_labels)
+    pie.height = 8
+    pie.width = 13
+    pie.dataLabels = DataLabelList()
+    pie.dataLabels.showPercent = True
+    summary.add_chart(pie, "G5")
+
+    if size_counts:
+        bar = BarChart()
+        bar.type = "col"
+        bar.style = 10
+        bar.title = "Egg Size Distribution"
+        bar.y_axis.title = "Eggs"
+        bar.x_axis.title = "Size"
+        bar_data = Reference(summary, min_col=5, min_row=5, max_row=5 + len(size_counts))
+        bar_labels = Reference(summary, min_col=4, min_row=6, max_row=5 + len(size_counts))
+        bar.add_data(bar_data, titles_from_data=True)
+        bar.set_categories(bar_labels)
+        bar.height = 8
+        bar.width = 13
+        summary.add_chart(bar, "G21")
+
+    headers = ["Egg ID", "Weight (g)", "Size", "Quality", "Verification", "Date Sorted", "Session Reference"]
+    details.append(headers)
+    for record in records:
+        sorted_at = record.sorted_at
+        if sorted_at.tzinfo is None:
+            sorted_at = sorted_at.replace(tzinfo=timezone.utc)
+        sorted_at = sorted_at.astimezone(ZoneInfo("Asia/Manila")).replace(tzinfo=None)
+        verification = "Verified" if record.quality_verified is True else (
+            "Unverified" if record.quality_verified is False else "Legacy/Unknown"
+        )
+        details.append([
+            f"EGG-{record.id:06d}",
+            record.weight_grams or None,
+            record.size,
+            record.quality,
+            verification,
+            sorted_at,
+            record.session_ref,
+        ])
+    details.freeze_panes = "A2"
+    details.auto_filter.ref = f"A1:G{max(1, details.max_row)}"
+    details.row_dimensions[1].height = 24
+    for cell in details[1]:
+        cell.font = Font(bold=True, color=white)
+        cell.fill = PatternFill("solid", fgColor=dark_green)
+        cell.alignment = Alignment(vertical="center", wrap_text=True)
+    for row in details.iter_rows(min_row=2):
+        for cell in row:
+            cell.border = Border(bottom=thin_gray)
+            cell.alignment = Alignment(vertical="center")
+        row[1].number_format = '0" g"'
+        row[5].number_format = "yyyy-mm-dd hh:mm"
+    for column, width in {"A": 17, "B": 14, "C": 18, "D": 20, "E": 20, "F": 22, "G": 26}.items():
+        details.column_dimensions[column].width = width
+    for column, width in {"A": 22, "B": 20, "D": 20, "E": 14}.items():
+        summary.column_dimensions[column].width = width
+    summary.freeze_panes = "A5"
+
+    output = BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    filename = f"egg-records-{datetime.now(ZoneInfo('Asia/Manila')).date().isoformat()}.xlsx"
+    return Response(
+        output.getvalue(),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
@@ -2911,6 +3107,7 @@ def check_mail() -> None:
 if __name__ == "__main__":
     app.run(
         debug=env_bool("FLASK_DEBUG", False),
+        port=app.config["PORT"],
         threaded=True,
         # Keep the server in the process owned by the current terminal.
         # Werkzeug's reloader starts a second process which can survive after

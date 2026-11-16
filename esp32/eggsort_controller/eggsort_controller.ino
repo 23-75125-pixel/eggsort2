@@ -77,9 +77,9 @@ unsigned long rejectClosedAt = 0;
 #define LOADCELL_OPEN_DELAY_AFTER_WEIGHT 200
 
 // How long load-cell gate stays open
-#define LOADCELL_OPEN_TIME 2100
+#define LOADCELL_OPEN_TIME 1900
 //Mas mataas = mas mabagal bumukas; mas mababa = mas mabilis.
-#define LOADCELL_OPEN_SPEED 5
+#define LOADCELL_OPEN_SPEED 7
 
 // Commanded position only; this servo has no physical position feedback.
 bool loadCellGateOpen = false;
@@ -137,7 +137,7 @@ bool loadCellGateOpen = false;
 // Small and Medium
 // Oras (mula nang mag-open ang loadcell gate) bago buksan ang size servo.
 // Dapat mas maliit ito sa LOADCELL_OPEN_TIME.
-#define SM_TRAVEL_TIME 1980
+#define SM_TRAVEL_TIME 2000
 
 // Large
 #define LARGE_TRAVEL_TIME 8500
@@ -154,7 +154,7 @@ bool loadCellGateOpen = false;
 
 HX711 scale;
 
-float calibration_factor = 715.0;
+float calibration_factor = 675.0;
 
 #define EGG_THRESHOLD 30
 

@@ -9,6 +9,7 @@ psycopg[binary]>=3.2,<4
 gunicorn==23.0.0
 python-dotenv==1.2.2
 itsdangerous==2.2.0
+openpyxl>=3.1,<4
 Jinja2==3.1.6
 MarkupSafe==3.0.3
 Werkzeug==3.1.8
