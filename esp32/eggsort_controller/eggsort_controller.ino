@@ -154,7 +154,7 @@ bool loadCellGateOpen = false;
 
 HX711 scale;
 
-float calibration_factor = 675.0;
+float calibration_factor = 681.0;
 
 #define EGG_THRESHOLD 30
 
